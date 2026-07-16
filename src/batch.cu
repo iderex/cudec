@@ -33,6 +33,8 @@ cudec_status cudec_lz4_decompress_batch(const void* const* d_src_ptrs,
      * for the real decoder. */
     constexpr size_t kMaxChunks =
         static_cast<size_t>(INT32_MAX) * kBlockThreads;
+    static_assert(kMaxChunks < SIZE_MAX,
+                  "the SIZE_MAX over-limit contract test relies on this");
     if (d_src_ptrs == nullptr || d_src_sizes == nullptr ||
         d_dst_ptrs == nullptr || d_dst_capacities == nullptr ||
         d_results == nullptr ||
