@@ -40,10 +40,11 @@ jobs:
       - name: Build
         run: cmake --build build
 
-      # Placeholder until the M0 test net lands: the ctest step is added by
-      # the PR that introduces tests/ (oracle diffs, negative tests,
-      # conformance tests) and becomes part of this required check
-      # automatically.
+      # tests/ holds the GPU smoke test, which needs a CUDA toolchain and a
+      # device this runner does not have; GPU results are pasted into each
+      # PR instead. The CUDA build joins this check with #3, and the
+      # host-side ctest step (oracle diffs, negative tests, conformance
+      # tests) with the test harness (#4).
 
   format:
     name: format
