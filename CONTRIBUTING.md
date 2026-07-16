@@ -30,9 +30,13 @@ Issue-driven, gate-driven:
 ## Building & testing
 
 ```sh
-cmake -B build && cmake --build build   # host stub today; CUDA arrives with M1
-ctest --test-dir build                  # once tests/ exists
+cmake -B build && cmake --build build   # host-only; needs just a C compiler
 ```
+
+The CUDA engine and its on-device tests are opt-in (`-DCUDEC_ENABLE_CUDA=ON`)
+and need a CUDA 12.x toolchain plus a GPU for the tests — see the README's
+container command for the maintained path (build directory `build-cuda`,
+`ctest --test-dir build-cuda`).
 
 All repo artifacts — code, comments, commits, PRs, issues — are written in
 English.

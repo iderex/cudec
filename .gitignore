@@ -1,5 +1,6 @@
 # Build output - reproducible from the sources via CMake.
 build/
+build-cuda/
 
 # Local maintainer tooling and working notes - never in the public tree.
 .claude/

@@ -1,11 +1,14 @@
 /* cudec - open-source GPU decompression for the standard formats.
  *
- * Public C ABI. Everything in this header is C-compatible; the library
- * never throws across this boundary and never writes output it did not
- * fully validate.
+ * Public C ABI. Everything in this header is C-compatible and requires no
+ * CUDA headers; the library never throws across this boundary and never
+ * reports output it did not fully validate.
  */
 #ifndef CUDEC_H
 #define CUDEC_H
+
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +21,76 @@ extern "C" {
 /* Returns the runtime library version as (major * 10000 +
  * minor * 100 + patch), for ABI sanity checks against these macros. */
 int cudec_version(void);
+
+typedef enum cudec_status {
+    CUDEC_OK = 0,
+    CUDEC_ERR_INVALID_ARGUMENT = 1,
+    CUDEC_ERR_CORRUPT_INPUT = 2,
+    CUDEC_ERR_OUTPUT_TOO_SMALL = 3,
+    CUDEC_ERR_CUDA = 4,
+    CUDEC_ERR_NOT_IMPLEMENTED = 5
+} cudec_status;
+
+/* Binary-compatible with cudaStream_t without pulling in the CUDA headers:
+ * both are pointers to the driver's CUstream_st. Pass a cudaStream_t
+ * directly; NULL means the legacy default stream (callers built with
+ * per-thread default streams pass cudaStreamPerThread explicitly). */
+typedef struct CUstream_st* cudec_stream_t;
+
+/* Per-chunk outcome, written by the device into a caller-provided device
+ * buffer. Fixed 16-byte layout on both sides of the ABI. */
+typedef struct cudec_chunk_result {
+    int32_t status;         /* a cudec_status value */
+    uint32_t reserved;      /* written as zero */
+    uint64_t bytes_written; /* valid output bytes when status is CUDEC_OK */
+} cudec_chunk_result;
+
+/* The device writes these records straight into caller memory, so every
+ * compiler on either side of the ABI must agree on the layout. The first
+ * member is at offset 0 by definition; with the total size and the last
+ * member's offset pinned, no other layout is possible. */
+#if defined(__cplusplus) && __cplusplus >= 201103L
+static_assert(sizeof(cudec_chunk_result) == 16 &&
+                  offsetof(cudec_chunk_result, bytes_written) == 8,
+              "cudec_chunk_result must keep its fixed 16-byte ABI layout");
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(cudec_chunk_result) == 16 &&
+                   offsetof(cudec_chunk_result, bytes_written) == 8,
+               "cudec_chunk_result must keep its fixed 16-byte ABI layout");
+#else
+/* Pre-C11 / pre-C++11: a negative array size fails compilation on drift. */
+typedef char cudec_chunk_result_layout_check
+    [(sizeof(cudec_chunk_result) == 16 &&
+      offsetof(cudec_chunk_result, bytes_written) == 8)
+         ? 1
+         : -1];
+#endif
+
+/* Batch LZ4 block decode. M1 lands the decoder; until then every chunk
+ * reports CUDEC_ERR_NOT_IMPLEMENTED and writes no output.
+ *
+ * All array arguments are device memory holding chunk_count entries, and
+ * the pointers those arrays contain are device pointers; d_results must be
+ * 16-byte aligned (any cudaMalloc allocation is). The call is asynchronous
+ * on `stream`: the synchronous return value covers argument validation and
+ * launch submission only; per-chunk outcomes land in d_results and are
+ * valid once the stream reaches the end of this launch.
+ *
+ * Validation rejects the whole call synchronously with
+ * CUDEC_ERR_INVALID_ARGUMENT and launches nothing: any NULL array
+ * argument, a misaligned d_results, an empty batch (chunk_count == 0), and
+ * a batch beyond the implementation's launch limit (rejected, never
+ * truncated). A rejected call makes no CUDA call and leaves the thread's
+ * pending CUDA error state untouched; a call that passes validation
+ * consumes that pending state (cudaGetLastError semantics), so the
+ * returned status reflects this submission alone. */
+cudec_status cudec_lz4_decompress_batch(const void* const* d_src_ptrs,
+                                        const size_t* d_src_sizes,
+                                        void* const* d_dst_ptrs,
+                                        const size_t* d_dst_capacities,
+                                        size_t chunk_count,
+                                        cudec_chunk_result* d_results,
+                                        cudec_stream_t stream);
 
 #ifdef __cplusplus
 }

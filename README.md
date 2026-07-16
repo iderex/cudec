@@ -63,11 +63,22 @@ and milestones:
 
 ## Building
 
-Requires CMake ≥ 3.24 and a C compiler; the CUDA kernels and their toolchain
-requirements arrive with M1.
+Host-only stub (CMake ≥ 3.24 and a C compiler, no CUDA toolchain needed):
 
 ```sh
 cmake -B build && cmake --build build
+```
+
+With the CUDA engine (CUDA 12.x toolchain; the maintained path is the
+pinned dev container — GPU required only for the tests, not the build):
+
+```sh
+docker run --rm --gpus all -v "$PWD:/w" -w /w \
+  nvidia/cuda:12.6.2-devel-ubuntu24.04@sha256:738fba0fbdb225b7a2931c58a5c8f03a84d3cd2f6a84975826a157339ef750b8 \
+  sh -c "apt-get update -q && apt-get install -yq cmake >/dev/null && \
+         cmake -B build-cuda -DCUDEC_ENABLE_CUDA=ON && \
+         cmake --build build-cuda -j && \
+         ctest --test-dir build-cuda --output-on-failure"
 ```
 
 ## Contributing
