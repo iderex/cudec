@@ -3,21 +3,11 @@
  * device - fail-closed argument validation, asynchronous submission, and
  * per-chunk device-side reporting. */
 #include "cudec.h"
+#include "require.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
-
-#define REQUIRE(cond)                                                      \
-    do {                                                                   \
-        if (!(cond)) {                                                     \
-            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__,   \
-                         #cond);                                           \
-            return 1;                                                      \
-        }                                                                  \
-    } while (0)
-
-#define REQUIRE_CUDA(call) REQUIRE((call) == cudaSuccess)
 
 int main() {
     REQUIRE(cudec_version() == CUDEC_VERSION_MAJOR * 10000 +

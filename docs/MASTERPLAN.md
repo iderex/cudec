@@ -100,7 +100,41 @@ a planned milestone — a vendor binary can never follow), and **hackability**.
 
 - Unit + oracle-diff + negative tests run under `ctest`; structural rules
   (fail-closed coverage, C-ABI purity, no-dependency rule) are encoded as
-  conformance tests so every PR is checked mechanically.
+  conformance tests so every PR is checked mechanically. The configure-time
+  conformance checks are **drift detectors, not tamper-proofing**: they
+  snapshot the library target's link surfaces and flags when `tests/` is
+  configured and defend against honest refactoring mistakes; adversarial
+  evasion (and additions made after that snapshot) remain code review's
+  job.
+- **The harness is framework-less; ctest is the runner** (settled in the #4
+  design review): one executable per test group over the small assertion
+  header `tests/require.h`; discovery, labels, parallelism, and rerun come
+  from ctest; buffer diffs report first-mismatch offset plus a hex window —
+  the one assertion domain a framework would not improve. Rationale:
+  near-zero supply-chain surface for the security net itself, and
+  early-abort semantics fit contract-sequence tests. Recorded reassessment
+  trigger: if early-abort measurably masks failure clusters at M5 mutant
+  scale, or an outside contributor base emerges, migrate to Catch2 (pinned)
+  — the REQUIRE-shaped macros survive that move verbatim, and no framework
+  headers are compiled through nvcc-only paths that would complicate it.
+- **A GPU test never self-skips** (banned pattern): no "no device, exit 0"
+  branches — skipping is exclusively the runner's decision via ctest labels
+  (`-LE gpu` on the GPU-less CI runner; the full run on the local gate). A
+  mislabeled GPU test in CI therefore fails loudly instead of passing
+  vacuously; `--no-tests=error` closes the zero-tests-selected route; CI
+  prints the deferred `-L gpu -N` listing and pins the known GPU tests by
+  name.
+- **Oracle pinning policy**: oracles are vendored via FetchContent from
+  maintainer-uploaded release assets, pinned by a self-computed SHA-256
+  cross-checked against a second packaging ecosystem; auto-generated
+  `/archive/` tarballs are avoided (GitHub regenerated them in 2023 and
+  their hashes moved). Where a project publishes no uploaded asset, the
+  archive tarball is pinned and a future hash mismatch is treated as the
+  invariant working, not as noise. FetchContent pins are invisible to
+  Dependabot — oracle bumps are deliberate manual PRs owned by the
+  supply-chain sweep. Third-party oracle code compiles with SYSTEM includes
+  and without the project's strict flags; one translation unit per oracle,
+  never its build system.
 - Fuzzing: mutation-based corpus fuzzing of the host-side parsers, plus
   GPU-vs-oracle diff loops on mutated streams for the kernels.
 - Benchmarks live in `bench/` with recorded methodology; every published
@@ -136,8 +170,13 @@ a planned milestone — a vendor binary can never follow), and **hackability**.
 
 - Exact LZ4 kernel decomposition: single-pass warp-cooperative decode vs.
   two-phase (sequence scan, then parallel copy) — decided with measurements
-  in the M1 design issue.
-- Test framework choice (GoogleTest vs. Catch2) and oracle vendoring
-  mechanism (FetchContent pinned to release hashes) — M0.
-- CUDA dev container image and CI toolchain pinning — M0.
+  in the M1 design issue. The exact batch upper bound is pinned there too:
+  with the kernel geometry settled, the zero-visible-devices technique from
+  the #4 harness distinguishes the boundary through the public API
+  (`CUDEC_ERR_CUDA` = passed validation and reached the launch;
+  `CUDEC_ERR_INVALID_ARGUMENT` = rejected) without publishing the constant.
 - Benchmark corpus set beyond Silesia/enwik (game-asset-like data) — M2.
+
+Settled: test framework and oracle vendoring (section 5, via the #4 design
+review); dev-container image and CI toolchain pinning (issues #1/#3 —
+digest-pinned `nvidia/cuda` 12.6.2 in CI and the local gate).

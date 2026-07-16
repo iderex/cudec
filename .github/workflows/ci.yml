@@ -1,9 +1,10 @@
 # CI — the fail-closed pull-request gate.
 #
 # Runs only on pull requests to `main`, so the mainline scaffolding push does
-# not trigger it. Every PR must build and pass the format check before it can
-# merge; the CUDA toolchain and the test/bench steps are added by the M0/M1
-# PRs that introduce them and become part of these required checks.
+# not trigger it. Every PR must build both configurations, pass the host-side
+# test subset, and pass the format check before it can merge; the bench step
+# is added by the PR that introduces bench/ and becomes part of these
+# required checks.
 
 name: CI
 
@@ -28,14 +29,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # The exact toolchain the local GPU gate uses - same image, same digest.
-    # The runner has no GPU: this job proves both configurations compile;
-    # the on-device ctest results are pasted into each PR from the local
-    # container run. The host-side ctest step (oracle diffs, negative
-    # tests, conformance tests) arrives with the test harness (#4).
+    # The runner has no GPU: this job proves both configurations compile
+    # and runs the host-side test subset (oracle diffs, negative tests,
+    # conformance tests); the on-device ctest results are pasted into each
+    # PR from the local container run.
     container:
       image: nvidia/cuda:12.6.2-devel-ubuntu24.04@sha256:738fba0fbdb225b7a2931c58a5c8f03a84d3cd2f6a84975826a157339ef750b8
     permissions:
       contents: read
+    defaults:
+      run:
+        # Explicit bash gets -o pipefail (the default shell does not), so a
+        # failing command on the left of a pipe reds the step by itself.
+        shell: bash
     steps:
       - name: Check out the source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -56,15 +62,37 @@ jobs:
       - name: Configure and build (host-only)
         run: cmake -B build && cmake --build build
 
-      # Unconditional AND self-verifying: the smoke binary exists only if
-      # the CUDA configuration actually built the device TUs, so a renamed
-      # CMake option cannot quietly turn this step into a green host-only
-      # build (-D on an unknown option is a warning, not an error).
+      # Unconditional AND self-verifying: the GPU-test binaries exist only
+      # if the CUDA configuration actually built the device TUs, so a
+      # renamed CMake option cannot quietly turn this step into a green
+      # host-only build (-D on an unknown option is a warning, not an
+      # error).
       - name: Configure and build (CUDA engine)
         run: >-
           cmake -B build-cuda -DCUDEC_ENABLE_CUDA=ON &&
           cmake --build build-cuda -j &&
-          test -x build-cuda/cudec_smoke
+          test -x build-cuda/tests/smoke &&
+          test -x build-cuda/tests/gpu_fixture
+
+      # The host-side subset; gpu-labeled tests run in this same container
+      # on the maintainer's machine and their output is pasted into the PR.
+      # Fail-closed plumbing: --no-tests=error reds a vacuous zero-test
+      # selection, and the identity greps pin BOTH sets by name - a known
+      # host test silently dropping out of the CI selection (say, by
+      # gaining a gpu-matching label) reds the gate exactly like a known
+      # GPU test vanishing from the deferred listing.
+      - name: Host-side tests (runner has no GPU)
+        run: >-
+          ctest --test-dir build-cuda -LE gpu --no-tests=error
+          --output-on-failure &&
+          ctest --test-dir build-cuda -LE gpu -N | tee host-selected.txt &&
+          grep -E ': conformance_c$' host-selected.txt &&
+          grep -E ': oracle_lz4$' host-selected.txt &&
+          grep -E ': launch_fail$' host-selected.txt &&
+          echo "Deferred to the local GPU gate:" &&
+          ctest --test-dir build-cuda -L gpu -N | tee gpu-deferred.txt &&
+          grep -E ': smoke$' gpu-deferred.txt &&
+          grep -E ': gpu_fixture$' gpu-deferred.txt
 
   format:
     name: format

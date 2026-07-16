@@ -70,7 +70,9 @@ cmake -B build && cmake --build build
 ```
 
 With the CUDA engine (CUDA 12.x toolchain; the maintained path is the
-pinned dev container — GPU required only for the tests, not the build):
+pinned dev container — GPU required only for the gpu-labeled tests, not the
+build: without a GPU, drop `--gpus all` and add `-LE gpu` to the ctest line
+to build everything and run the host-side subset):
 
 ```sh
 docker run --rm --gpus all -v "$PWD:/w" -w /w \
@@ -78,7 +80,7 @@ docker run --rm --gpus all -v "$PWD:/w" -w /w \
   sh -c "apt-get update -q && apt-get install -yq cmake >/dev/null && \
          cmake -B build-cuda -DCUDEC_ENABLE_CUDA=ON && \
          cmake --build build-cuda -j && \
-         ctest --test-dir build-cuda --output-on-failure"
+         ctest --test-dir build-cuda --no-tests=error --output-on-failure"
 ```
 
 ## Contributing

@@ -38,8 +38,13 @@ if(CUDEC_ENABLE_CUDA)
   enable_language(CUDA)
   enable_testing()
 
+  # Single source of truth for the strict device flags: the raw list also
+  # feeds the configure-time liveness probes in tests/CMakeLists.txt, so an
+  # edit here is probed, not trusted.
+  set(CUDEC_CUDA_STRICT_FLAGS_RAW --Werror=all-warnings
+                                  -Xcompiler=-Wall,-Wextra,-Werror)
   set(CUDEC_CUDA_STRICT_FLAGS
-      $<$<COMPILE_LANGUAGE:CUDA>:--Werror=all-warnings;-Xcompiler=-Wall,-Wextra,-Werror>)
+      $<$<COMPILE_LANGUAGE:CUDA>:${CUDEC_CUDA_STRICT_FLAGS_RAW}>)
 
   target_sources(cudec PRIVATE src/batch.cu)
   # The cudec target predates enable_language(CUDA), so the architecture
@@ -49,11 +54,8 @@ if(CUDEC_ENABLE_CUDA)
                      CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
   target_compile_options(cudec PRIVATE ${CUDEC_CUDA_STRICT_FLAGS})
 
-  add_executable(cudec_smoke tests/smoke.cu)
-  target_link_libraries(cudec_smoke PRIVATE cudec)
-  set_target_properties(
-    cudec_smoke PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
-                           CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-  target_compile_options(cudec_smoke PRIVATE ${CUDEC_CUDA_STRICT_FLAGS})
-  add_test(NAME smoke COMMAND cudec_smoke)
+  # Keep this last in the CUDA block: the conformance checks in tests/
+  # snapshot the cudec target's properties at this point - anything added
+  # to the target below this line would escape them.
+  add_subdirectory(tests)
 endif()
