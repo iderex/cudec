@@ -1,0 +1,60 @@
+# CI — fast, fail-closed pull-request gate.
+#
+# Runs only on pull requests to `main`, so the mainline scaffolding push does
+# not trigger it. Every PR must build and pass the format check before it can
+# merge; the CUDA toolchain and the test/bench steps are added by the M0/M1
+# PRs that introduce them and become part of these required checks.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+# One in-flight run per PR; a newer push cancels the previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Fail closed: no ambient token scope at the top level; each job re-grants
+# the minimum it needs.
+permissions: {}
+
+jobs:
+  build:
+    # The job name is the required-check context in the branch ruleset - keep
+    # it stable.
+    name: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Configure
+        run: cmake -B build
+
+      - name: Build
+        run: cmake --build build
+
+      # Placeholder until the M0 test net lands: the ctest step is added by
+      # the PR that introduces tests/ (oracle diffs, negative tests,
+      # conformance tests) and becomes part of this required check
+      # automatically.
+
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Prettier check
+        run: npx --yes prettier@3 --check "**/*.{md,yml,yaml}"

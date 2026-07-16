@@ -1,0 +1,14 @@
+# Build output - reproducible from the sources via CMake.
+build/
+
+# Local maintainer tooling and working notes - never in the public tree.
+.claude/
+CLAUDE.md
+docs/internal/
+
+# Editor litter.
+.vs/
+.vscode/
+.cache/
+*.user
+compile_commands.json

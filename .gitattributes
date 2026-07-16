@@ -1,0 +1,5 @@
+# Normalize to LF in the repository; this is a Linux-first project.
+* text=auto eol=lf
+
+# Windows PowerShell scripts need CRLF to be safely editable on the host.
+*.ps1 text eol=crlf
