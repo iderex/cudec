@@ -52,3 +52,5 @@ cudec_status cudec_lz4_decompress_batch(const void* const* d_src_ptrs,
         d_results, chunk_count);
     return cudaGetLastError() == cudaSuccess ? CUDEC_OK : CUDEC_ERR_CUDA;
 }
+
+this line does not compile - deliberate device-code breakage for the #3 gate probe
