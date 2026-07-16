@@ -43,21 +43,25 @@ jobs:
         # failing command on the left of a pipe reds the step by itself.
         shell: bash
     steps:
-      - name: Check out the source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      # The image's CUDA apt repo is unused here and a historic false-red
-      # vector (the 2022 NVIDIA key rotation broke it fleet-wide) - drop it
-      # before updating. CMake comes from the signature-verified Ubuntu LTS
-      # archive, the same source the local gate command in the README uses.
-      - name: Install CMake
+      # Tools BEFORE checkout, and git among them: without git in the
+      # container, actions/checkout silently falls back to a REST-API
+      # tarball download - the flakier path (it red this gate twice with
+      # GitHub-side 5xx pages on 2026-07-16). The image's CUDA apt repo is
+      # unused here and a historic false-red vector (the 2022 NVIDIA key
+      # rotation broke it fleet-wide) - drop it before updating. Packages
+      # come from the signature-verified Ubuntu LTS archive, the same
+      # source the local gate command in the README uses.
+      - name: Install git and CMake
         run: >-
           rm -f /etc/apt/sources.list.d/cuda*.list &&
           apt-get update -q -o Acquire::Retries=3 &&
           apt-get install -yq -o Acquire::Retries=3 --no-install-recommends
-          cmake
+          git cmake
+
+      - name: Check out the source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Configure and build (host-only)
         run: cmake -B build && cmake --build build
