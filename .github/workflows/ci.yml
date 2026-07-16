@@ -1,4 +1,4 @@
-# CI — fast, fail-closed pull-request gate.
+# CI — the fail-closed pull-request gate.
 #
 # Runs only on pull requests to `main`, so the mainline scaffolding push does
 # not trigger it. Every PR must build and pass the format check before it can
@@ -26,6 +26,14 @@ jobs:
     # it stable.
     name: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The exact toolchain the local GPU gate uses - same image, same digest.
+    # The runner has no GPU: this job proves both configurations compile;
+    # the on-device ctest results are pasted into each PR from the local
+    # container run. The host-side ctest step (oracle diffs, negative
+    # tests, conformance tests) arrives with the test harness (#4).
+    container:
+      image: nvidia/cuda:12.6.2-devel-ubuntu24.04@sha256:738fba0fbdb225b7a2931c58a5c8f03a84d3cd2f6a84975826a157339ef750b8
     permissions:
       contents: read
     steps:
@@ -34,17 +42,29 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Configure
-        run: cmake -B build
+      # The image's CUDA apt repo is unused here and a historic false-red
+      # vector (the 2022 NVIDIA key rotation broke it fleet-wide) - drop it
+      # before updating. CMake comes from the signature-verified Ubuntu LTS
+      # archive, the same source the local gate command in the README uses.
+      - name: Install CMake
+        run: >-
+          rm -f /etc/apt/sources.list.d/cuda*.list &&
+          apt-get update -q -o Acquire::Retries=3 &&
+          apt-get install -yq -o Acquire::Retries=3 --no-install-recommends
+          cmake
 
-      - name: Build
-        run: cmake --build build
+      - name: Configure and build (host-only)
+        run: cmake -B build && cmake --build build
 
-      # tests/ holds the GPU smoke test, which needs a CUDA toolchain and a
-      # device this runner does not have; GPU results are pasted into each
-      # PR instead. The CUDA build joins this check with #3, and the
-      # host-side ctest step (oracle diffs, negative tests, conformance
-      # tests) with the test harness (#4).
+      # Unconditional AND self-verifying: the smoke binary exists only if
+      # the CUDA configuration actually built the device TUs, so a renamed
+      # CMake option cannot quietly turn this step into a green host-only
+      # build (-D on an unknown option is a warning, not an error).
+      - name: Configure and build (CUDA engine)
+        run: >-
+          cmake -B build-cuda -DCUDEC_ENABLE_CUDA=ON &&
+          cmake --build build-cuda -j &&
+          test -x build-cuda/cudec_smoke
 
   format:
     name: format
