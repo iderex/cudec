@@ -1,7 +1,7 @@
 /* M0 smoke test: the library links, the version matches the header, and
- * the stubbed batch entry point honors its documented contract on a real
- * device - fail-closed argument validation, asynchronous submission, and
- * per-chunk device-side reporting. */
+ * the batch entry point honors its documented contract on a real device -
+ * fail-closed argument validation, asynchronous submission, per-chunk
+ * device-side reporting, and a real empty-block decode. */
 #include "cudec.h"
 #include "require.h"
 
@@ -25,8 +25,9 @@ int main() {
                                        no_results, nullptr) ==
             CUDEC_ERR_INVALID_ARGUMENT);
 
-    /* 257 chunks spans two blocks of the 256-thread launch, so the
-     * multi-block index arithmetic actually executes on device. */
+    /* 257 chunks span many blocks of the warp-per-chunk launch (128
+     * threads = 4 chunks per block), so the multi-block index arithmetic
+     * actually executes on device. */
     const size_t chunk_count = 257;
     const size_t chunk_bytes = 64;
 
@@ -34,12 +35,16 @@ int main() {
     const void* h_src_ptrs[chunk_count];
     void* h_dst_ptrs[chunk_count];
     size_t h_sizes[chunk_count];
+    /* Each chunk is a valid empty LZ4 block (a lone 0x00 token) so the
+     * batch exercises a real successful decode end to end at the ABI
+     * boundary; the fixture test covers content-bearing streams. */
     for (size_t i = 0; i < chunk_count; i++) {
         REQUIRE_CUDA(cudaMalloc(&buffers[i], chunk_bytes));
+        REQUIRE_CUDA(cudaMemset(buffers[i], 0, 1));
         REQUIRE_CUDA(cudaMalloc(&buffers[chunk_count + i], chunk_bytes));
         h_src_ptrs[i] = buffers[i];
         h_dst_ptrs[i] = buffers[chunk_count + i];
-        h_sizes[i] = chunk_bytes;
+        h_sizes[i] = 1;
     }
 
     const void** d_src_ptrs;
@@ -123,14 +128,14 @@ int main() {
     REQUIRE_CUDA(cudaMemcpy(h_results, d_results, sizeof(h_results),
                             cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < chunk_count; i++) {
-        REQUIRE(h_results[i].status == CUDEC_ERR_NOT_IMPLEMENTED);
+        REQUIRE(h_results[i].status == CUDEC_OK);
         REQUIRE(h_results[i].reserved == 0);
         REQUIRE(h_results[i].bytes_written == 0);
     }
 
     REQUIRE_CUDA(cudaStreamDestroy(stream));
-    std::printf("PASS: version + fail-closed validation + %zu-chunk stub "
-                "batch on device\n",
+    std::printf("PASS: version + fail-closed validation + %zu-chunk "
+                "empty-block decode on device\n",
                 chunk_count);
     return 0;
 }
