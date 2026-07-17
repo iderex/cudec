@@ -249,13 +249,15 @@ runner, so the adversarial number cannot silently drift.
 ## The nvCOMP comparison (not published)
 
 The one comparison this document deliberately does **not** publish is
-cudec-vs-nvCOMP. The nvCOMP EULA (NVIDIA Software License Agreement) contains
-a DeWitt-style benchmark clause forbidding disclosure of nvCOMP benchmark,
-competitive-analysis, or performance results to third parties without NVIDIA's
-prior written permission. cudec therefore publishes **no** cudec-vs-nvCOMP
-throughput numbers, quotes no nvCOMP figures, and builds no head-to-head table
-— by policy, not oversight. nvCOMP is referenced only nominatively, as the
-proprietary incumbent this project offers an auditable open alternative to.
+cudec-vs-nvCOMP. **§8.9 of the NVIDIA Software License Agreement** — the EULA
+governing the nvCOMP binary — restricts the customer from distributing or
+disclosing to third parties the results of benchmarking, competitive analysis,
+or regression/performance testing of the software without NVIDIA's prior
+written permission (a "DeWitt clause"). cudec therefore publishes **no**
+cudec-vs-nvCOMP throughput numbers, quotes no nvCOMP figures, and builds no
+head-to-head table — by policy, not oversight. nvCOMP is referenced only
+nominatively, as the proprietary incumbent this project offers an auditable
+open alternative to.
 
 This is why the reproducible harness above matters: a third party can build
 cudec and nvCOMP on their own hardware, run both over the same hash-pinned
