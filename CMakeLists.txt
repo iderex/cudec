@@ -51,13 +51,20 @@ if(CUDEC_ENABLE_CUDA)
   set(CUDEC_CUDA_STRICT_FLAGS
       $<$<COMPILE_LANGUAGE:CUDA>:${CUDEC_CUDA_STRICT_FLAGS_RAW}>)
 
-  target_sources(cudec PRIVATE src/batch.cu)
+  # frame.cpp (the LZ4 frame orchestrator) is host C++ that drives the
+  # device batch decoder, so it needs the CUDA runtime.
+  find_package(CUDAToolkit REQUIRED)
+  target_sources(cudec PRIVATE src/batch.cu src/frame.cpp)
+  target_link_libraries(cudec PRIVATE CUDA::cudart)
   # The cudec target predates enable_language(CUDA), so the architecture
   # list must be applied as an explicit target property.
   set_target_properties(
     cudec PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+                     CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
                      CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-  target_compile_options(cudec PRIVATE ${CUDEC_CUDA_STRICT_FLAGS})
+  target_compile_options(
+    cudec PRIVATE ${CUDEC_CUDA_STRICT_FLAGS}
+                  $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>)
 
   # Keep tests/ after everything that may touch the cudec target: its
   # conformance checks snapshot the target's properties at this point -

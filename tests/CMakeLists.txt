@@ -27,6 +27,15 @@ FetchContent_MakeAvailable(lz4)
 # third-party code is audited by hash, not reformatted.
 add_library(lz4_oracle STATIC ${lz4_SOURCE_DIR}/lib/lz4.c)
 target_include_directories(lz4_oracle SYSTEM PUBLIC ${lz4_SOURCE_DIR}/lib)
+
+# The frame oracle adds liblz4's frame API and xxHash (the checksum the
+# frame format uses) - the reference the cudec frame decoder is held to.
+add_library(
+  lz4_frame_oracle STATIC
+  ${lz4_SOURCE_DIR}/lib/lz4.c ${lz4_SOURCE_DIR}/lib/lz4hc.c
+  ${lz4_SOURCE_DIR}/lib/lz4frame.c ${lz4_SOURCE_DIR}/lib/xxhash.c)
+target_include_directories(lz4_frame_oracle SYSTEM PUBLIC
+                           ${lz4_SOURCE_DIR}/lib)
 # -O2 unconditionally: the oracle is also the bench harness's timed
 # decoder, and an empty CMAKE_BUILD_TYPE (the documented container
 # command) would otherwise time -O0 reference code. Correctness is
@@ -90,6 +99,10 @@ set_tests_properties(launch_fail PROPERTIES ENVIRONMENT
 cudec_add_test(smoke SOURCES smoke.cu GPU)
 cudec_add_test(gpu_fixture SOURCES gpu_fixture.cu LIBS cudec_test_fixtures
                GPU)
+cudec_add_test(frame_twin SOURCES frame_twin.cu LIBS lz4_frame_oracle GPU)
+# frame_twin verifies the library's own xxhash32.h against liblz4's XXH32.
+target_include_directories(frame_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
 # ---- Structural conformance, configure time: a violation reds every CI
 # build. These are drift detectors, not tamper-proofing - the honest limits
@@ -104,7 +117,12 @@ foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES LINK_OPTIONS
   get_target_property(_entries cudec ${_prop})
   if(_entries)
     foreach(_entry IN LISTS _entries)
-      if(NOT _entry MATCHES "^CUDA::")
+      # A PRIVATE link of an imported target lands in the interface list
+      # wrapped as $<LINK_ONLY:CUDA::cudart>; strip that wrapper before
+      # matching so CUDA::cudart (the CUDA runtime the rule permits) is not
+      # a false positive.
+      string(REGEX REPLACE "^\\$<LINK_ONLY:(.+)>$" "\\1" _bare "${_entry}")
+      if(NOT _bare MATCHES "^CUDA::")
         message(
           FATAL_ERROR
             "cudec carries '${_entry}' in ${_prop} - the library must depend "

@@ -28,7 +28,11 @@ typedef enum cudec_status {
     CUDEC_ERR_CORRUPT_INPUT = 2,
     CUDEC_ERR_OUTPUT_TOO_SMALL = 3,
     CUDEC_ERR_CUDA = 4,
-    CUDEC_ERR_NOT_IMPLEMENTED = 5
+    CUDEC_ERR_NOT_IMPLEMENTED = 5,
+    /* A well-formed frame that uses a feature cudec does not decode
+     * (block-linked mode, a dictionary id). Distinct from CORRUPT_INPUT:
+     * the input is valid, just outside cudec's supported subset. */
+    CUDEC_ERR_UNSUPPORTED = 6
 } cudec_status;
 
 /* Binary-compatible with cudaStream_t without pulling in the CUDA headers:
@@ -95,6 +99,30 @@ cudec_status cudec_lz4_decompress_batch(const void* const* d_src_ptrs,
                                         size_t chunk_count,
                                         cudec_chunk_result* d_results,
                                         cudec_stream_t stream);
+
+/* Decode a single LZ4 frame (the .lz4 container: magic, frame descriptor,
+ * data blocks, end mark, optional checksums) from host memory into host
+ * memory, using the GPU batch decoder internally. Synchronous.
+ *
+ * `frame`/`frame_size` is the whole frame in host memory; the decoded
+ * output is written to `dst` (host, `dst_capacity` bytes) and the produced
+ * size is returned in `*bytes_written`.
+ *
+ * Supported subset: block-INDEPENDENT frames (compress with
+ * LZ4F_blockIndependent). The header, block, and content checksums and the
+ * optional declared content size, when present, are verified fail-closed.
+ * Returns CUDEC_ERR_UNSUPPORTED for a valid frame cudec does not decode
+ * (block-linked mode - the default of liblz4's frame compressor - or a
+ * dictionary id), CUDEC_ERR_CORRUPT_INPUT for a malformed frame, a checksum
+ * mismatch, or a declared content size that does not match the decoded
+ * size, CUDEC_ERR_OUTPUT_TOO_SMALL when `dst_capacity` is too small, and
+ * CUDEC_ERR_CUDA on a device or host resource failure. A NULL `frame` or
+ * `bytes_written`, or a NULL `dst` with a non-zero `dst_capacity`, returns
+ * CUDEC_ERR_INVALID_ARGUMENT. On any error `*bytes_written` is 0 and no
+ * partial output is presented as a valid decode. */
+cudec_status cudec_lz4f_decompress(const void* frame, size_t frame_size,
+                                   void* dst, size_t dst_capacity,
+                                   size_t* bytes_written);
 
 #ifdef __cplusplus
 }
