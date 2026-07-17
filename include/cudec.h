@@ -28,6 +28,10 @@ typedef enum cudec_status {
     CUDEC_ERR_CORRUPT_INPUT = 2,
     CUDEC_ERR_OUTPUT_TOO_SMALL = 3,
     CUDEC_ERR_CUDA = 4,
+    /* Reserved for an API entry point or decode path declared here but not
+     * yet implemented (e.g. a future format). No current entry point
+     * returns it; kept at this fixed value so a caller's switch stays
+     * exhaustive once it is wired up. */
     CUDEC_ERR_NOT_IMPLEMENTED = 5,
     /* A well-formed frame that uses a feature cudec does not decode
      * (block-linked mode, a dictionary id). Distinct from CORRUPT_INPUT:
