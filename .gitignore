@@ -2,6 +2,10 @@
 build/
 build-cuda/
 
+# Downloaded benchmark corpora - hash-pinned by bench/get-corpora.sh,
+# never committed.
+bench/corpora/
+
 # Local maintainer tooling and working notes - never in the public tree.
 .claude/
 CLAUDE.md

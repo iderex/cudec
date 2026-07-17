@@ -1,7 +1,6 @@
 # The test net: ctest is the runner, one executable per test group, the
 # assertion header tests/require.h as the only "framework". Decision record
 # and reassessment trigger: docs/MASTERPLAN.md section 5.
-enable_language(CXX)
 
 # Supply chain: the hash-verified tarball is the only acceptable oracle
 # source - a system copy must never silently substitute for it.
@@ -28,6 +27,11 @@ FetchContent_MakeAvailable(lz4)
 # third-party code is audited by hash, not reformatted.
 add_library(lz4_oracle STATIC ${lz4_SOURCE_DIR}/lib/lz4.c)
 target_include_directories(lz4_oracle SYSTEM PUBLIC ${lz4_SOURCE_DIR}/lib)
+# -O2 unconditionally: the oracle is also the bench harness's timed
+# decoder, and an empty CMAKE_BUILD_TYPE (the documented container
+# command) would otherwise time -O0 reference code. Correctness is
+# optimization-independent; honest numbers are not.
+target_compile_options(lz4_oracle PRIVATE -O2)
 
 # PRIVATE on purpose: the archive still links through, but the lz4 include
 # path stays out of every consumer's command line - so an accidental
@@ -38,8 +42,14 @@ target_link_libraries(cudec_test_fixtures PRIVATE lz4_oracle)
 target_include_directories(cudec_test_fixtures PUBLIC .)
 set_target_properties(cudec_test_fixtures PROPERTIES CXX_STANDARD 17
                                                      CXX_STANDARD_REQUIRED ON)
+# -O2 for the harness's UNTIMED bulk work: corpus prep and the byte-verify
+# pass run through this code over 200+ MB corpora (the timed region itself
+# calls LZ4_decompress_safe in lz4_oracle directly and never enters
+# fixtures code). Keeps setup time negligible under the build-type-less
+# documented container command.
 target_compile_options(
-  cudec_test_fixtures PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>)
+  cudec_test_fixtures
+  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-O2>)
 
 # GPU tests carry the label (the GPU-less CI runner selects -LE gpu) and
 # run serially: one physical device, and deterministic device state is

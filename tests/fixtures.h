@@ -37,4 +37,10 @@ std::vector<Mutant> MutateStream(const std::vector<unsigned char>& stream,
 bool OracleDecodes(const std::vector<unsigned char>& stream,
                    size_t original_size, std::vector<unsigned char>* decoded);
 
+/* CPU-reference block compression. Fixture generation and the bench
+ * harness share it so every compressed stream in the project has a single
+ * provenance; aborts on compressor failure (infrastructure, not a test). */
+std::vector<unsigned char> Lz4CompressBlock(
+    const std::vector<unsigned char>& original);
+
 #endif /* CUDEC_TESTS_FIXTURES_H */
