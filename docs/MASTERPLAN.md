@@ -168,15 +168,131 @@ a planned milestone — a vendor binary can never follow), and **hackability**.
 
 ## 8. Open design questions (settled via design issues before use)
 
-- Exact LZ4 kernel decomposition: single-pass warp-cooperative decode vs.
-  two-phase (sequence scan, then parallel copy) — decided with measurements
-  in the M1 design issue. The exact batch upper bound is pinned there too:
-  with the kernel geometry settled, the zero-visible-devices technique from
-  the #4 harness distinguishes the boundary through the public API
-  (`CUDEC_ERR_CUDA` = passed validation and reached the launch;
-  `CUDEC_ERR_INVALID_ARGUMENT` = rejected) without publishing the constant.
 - Benchmark corpus set beyond Silesia/enwik (game-asset-like data) — M2.
+- Device-side chunk-size binning for mixed batches — M2 (see section 9:
+  the async ABI rules out host-side histogramming, so section 4's
+  "dispatcher picks per batch histogram" pillar resolves to device-side
+  binning or nothing; M1 ships without a dispatch heuristic).
 
 Settled: test framework and oracle vendoring (section 5, via the #4 design
 review); dev-container image and CI toolchain pinning (issues #1/#3 —
-digest-pinned `nvidia/cuda` 12.6.2 in CI and the local gate).
+digest-pinned `nvidia/cuda` 12.6.2 in CI and the local gate); the LZ4
+kernel decomposition (section 9, via the #6 design panel — single-pass
+warp-per-chunk, with a recorded measurement-based falsification trigger;
+the exact batch upper bound is pinned by the zero-visible-devices
+technique from the #4 harness once the geometry lands:
+`CUDEC_ERR_CUDA` = passed validation and reached the launch,
+`CUDEC_ERR_INVALID_ARGUMENT` = rejected, no constant published).
+
+## 9. M1 kernel design (settled via the #6 design panel, 2026-07-17)
+
+Three candidate designs (single-pass warp-cooperative, two-phase
+scan-then-copy, and a simplest-that-saturates challenger) were developed
+independently and scored by two judges with independent bandwidth and
+occupancy arithmetic. The convergent result:
+
+**One kernel. One warp per chunk over a grid-stride loop. All 32 lanes
+parse the sequence stream redundantly in lockstep** (identical bytes,
+identical arithmetic, identical registers in every lane — no leader lane,
+no shuffles, no parse divergence), **and fan out by lane for every copy.
+No shared memory, no sequence table, no dispatch heuristic.**
+
+Why the arithmetic forces this shape:
+
+- The kernel is parse-bound, not bandwidth-bound. The Silesia-shaped batch
+  moves ~450–550 MB per run (src read + dst write + match-gather misses
+  against 5 MB L2) — a ~300–380 GB/s bandwidth ceiling — while the serial
+  per-chunk parse chain (3–5 dependent L1 loads per sequence, ~3,300
+  sequences per 64 KiB chunk) bounds a naive kernel to ~100–200 GB/s.
+  Parallelism therefore comes from chunks: 3,239 Silesia chunks against
+  3,264 resident warps on the RTX 3080. Warp-per-chunk exposes 32
+  concurrent parse streams per SM; a block-per-chunk two-phase design
+  exposes 4, starving the binding resource to accelerate copies that were
+  never the bottleneck.
+- Table-in-smem two-phase is dead on arithmetic alone, recorded here so
+  nobody re-proposes it: a 64 KiB chunk admits up to 16,385 sequences;
+  at 16 B per table entry that is ~256 KiB — 2.6× an SM's usable shared
+  memory.
+
+**Overlap copy, closed form.** An overlapping match is not a copy that
+chases itself; it is a modular gather from bytes already final:
+`dst[d + i] = dst[d - off + (i mod off)]` reads only `[d - off, d)`, which
+the `__syncwarp()` preceding every copy has frozen. Each output byte is
+written exactly once, by a statically determined lane, as a pure function
+of lower addresses — deterministic because no ordering exists to get
+wrong. The inner loop tracks the modulus incrementally
+(`r += step; if (r >= off) r -= off`) so no lane pays a division per
+iteration.
+
+**The validation ladder** (fail-closed; every stream-decoded value checked
+before first use as address, length, or offset): token existence before
+every token read; length accumulation in 64-bit with the capacity bound
+re-checked inside the 255-continuation loop (each step adds ≤ 255 after
+the check, so the accumulator cannot wrap for any caller-supplied sizes);
+literal presence vs. remaining src; literal fit vs. remaining dst
+capacity; offset-field presence; `offset == 0` rejected;
+`offset > bytes written so far` rejected; match-length fit vs. remaining
+capacity; success ONLY at exact stream consumption after a literals-only
+tail. Edge semantics (end-of-block rules, empty-block tokens) are settled
+empirically by oracle parity — whenever liblz4 rejects, cudec rejects; for
+accepted mutants the comparison is against the oracle's own output and
+size. One crafted negative fixture per ladder branch, its oracle verdict
+asserted in-test, keeps every reject path CI-covered.
+
+**Failure contract:** on any reject, `bytes_written = 0` and a non-OK
+status; dst contents up to the failure point are unspecified but are never
+presented as success. On success, writes touch exactly
+`dst[0, bytes_written)`. Check-before-load is batch isolation, not just
+parity: on a GPU an out-of-bounds read is not a per-chunk failure — it can
+fault the launch and poison the whole batch.
+
+**Anti-pattern rule (from the two-phase candidate's disproof):** no packed
+or narrowed field anywhere in the decoder unless its bound derives from an
+ABI-enforced invariant — the 64 KiB chunk cap is a project convention, not
+an ABI guarantee, and the frozen `size_t` capacities admit larger values.
+A crafted test (valid stream, `dst_capacity > 65536`) pins that the ladder
+stays correct beyond the convention.
+
+**Mechanical gates for every kernel PR** (determinism is enforced, not
+argued): compute-sanitizer memcheck + racecheck clean; same-batch-twice
+bit-compare; whole-Silesia GPU-vs-oracle byte diff; the armed mutant
+reject-parity; the capacity-beyond-convention test. Numbers for an
+unverified decoder are not numbers.
+
+**Occupancy plan:** target ≤ 64 registers/thread for ≥ 32 warps/SM,
+pinned with `__launch_bounds__`; achieved registers and occupancy are read
+out at the kernel PR and recorded — a 24-warp fallback is a measured
+choice, never an accident.
+
+**Measurement decision rule (recorded before the kernel lands):** the
+bench harness gains `PARSE_ONLY` and `COPY_ONLY` compile variants. The
+parse-only number simultaneously ceilings this design and any two-phase
+phase-1 (identical serial ladder, no more concurrent chains), so one
+measurement settles the decomposition question: proceed if parse-only
+projects ≥ ~10× the CPU p50 baseline (≥ ~35 GB/s); reopen two-phase only
+if the shipped kernel measures below ~15× CPU after the first perf pass or
+profiling attributes the majority of stalls to copy starvation.
+
+**Known limits, published:** the redundant-parse family ceiling is roughly
+250–400 GB/s after perf passes — deliberately accepted under "formats over
+percentage points"; batches under ~2,000 chunks underfill the machine and
+land near CPU speed (documented, not hidden); warp-synchronous discipline
+is load-bearing — every `__syncwarp` is reviewed as such.
+
+**M3/M4 seam:** the chunk decoder is `template<class FormatParser>` —
+Snappy (M3) swaps the parser and keeps everything else; GDeflate (M4)
+keeps the copy engine, validation posture, and result contract while
+bringing its format-native 32-substream parse model.
+
+**The M1 PR ladder** (each independently gated): (1) this design section —
+closes the design issue; (2) the sequence parser + validation ladder as a
+single-source `__host__ __device__` header with a CPU-compiled twin test
+running the full mutant corpus and the crafted negatives on the GPU-less
+CI runner — the security heart of M1 lands under CI before any kernel;
+(3) the kernel, minimal-correct, behind the frozen batch ABI — the stub
+deleted, the gpu_fixture expectations flip, all mechanical gates recorded
+(security-review gated: decoder validation is this project's login path);
+(4) the bench GPU path + the split variants + the first recorded GPU
+baselines — numbers and kernel never move in the same PR; (5) a measured
+perf pass (register-window parse staging, vectorized multi-byte lane
+copies), accepted only on recorded improvement with all gates green.
