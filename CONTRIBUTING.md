@@ -16,8 +16,9 @@ Issue-driven, gate-driven:
 - **Fail-closed decoding.** A bitstream that does not validate produces a
   defined error code, never an out-of-bounds access, never a partial guess.
   Every reject path carries an explicit negative test.
-- **The oracles decide.** Decode output is diff-tested against the reference
-  implementations (liblz4, zlib, libzstd) on real and fuzzed corpora.
+- **The oracles decide.** Decode output is diff-tested on real and fuzzed
+  corpora against the reference implementations — liblz4 today, with zlib and
+  libzstd joining as the DEFLATE and Zstd formats land.
 - **Determinism**: same input → same output, bit-exact per code path.
 - **Performance claims are measured**, never reasoned: numbers ship with GPU
   model, driver, CUDA version, corpus, and chunk-size distribution.
