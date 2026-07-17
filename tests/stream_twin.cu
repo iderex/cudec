@@ -413,16 +413,26 @@ int main() {
         REQUIRE_CTX(r.bytes_written == 0, "poison chunk bytes_written %llu",
                     static_cast<unsigned long long>(r.bytes_written));
 
-        /* Poisoned: a perfectly valid batch now returns CUDEC_ERR_CUDA. */
+        /* Poisoned: a perfectly valid batch now returns CUDEC_ERR_CUDA. The
+         * poisoned re-entry is a post-validation non-OK return, so it too must
+         * leave the per-chunk channel a DEFINED non-OK status - never the stale
+         * OK-looking pre-fill. */
         std::vector<unsigned char> out(fixtures[0].original.size() + 8, 0);
         void* d2 = out.data();
         size_t cap2 = out.size();
         const void* s2 = fixtures[0].compressed.data();
         size_t sz2 = fixtures[0].compressed.size();
         cudec_chunk_result r2;
+        r2.status = CUDEC_OK;
+        r2.reserved = 0;
+        r2.bytes_written = 123456;
         REQUIRE(cudec_lz4_decompress_stream_ctx(ctx, &s2, &sz2, &d2, &cap2, 1,
                                                 CUDEC_MEM_HOST, &r2) ==
                 CUDEC_ERR_CUDA);
+        REQUIRE_CTX(r2.status == CUDEC_ERR_CUDA, "poisoned re-entry status %d",
+                    r2.status);
+        REQUIRE_CTX(r2.bytes_written == 0, "poisoned re-entry bytes_written %llu",
+                    static_cast<unsigned long long>(r2.bytes_written));
         cudec_stream_ctx_destroy(ctx); /* still frees, no crash */
     }
 

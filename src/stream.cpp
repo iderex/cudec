@@ -466,8 +466,9 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
         drain = CUDEC_ERR_CUDA;
     }
 
-    /* Publish whatever per-chunk results completed (0xFF non-OK sentinel for
-     * any wave that did not), then decide the aggregate. */
+    /* Publish whatever per-chunk results completed (the defined CUDEC_ERR_CUDA
+     * not-produced seed from above for any wave that did not), then decide the
+     * aggregate. */
     std::memcpy(h_results, ctx.p_results.p, results_bytes);
     if (drain != CUDEC_OK) {
         /* A CUDA-level fault happened; the context is dead. */
@@ -525,8 +526,11 @@ cudec_status cudec_lz4_decompress_stream_ctx(
     if (args != CUDEC_OK) {
         return args;
     }
-    /* A context poisoned by an earlier CUDA fault decodes nothing further. */
+    /* A context poisoned by an earlier CUDA fault decodes nothing further. This
+     * is a post-validation non-OK return, so fail-closed the per-chunk channel
+     * with the defined not-produced status the ABI promises. */
     if (ctx->poisoned) {
+        StampNotDecoded(h_results, chunk_count, CUDEC_ERR_CUDA);
         return CUDEC_ERR_CUDA;
     }
     try {
