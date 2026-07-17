@@ -307,6 +307,18 @@ falsification trigger does NOT reopen two-phase: it stays ruled out by the
 shared parse ceiling regardless of the numeric condition (see
 BENCHMARKS.md).
 
+**Perf pass 2 outcome (issue #21): the occupancy lever is rejected by
+measurement too.** Profiling confirmed 46 registers/thread → 40 warps/SM
+(~83%) on sm_86; register granularity puts 100% occupancy behind ≤ 40
+registers/thread, reachable only by narrowing the 64-bit parser state (barred
+by the anti-pattern rule above) or by forcing a spill. `__launch_bounds__`
+with a min-blocks target of 12 forces the spill and regresses the full decode
+~5% (17.4 → 16.6 GB/s), parse-only flat as the control; no code shipped.
+Raising the parse ceiling needs the warp-specialization rewrite that abandons
+the redundant-lockstep-parse invariant (its own design panel), which under
+"formats over percentage points" ranks below the next format. Recorded in
+[docs/BENCHMARKS.md](BENCHMARKS.md).
+
 **Known limits, published:** the redundant-parse family ceiling is roughly
 250–400 GB/s after perf passes — deliberately accepted under "formats over
 percentage points"; batches under ~2,000 chunks underfill the machine and
