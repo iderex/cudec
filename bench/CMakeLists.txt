@@ -28,3 +28,10 @@ target_compile_options(
 # milestones. (--selfcheck stays CPU-only so it runs on the GPU-less CI
 # runner; the GPU path is exercised by the /bench command and BENCHMARKS.md.)
 add_test(NAME bench_selfcheck COMMAND bench_lz4 --selfcheck)
+
+# The worst-4Bmatch corpus is constructed in-harness and oracle-validated
+# before timing; this runs that construction through the same self-checked
+# path (a few chunks, CPU-only) so a broken generator - one whose stream the
+# oracle no longer accepts, or that stops round-tripping - reds CI, not just
+# a manual bench.
+add_test(NAME bench_worst4b_selfcheck COMMAND bench_lz4 --worst4b --selfcheck)

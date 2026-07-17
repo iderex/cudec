@@ -98,6 +98,7 @@ jobs:
           grep -E ': parser_twin$' host-selected.txt &&
           grep -E ': launch_fail$' host-selected.txt &&
           grep -E ': bench_selfcheck$' host-selected.txt &&
+          grep -E ': bench_worst4b_selfcheck$' host-selected.txt &&
           echo "Deferred to the local GPU gate:" &&
           ctest --test-dir build-cuda -L gpu -N | tee gpu-deferred.txt &&
           grep -E ': smoke$' gpu-deferred.txt &&
