@@ -41,16 +41,42 @@ design (a two-phase phase-1 runs the identical serial parse, so it cannot
 exceed ~35 GB/s either). Two-phase's only lever is a faster phase-2 copy —
 but single-pass's copy is equally optimizable, and doing so needs no table,
 no barrier, and no extra memory traffic. **The decomposition question is
-therefore settled for single-pass.** The perf pass (#16) targets the copy
-first (vectorized multi-byte lane copies + incremental-mod, to pull
-end-to-end toward the ~35 GB/s parse ceiling) and the parse itself second
-(register-window staging, to raise the ceiling). The masterplan
-falsification trigger — reopen two-phase only if the shipped kernel measures
-below ~15x CPU after perf pass 1, or profiling attributes the majority of
-stalls to copy starvation — is evaluated at #16.
+therefore settled for single-pass.** Perf pass 1 (#16) then measured the
+two designed copy/parse micro-optimizations; both were rejected on hardware
+(see "Perf pass 1" below), and the falsification trigger is evaluated there.
 
 Occupancy readout (issue #14): 46 registers/thread, so ≥ 32 warps/SM is
 achievable on sm_86.
+
+### Perf pass 1 (issue #16): the designed micro-optimizations do not help
+
+Both optimizations the #6 design panel grafted for perf pass 1 were
+implemented and measured on Silesia against the ~18 GB/s baseline; **both
+were rejected by measurement** (masterplan rule: accepted only on recorded
+improvement):
+
+| Attempt                                        | Result          | Why                                                                                                                                  |
+| ---------------------------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Incremental-mod match gather                   | ~15 GB/s (−16%) | the loop-carried `r += step` dependency pipelines worse than the independent per-iteration `i % offset`, which the compiler overlaps |
+| Vectorized (16-byte) literal copy              | ~17 GB/s (−6%)  | Silesia's literal runs are mostly < 16 bytes, so the wide path rarely triggers and only adds setup/branch overhead                   |
+| `__syncwarp` elision on zero-literal sequences | neutral         | the barriers are not the bottleneck                                                                                                  |
+
+The empirical conclusion: the minimal-correct byte-per-lane kernel is at a
+local optimum for this workload. The bottleneck is **structural** — the
+redundant 32-lane parse sets the ~34 GB/s ceiling, and the copies are
+latency-bound on the short literal/match runs typical of real data, where
+neither a cheaper modulo nor wider copies help. Meaningful gains require
+raising the parse ceiling itself (higher occupancy via register reduction,
+or warp-specialization), which is larger than a micro-op pass — tracked as
+a follow-up (issue #21).
+
+**Falsification-trigger verdict (masterplan section 9).** The shipped
+kernel is ~5× CPU (below the ~15× reopen threshold), but two-phase stays
+**ruled out**: the parse-only ceiling (~10× CPU) bounds any two-phase
+phase-1, which shares the identical serial parse, so two-phase cannot reach
+~15× either. The trigger's numeric condition is met while its purpose — does
+two-phase help? — is answered NO by the arithmetic. The path to higher
+throughput is structural single-pass work, not a decomposition change.
 
 ## Baseline: CPU oracle (M0, pre-kernel)
 
