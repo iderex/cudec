@@ -172,6 +172,13 @@ cudec_status cudec_stream_ctx_create(cudec_stream_ctx** out_ctx);
  * failure (CUDEC_ERR_CUDA) takes precedence, then the first non-OK chunk's
  * status in index order.
  *
+ * On any non-OK return once the arguments are accepted, every h_results[k]
+ * holds a DEFINED non-OK cudec_status and bytes_written 0: its own decode
+ * error where the decoder reached the chunk, otherwise CUDEC_ERR_CUDA for a
+ * chunk the call did not produce (a staging-grow or CUDA fault) - never a
+ * stale or out-of-enum value. (A CUDEC_ERR_INVALID_ARGUMENT reject, where an
+ * array argument may itself be NULL, leaves h_results untouched.)
+ *
  * A CUDA fault during a decode POISONS the context: it returns CUDEC_ERR_CUDA,
  * every later decode on it returns CUDEC_ERR_CUDA without touching the device,
  * and only cudec_stream_ctx_destroy is valid on it thereafter. Never throws

@@ -394,10 +394,24 @@ int main() {
         unsigned char sink = 0; /* a real, tiny host dst; never written */
         void* dst = &sink;
         size_t huge_cap = static_cast<size_t>(1) << 60; /* impossible alloc */
+        /* Pre-fill with an OK-looking record: the grow fault happens BEFORE the
+         * wave loop, so nothing reads this chunk back. The contract still
+         * requires the per-chunk channel to be left DEFINED non-OK, so this
+         * OK-looking value must be overwritten - if it survives, the fail-closed
+         * stamp is missing. */
         cudec_chunk_result r;
+        r.status = CUDEC_OK;
+        r.reserved = 0;
+        r.bytes_written = 123456;
         REQUIRE(cudec_lz4_decompress_stream_ctx(ctx, &src, &ssz, &dst,
                                                 &huge_cap, 1, CUDEC_MEM_HOST,
                                                 &r) == CUDEC_ERR_CUDA);
+        /* Fail-closed per-chunk on the pre-loop grow-fault path: a defined non-OK
+         * status and no claimed output, never the stale OK-looking pre-fill. */
+        REQUIRE_CTX(r.status == CUDEC_ERR_CUDA, "poison chunk status %d",
+                    r.status);
+        REQUIRE_CTX(r.bytes_written == 0, "poison chunk bytes_written %llu",
+                    static_cast<unsigned long long>(r.bytes_written));
 
         /* Poisoned: a perfectly valid batch now returns CUDEC_ERR_CUDA. */
         std::vector<unsigned char> out(fixtures[0].original.size() + 8, 0);

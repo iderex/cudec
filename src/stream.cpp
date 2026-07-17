@@ -13,10 +13,15 @@
  *
  * Why a single stream, no ring: the #24 measurement showed the copy/decode
  * overlap ceiling is only ~25% for LZ4 (the compressed H2D is ~4 ms against a
- * ~12 ms decode - LZ4's ~2:1 ratio keeps the input small), and the real cost
- * was the per-call ring allocation. Under correctness > measured performance >
- * minimal code, the N-stream ring is dropped for a single stream whose one
- * reusable staging set is grown on demand and reused. See docs/BENCHMARKS.md
+ * ~12 ms decode - LZ4's ~2:1 ratio keeps the input small), so the N-stream ring
+ * bought almost no overlap. Measuring a context that allocates nothing in steady
+ * state also corrected #24's own diagnosis: the per-call allocation is NOT the
+ * dominant cost - reuse saves only ~8 ms (cold - steady) of the ~230 ms wall.
+ * The dominant streaming cost is the per-wave serial submission (~51 waves for
+ * Silesia), tracked as the real lever in issue #33. Under correctness > measured
+ * performance > minimal code, the N-stream ring is therefore dropped for a
+ * single stream whose one reusable staging set is grown on demand and reused;
+ * the amortization this context buys is real but small. See docs/BENCHMARKS.md
  * for the corrected overlap analysis and the output-D2H future lever. */
 #include "cudec.h"
 
@@ -199,6 +204,20 @@ cudec_status ValidateStreamArgs(const void* const* h_src_ptrs,
     return CUDEC_OK;
 }
 
+/* Stamps a defined non-OK status into every per-chunk record. Used to leave the
+ * per-chunk channel fail-closed with a DEFINED cudec_status value (never a stale
+ * or out-of-enum byte pattern) on any post-validation path that returns without
+ * the device reporting a chunk. `status` is stored as int32; bytes_written is
+ * zeroed, matching the "no output on error" contract. */
+void StampNotDecoded(cudec_chunk_result* results, size_t chunk_count,
+                     cudec_status status) {
+    for (size_t i = 0; i < chunk_count; i++) {
+        results[i].status = static_cast<int32_t>(status);
+        results[i].reserved = 0;
+        results[i].bytes_written = 0;
+    }
+}
+
 /* Decodes the whole batch on the context's single stream. Grows the staging to
  * this call's high-water mark first (reusing it when already large enough),
  * then stages and launches each wave in order. A CUDA-level fault (a failed
@@ -213,6 +232,13 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
                              cudec_chunk_result* h_results) {
     const bool host_out = (dst_space == CUDEC_MEM_HOST);
     const size_t wave_count = (chunk_count + kWaveChunks - 1) / kWaveChunks;
+
+    /* Fail-closed the per-chunk channel up front: any post-validation early
+     * return below (a size-overflow reject or a staging-grow failure) then
+     * leaves every h_results[k] reading a DEFINED not-produced status rather than
+     * stale caller memory. Successful and mid-wave-failure returns overwrite this
+     * with the real per-chunk outcomes via the pinned-mirror publish. */
+    StampNotDecoded(h_results, chunk_count, CUDEC_ERR_CUDA);
 
     /* Largest single wave's compressed bytes and (host-output) destination
      * bytes set the grow-to sizes: fixed for the whole call, so a hostile
@@ -281,10 +307,12 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
     cudaStream_t stream = ctx.stream.s;
     cudaEvent_t reuse = ctx.reuse_ev.e;
 
-    /* 0xFF is a non-OK status sentinel: any wave that fails to complete before
-     * an error return leaves its result records reading not-OK rather than
-     * stale caller memory. Only the active prefix is stamped. */
-    std::memset(ctx.p_results.p, 0xFF, results_bytes);
+    /* Seed the pinned result mirror with a DEFINED not-produced status: any wave
+     * that does not complete before an error return then publishes CUDEC_ERR_CUDA
+     * (not a stale or out-of-enum value) for its chunks, while completed waves
+     * overwrite their slice via the result readback below. */
+    StampNotDecoded(static_cast<cudec_chunk_result*>(ctx.p_results.p),
+                    chunk_count, CUDEC_ERR_CUDA);
 
     /* On an error inside the wave loop we break rather than return, so the
      * unconditional drain below completes the in-flight stream before the RAII
