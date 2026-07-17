@@ -1,88 +1,141 @@
-/* Pinned-host streaming LZ4 block decode: host-resident compressed chunks
- * decoded on the GPU with the H2D copy overlapped against decode across N
- * CUDA streams (masterplan section 4, the asset-streaming memory path, M2).
+/* Reusable single-stream context for pinned-host streaming LZ4 block decode:
+ * host-resident compressed chunks decoded on the GPU, with the per-call CUDA
+ * allocation of the earlier N-stream ring amortized into a caller-held context
+ * that is created once and reused across decodes (masterplan section 4, the
+ * asset-streaming memory path, M2).
  *
  * This adds NO kernel and NO parser code: it is host-side copy/stream
  * choreography around the unchanged, already-fuzzed cudec_lz4_decompress_batch,
  * which is reused verbatim per wave. Per-chunk output and result indices are
- * disjoint, so stream interleaving cannot change the bytes - the output is
- * bit-identical for every stream count (determinism by construction). The
- * per-frame staging in frame.cpp is the future consumer of this path (#24's
- * note in frame.cpp); wiring frame.cpp onto it is a separate change. */
+ * disjoint and a single stream executes every wave in order, so the output is
+ * bit-identical on every path (determinism by construction) - across a fresh
+ * context and a reused one, and before and after a grow.
+ *
+ * Why a single stream, no ring: the #24 measurement showed the copy/decode
+ * overlap ceiling is only ~25% for LZ4 (the compressed H2D is ~4 ms against a
+ * ~12 ms decode - LZ4's ~2:1 ratio keeps the input small), and the real cost
+ * was the per-call ring allocation. Under correctness > measured performance >
+ * minimal code, the N-stream ring is dropped for a single stream whose one
+ * reusable staging set is grown on demand and reused. See docs/BENCHMARKS.md
+ * for the corrected overlap analysis and the output-D2H future lever. */
 #include "cudec.h"
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <cstring>
-#include <vector>
+#include <new>
 
-namespace {
+namespace cudec_stream_detail {
 
-constexpr unsigned kDefaultStreams = 4;
-constexpr unsigned kMaxStreams = 32;
 constexpr size_t kWaveChunks = 64; /* chunks per wave: amortizes launch cost */
-constexpr size_t kRingDepth = 2;   /* ring slots per stream (double-buffer) */
 
-/* The batch entry's own launch limit; a stream batch cannot exceed it
- * either. Kept in sync with validate_batch_args in lz4_decode.cuh. */
+/* The batch entry's own launch limit; a stream batch cannot exceed it either.
+ * Kept in sync with validate_batch_args in lz4_decode.cuh. */
 constexpr size_t kMaxChunks = static_cast<size_t>(INT32_MAX) * 32;
 
-bool MulOverflows(size_t a, size_t b) { return a != 0 && b > SIZE_MAX / a; }
+/* Metadata layout inside p_meta/d_meta for a wave of up to kWaveChunks chunks:
+ * [src_ptrs][src_sizes][dst_ptrs][dst_caps], each kWaveChunks wide, 8-byte
+ * elements. Fixed size, so the metadata staging never grows past this. */
+constexpr size_t kMetaStride = kWaveChunks * sizeof(void*);
+constexpr size_t kMetaBytes = 4 * kMetaStride;
 
-/* RAII owners so every device/pinned/stream/event allocation is freed on
- * every return path, including the reject and exception paths. */
-struct DevPtr {
+inline bool MulOverflows(size_t a, size_t b) {
+    return a != 0 && b > SIZE_MAX / a;
+}
+
+/* Grow-only device buffer. ensure() reuses the existing allocation when it is
+ * already large enough (the amortization); otherwise it frees the old one and
+ * allocates the larger size. On failure the owner holds nothing (null, cap 0),
+ * so the destructor never double-frees - the enclosing context is poisoned by
+ * the caller and only its destruction is valid afterwards. All grows happen
+ * before any staging in a decode, so no live buffer is ever reallocated
+ * mid-call. */
+struct DevBuf {
     void* p = nullptr;
-    DevPtr() = default;
-    DevPtr(const DevPtr&) = delete;
-    DevPtr& operator=(const DevPtr&) = delete;
-    ~DevPtr() {
+    size_t cap = 0;
+    DevBuf() = default;
+    DevBuf(const DevBuf&) = delete;
+    DevBuf& operator=(const DevBuf&) = delete;
+    ~DevBuf() {
         if (p != nullptr) {
             (void)cudaFree(p);
         }
     }
-    cudaError_t alloc(size_t bytes) { return cudaMalloc(&p, bytes); }
+    cudaError_t ensure(size_t bytes) {
+        if (bytes <= cap) {
+            return cudaSuccess;
+        }
+        if (p != nullptr) {
+            (void)cudaFree(p);
+            p = nullptr;
+            cap = 0;
+        }
+        const cudaError_t e = cudaMalloc(&p, bytes);
+        if (e != cudaSuccess) {
+            p = nullptr;
+            return e;
+        }
+        cap = bytes;
+        return cudaSuccess;
+    }
 };
 
-struct PinnedPtr {
+/* Grow-only pinned host buffer, same contract as DevBuf. */
+struct PinnedBuf {
     void* p = nullptr;
-    PinnedPtr() = default;
-    PinnedPtr(const PinnedPtr&) = delete;
-    PinnedPtr& operator=(const PinnedPtr&) = delete;
-    ~PinnedPtr() {
+    size_t cap = 0;
+    PinnedBuf() = default;
+    PinnedBuf(const PinnedBuf&) = delete;
+    PinnedBuf& operator=(const PinnedBuf&) = delete;
+    ~PinnedBuf() {
         if (p != nullptr) {
             (void)cudaFreeHost(p);
         }
     }
-    cudaError_t alloc(size_t bytes) {
-        return cudaHostAlloc(&p, bytes, cudaHostAllocDefault);
+    cudaError_t ensure(size_t bytes) {
+        if (bytes <= cap) {
+            return cudaSuccess;
+        }
+        if (p != nullptr) {
+            (void)cudaFreeHost(p);
+            p = nullptr;
+            cap = 0;
+        }
+        const cudaError_t e = cudaHostAlloc(&p, bytes, cudaHostAllocDefault);
+        if (e != cudaSuccess) {
+            p = nullptr;
+            return e;
+        }
+        cap = bytes;
+        return cudaSuccess;
     }
 };
 
-struct StreamPtr {
+struct StreamOwner {
     cudaStream_t s = nullptr;
-    StreamPtr() = default;
-    StreamPtr(const StreamPtr&) = delete;
-    StreamPtr& operator=(const StreamPtr&) = delete;
-    ~StreamPtr() {
+    StreamOwner() = default;
+    StreamOwner(const StreamOwner&) = delete;
+    StreamOwner& operator=(const StreamOwner&) = delete;
+    ~StreamOwner() {
         if (s != nullptr) {
             (void)cudaStreamDestroy(s);
         }
     }
     cudaError_t create() {
-        /* Non-blocking so the overlap does not depend on the legacy default
-         * stream staying idle (a caller with default-stream work in the same
-         * context would otherwise serialize every wave). */
+        /* Non-blocking so a wave does not depend on the legacy default stream
+         * staying idle (a caller with default-stream work in the same context
+         * would otherwise serialize every wave). */
         return cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
     }
 };
 
-struct EventPtr {
+struct EventOwner {
     cudaEvent_t e = nullptr;
-    EventPtr() = default;
-    EventPtr(const EventPtr&) = delete;
-    EventPtr& operator=(const EventPtr&) = delete;
-    ~EventPtr() {
+    EventOwner() = default;
+    EventOwner(const EventOwner&) = delete;
+    EventOwner& operator=(const EventOwner&) = delete;
+    ~EventOwner() {
         if (e != nullptr) {
             (void)cudaEventDestroy(e);
         }
@@ -90,67 +143,61 @@ struct EventPtr {
     cudaError_t create() { return cudaEventCreate(&e); }
 };
 
-/* Per ring slot: one pinned staging buffer + one device buffer for the
- * wave's compressed sources, a pinned+device metadata buffer for the batch
- * entry's per-chunk pointer/size arrays, an optional device destination
- * staging buffer (host-output only), and a completion event. Slots are
- * reused round-robin; a slot's event gates its reuse. */
-struct Slot {
-    PinnedPtr p_src;
-    DevPtr d_src;
-    PinnedPtr p_meta;
-    DevPtr d_meta;
-    DevPtr d_dst; /* host-output staging only */
-    EventPtr ev;
+}  // namespace cudec_stream_detail
+
+/* The opaque context (the header forward-declares `struct cudec_stream_ctx`).
+ * One non-blocking stream, one grow-only pinned+device compressed-source
+ * staging pair, one grow-only pinned+device metadata pair, one grow-only
+ * device destination staging (host-output only), one grow-only device result
+ * buffer with a pinned mirror, and one reuse event that gates reuse of the
+ * single pinned-source buffer across waves. `poisoned` latches on a CUDA fault
+ * during a decode: only destruction is valid afterwards.
+ *
+ * Not thread-safe: one context per thread, no internal locking (documented on
+ * the ABI). The member types have external linkage (named namespace) so this
+ * ABI-visible struct triggers no subobject-linkage diagnostic. */
+struct cudec_stream_ctx {
+    cudec_stream_detail::StreamOwner stream;
+    cudec_stream_detail::EventOwner reuse_ev;
+    cudec_stream_detail::PinnedBuf p_src;
+    cudec_stream_detail::DevBuf d_src;
+    cudec_stream_detail::PinnedBuf p_meta;
+    cudec_stream_detail::DevBuf d_meta;
+    cudec_stream_detail::DevBuf d_dst; /* host-output staging only */
+    cudec_stream_detail::DevBuf d_results;
+    cudec_stream_detail::PinnedBuf p_results;
+    bool poisoned = false;
 };
 
-/* Metadata layout inside p_meta/d_meta for a wave of up to kWaveChunks
- * chunks: [src_ptrs][src_sizes][dst_ptrs][dst_caps], each kWaveChunks wide,
- * 8-byte elements. */
-constexpr size_t kMetaStride = kWaveChunks * sizeof(void*);
-constexpr size_t kMetaBytes = 4 * kMetaStride;
+namespace {
 
-cudec_status DecodeStream(const void* const* h_src_ptrs,
-                          const size_t* h_src_sizes, void* const* dst_ptrs,
-                          const size_t* dst_caps, size_t chunk_count,
-                          cudec_mem_space dst_space, unsigned streams,
-                          cudec_chunk_result* h_results) {
-#define STREAM_CUDA(call)                       \
-    do {                                        \
-        if ((call) != cudaSuccess) {            \
-            return CUDEC_ERR_CUDA;              \
-        }                                       \
-    } while (0)
+using namespace cudec_stream_detail;
 
+/* Decodes the whole batch on the context's single stream. Grows the staging to
+ * this call's high-water mark first (reusing it when already large enough),
+ * then stages and launches each wave in order. A CUDA-level fault (a failed
+ * copy/launch/sync, or a grow allocation failure) poisons the context and
+ * returns CUDEC_ERR_CUDA; per-chunk decode rejects are reported in h_results
+ * and never poison. */
+cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
+                             const void* const* h_src_ptrs,
+                             const size_t* h_src_sizes, void* const* dst_ptrs,
+                             const size_t* dst_caps, size_t chunk_count,
+                             cudec_mem_space dst_space,
+                             cudec_chunk_result* h_results) {
     const bool host_out = (dst_space == CUDEC_MEM_HOST);
     const size_t wave_count = (chunk_count + kWaveChunks - 1) / kWaveChunks;
 
-    unsigned n_streams = (streams == 0) ? kDefaultStreams : streams;
-    if (n_streams > kMaxStreams) {
-        n_streams = kMaxStreams;
-    }
-    if (static_cast<size_t>(n_streams) > wave_count) {
-        n_streams = static_cast<unsigned>(wave_count);
-    }
-    /* Host output drains each wave before issuing the next (the readback to
-     * pageable caller memory is synchronous), so extra streams and ring slots
-     * buy no overlap - collapse to a single stream and avoid provisioning a
-     * fan-out that never engages. */
-    if (host_out) {
-        n_streams = 1;
-    }
-    const size_t n_slots = static_cast<size_t>(n_streams) * kRingDepth;
-
-    /* Largest single wave's compressed bytes and destination bytes decide
-     * the per-slot buffer sizes (fixed for the whole call, so a hostile
-     * chunk_count cannot drive per-wave growth). */
+    /* Largest single wave's compressed bytes and (host-output) destination
+     * bytes set the grow-to sizes: fixed for the whole call, so a hostile
+     * chunk_count cannot drive per-wave growth. */
     size_t max_wave_src = 0;
     size_t max_wave_dst = 0;
     for (size_t w = 0; w < wave_count; w++) {
         const size_t begin = w * kWaveChunks;
-        const size_t end =
-            (begin + kWaveChunks < chunk_count) ? begin + kWaveChunks
-                                                : chunk_count;
+        const size_t end = (begin + kWaveChunks < chunk_count)
+                               ? begin + kWaveChunks
+                               : chunk_count;
         size_t wsrc = 0, wdst = 0;
         for (size_t i = begin; i < end; i++) {
             if (SIZE_MAX - wsrc < h_src_sizes[i]) {
@@ -178,46 +225,47 @@ cudec_status DecodeStream(const void* const* h_src_ptrs,
         max_wave_dst = 1;
     }
 
-    /* Shared results: one device buffer + a pinned mirror so the per-wave
-     * result readback stays async (a device->pageable copy would sync and
-     * serialize the pipeline). */
     if (MulOverflows(chunk_count, sizeof(cudec_chunk_result))) {
         return CUDEC_ERR_CORRUPT_INPUT;
     }
     const size_t results_bytes = chunk_count * sizeof(cudec_chunk_result);
-    DevPtr d_results;
-    PinnedPtr p_results;
-    STREAM_CUDA(d_results.alloc(results_bytes));
-    STREAM_CUDA(p_results.alloc(results_bytes));
-    /* 0xFF is a non-OK status sentinel: any wave that fails to complete
-     * before an error return leaves its result records reading not-OK rather
-     * than stale caller memory. */
-    std::memset(p_results.p, 0xFF, results_bytes);
 
-    std::vector<StreamPtr> stream_pool(n_streams);
-    for (unsigned s = 0; s < n_streams; s++) {
-        STREAM_CUDA(stream_pool[s].create());
+    /* Grow-only staging. A grow allocation failure (e.g. an oversized
+     * cudaMalloc) leaves the context's buffers partially grown; poison so only
+     * destruction is valid afterwards. This is a DEFINED failure, reachable
+     * through the public API without any undefined behavior. */
+#define GROW(call)                   \
+    do {                             \
+        if ((call) != cudaSuccess) { \
+            ctx.poisoned = true;     \
+            return CUDEC_ERR_CUDA;   \
+        }                            \
+    } while (0)
+    GROW(ctx.p_src.ensure(max_wave_src));
+    GROW(ctx.d_src.ensure(max_wave_src));
+    GROW(ctx.p_meta.ensure(kMetaBytes));
+    GROW(ctx.d_meta.ensure(kMetaBytes));
+    if (host_out) {
+        GROW(ctx.d_dst.ensure(max_wave_dst));
     }
-    std::vector<Slot> slots(n_slots);
-    for (size_t s = 0; s < n_slots; s++) {
-        STREAM_CUDA(slots[s].p_src.alloc(max_wave_src));
-        STREAM_CUDA(slots[s].d_src.alloc(max_wave_src));
-        STREAM_CUDA(slots[s].p_meta.alloc(kMetaBytes));
-        STREAM_CUDA(slots[s].d_meta.alloc(kMetaBytes));
-        if (host_out) {
-            STREAM_CUDA(slots[s].d_dst.alloc(max_wave_dst));
-        }
-        STREAM_CUDA(slots[s].ev.create());
-    }
+    GROW(ctx.d_results.ensure(results_bytes));
+    GROW(ctx.p_results.ensure(results_bytes));
+#undef GROW
+
+    cudaStream_t stream = ctx.stream.s;
+    cudaEvent_t reuse = ctx.reuse_ev.e;
+
+    /* 0xFF is a non-OK status sentinel: any wave that fails to complete before
+     * an error return leaves its result records reading not-OK rather than
+     * stale caller memory. Only the active prefix is stamped. */
+    std::memset(ctx.p_results.p, 0xFF, results_bytes);
 
     /* On an error inside the wave loop we break rather than return, so the
-     * unconditional drain below completes every in-flight stream before the
-     * RAII owners free the buffers those streams are still reading/writing
-     * (not relying on cudaFree's implicit device sync). WAVE_FAIL records the
-     * failure and stops the loop. */
+     * unconditional drain below completes the in-flight stream before the RAII
+     * owners (at context destruction) free the buffers it is still
+     * reading/writing. WAVE_FAIL records the fault and stops the loop. */
     cudec_status wave_status = CUDEC_OK;
-    /* Used only inside braced if-blocks in the wave loop; the break exits the
-     * wave loop (not a do-while) so control reaches the unconditional drain. */
+    bool have_pending_src = false; /* whether reuse has been recorded */
 #define WAVE_FAIL(st)       \
     {                       \
         wave_status = (st); \
@@ -226,34 +274,35 @@ cudec_status DecodeStream(const void* const* h_src_ptrs,
 
     for (size_t w = 0; w < wave_count; w++) {
         const size_t begin = w * kWaveChunks;
-        const size_t end =
-            (begin + kWaveChunks < chunk_count) ? begin + kWaveChunks
-                                                : chunk_count;
+        const size_t end = (begin + kWaveChunks < chunk_count)
+                               ? begin + kWaveChunks
+                               : chunk_count;
         const size_t wn = end - begin;
-        const unsigned si = static_cast<unsigned>(w % n_streams);
-        Slot& slot = slots[w % n_slots];
-        cudaStream_t stream = stream_pool[si].s;
 
-        /* Reuse gate: wait for the slot's previous wave to complete before
-         * overwriting its buffers. A never-recorded event returns at once. */
-        if (cudaEventSynchronize(slot.ev.e) != cudaSuccess) {
+        /* Reuse gate: the single pinned source/metadata staging is overwritten
+         * every wave, so wait for the previous wave's H2D of it to finish
+         * before the host memcpy clobbers it. This is the one cheap overlap the
+         * single-stream design keeps: while the host is blocked here, the GPU
+         * runs the previous wave's decode and result readback. The first wave
+         * never recorded the event. */
+        if (have_pending_src &&
+            cudaEventSynchronize(reuse) != cudaSuccess) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
 
         /* Stage the wave's compressed sources contiguously and build the
          * per-chunk device pointer/size arrays into the pinned metadata. */
-        unsigned char* p_src = static_cast<unsigned char*>(slot.p_src.p);
-        unsigned char* d_src = static_cast<unsigned char*>(slot.d_src.p);
-        unsigned char* d_dst = static_cast<unsigned char*>(slot.d_dst.p);
-        const void** m_src =
-            reinterpret_cast<const void**>(static_cast<unsigned char*>(
-                slot.p_meta.p));
+        unsigned char* p_src = static_cast<unsigned char*>(ctx.p_src.p);
+        unsigned char* d_src = static_cast<unsigned char*>(ctx.d_src.p);
+        unsigned char* d_dst = static_cast<unsigned char*>(ctx.d_dst.p);
+        const void** m_src = reinterpret_cast<const void**>(
+            static_cast<unsigned char*>(ctx.p_meta.p));
         size_t* m_ssz = reinterpret_cast<size_t*>(
-            static_cast<unsigned char*>(slot.p_meta.p) + kMetaStride);
+            static_cast<unsigned char*>(ctx.p_meta.p) + kMetaStride);
         void** m_dst = reinterpret_cast<void**>(
-            static_cast<unsigned char*>(slot.p_meta.p) + 2 * kMetaStride);
+            static_cast<unsigned char*>(ctx.p_meta.p) + 2 * kMetaStride);
         size_t* m_cap = reinterpret_cast<size_t*>(
-            static_cast<unsigned char*>(slot.p_meta.p) + 3 * kMetaStride);
+            static_cast<unsigned char*>(ctx.p_meta.p) + 3 * kMetaStride);
 
         size_t src_off = 0;
         size_t dst_off = 0;
@@ -276,9 +325,8 @@ cudec_status DecodeStream(const void* const* h_src_ptrs,
         }
 
         /* Device metadata pointers into d_meta (same layout as p_meta). */
-        unsigned char* dm = static_cast<unsigned char*>(slot.d_meta.p);
-        const void* const* dd_src =
-            reinterpret_cast<const void* const*>(dm);
+        unsigned char* dm = static_cast<unsigned char*>(ctx.d_meta.p);
+        const void* const* dd_src = reinterpret_cast<const void* const*>(dm);
         const size_t* dd_ssz =
             reinterpret_cast<const size_t*>(dm + kMetaStride);
         void* const* dd_dst =
@@ -291,15 +339,21 @@ cudec_status DecodeStream(const void* const* h_src_ptrs,
                             stream) != cudaSuccess) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
-        if (cudaMemcpyAsync(slot.d_meta.p, slot.p_meta.p, kMetaBytes,
+        if (cudaMemcpyAsync(ctx.d_meta.p, ctx.p_meta.p, kMetaBytes,
                             cudaMemcpyHostToDevice, stream) != cudaSuccess) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
+        /* Record after both H2D copies so the next wave's reuse gate waits for
+         * the pinned source AND metadata reads to complete. */
+        if (cudaEventRecord(reuse, stream) != cudaSuccess) {
+            WAVE_FAIL(CUDEC_ERR_CUDA);
+        }
+        have_pending_src = true;
 
-        /* The per-wave result slice is offset*16 into a cudaMalloc base, so
-         * it satisfies the batch entry's 16-byte-alignment requirement. */
+        /* The per-wave result slice is offset*16 into a cudaMalloc base, so it
+         * satisfies the batch entry's 16-byte-alignment requirement. */
         cudec_chunk_result* d_res =
-            static_cast<cudec_chunk_result*>(d_results.p) + begin;
+            static_cast<cudec_chunk_result*>(ctx.d_results.p) + begin;
         const cudec_status launched = cudec_lz4_decompress_batch(
             dd_src, dd_ssz, dd_dst, dd_cap, wn, d_res, stream);
         if (launched != CUDEC_OK) {
@@ -308,26 +362,25 @@ cudec_status DecodeStream(const void* const* h_src_ptrs,
 
         /* Result readback into the pinned mirror (async). */
         if (cudaMemcpyAsync(
-                static_cast<cudec_chunk_result*>(p_results.p) + begin, d_res,
-                wn * sizeof(cudec_chunk_result), cudaMemcpyDeviceToHost,
+                static_cast<cudec_chunk_result*>(ctx.p_results.p) + begin,
+                d_res, wn * sizeof(cudec_chunk_result), cudaMemcpyDeviceToHost,
                 stream) != cudaSuccess) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
 
         if (host_out) {
             /* Copy exactly bytes_written per chunk into the caller's host
-             * buffer, leaving the tail beyond it untouched - the same
-             * contract as the device-output path, and no cross-chunk residue.
-             * The exact length needs the per-chunk result, so this wave is
-             * drained first; the D2H targets pageable caller memory and is
-             * therefore synchronous, so host-output does not overlap in this
-             * cut (device-output is the overlapped path). Overlapping the
-             * host readback needs a pinned output ring - a later change. */
+             * buffer, leaving the tail beyond it untouched - the same contract
+             * as the device-output path, and no cross-chunk residue. The exact
+             * length needs the per-chunk result, so this wave is drained first;
+             * the D2H targets pageable caller memory and is therefore
+             * synchronous, so host-output does not overlap (device-output is
+             * the overlapped path). */
             if (cudaStreamSynchronize(stream) != cudaSuccess) {
                 WAVE_FAIL(CUDEC_ERR_CUDA);
             }
             const cudec_chunk_result* wr =
-                static_cast<cudec_chunk_result*>(p_results.p) + begin;
+                static_cast<cudec_chunk_result*>(ctx.p_results.p) + begin;
             size_t off = 0;
             bool copy_failed = false;
             for (size_t j = 0; j < wn; j++) {
@@ -345,22 +398,15 @@ cudec_status DecodeStream(const void* const* h_src_ptrs,
                 WAVE_FAIL(CUDEC_ERR_CUDA);
             }
         }
-
-        /* Gate slot reuse on the whole wave's completion. */
-        if (cudaEventRecord(slot.ev.e, stream) != cudaSuccess) {
-            WAVE_FAIL(CUDEC_ERR_CUDA);
-        }
     }
 #undef WAVE_FAIL
 
-    /* Drain every stream unconditionally so no async work outlives the RAII
-     * teardown, and surface any async fault as a defined error. */
+    /* Drain the stream unconditionally so no async work outlives this call
+     * (the entry is synchronous), and surface any async fault as a defined
+     * error. */
     cudec_status drain = wave_status;
-    for (unsigned s = 0; s < n_streams; s++) {
-        if (cudaStreamSynchronize(stream_pool[s].s) != cudaSuccess &&
-            drain == CUDEC_OK) {
-            drain = CUDEC_ERR_CUDA;
-        }
+    if (cudaStreamSynchronize(stream) != cudaSuccess && drain == CUDEC_OK) {
+        drain = CUDEC_ERR_CUDA;
     }
     if (cudaGetLastError() != cudaSuccess && drain == CUDEC_OK) {
         drain = CUDEC_ERR_CUDA;
@@ -368,24 +414,96 @@ cudec_status DecodeStream(const void* const* h_src_ptrs,
 
     /* Publish whatever per-chunk results completed (0xFF non-OK sentinel for
      * any wave that did not), then decide the aggregate. */
-    std::memcpy(h_results, p_results.p, results_bytes);
+    std::memcpy(h_results, ctx.p_results.p, results_bytes);
     if (drain != CUDEC_OK) {
+        /* A CUDA-level fault happened; the context is dead. */
+        ctx.poisoned = true;
         return drain;
     }
 
-    /* Aggregate: OK iff every chunk decoded OK, else the first non-OK in
-     * index order - a lazy caller checking only the return still fails
-     * closed. */
+    /* Aggregate: OK iff every chunk decoded OK, else the first non-OK in index
+     * order - a lazy caller checking only the return still fails closed. A
+     * per-chunk reject is a normal fail-closed outcome and does NOT poison. */
     for (size_t i = 0; i < chunk_count; i++) {
         if (h_results[i].status != CUDEC_OK) {
             return static_cast<cudec_status>(h_results[i].status);
         }
     }
     return CUDEC_OK;
-#undef STREAM_CUDA
 }
 
 }  // namespace
+
+cudec_status cudec_stream_ctx_create(cudec_stream_ctx** out_ctx) {
+    if (out_ctx == nullptr) {
+        return CUDEC_ERR_INVALID_ARGUMENT;
+    }
+    *out_ctx = nullptr;
+    cudec_stream_ctx* ctx = new (std::nothrow) cudec_stream_ctx();
+    if (ctx == nullptr) {
+        return CUDEC_ERR_CUDA; /* host OOM - never crosses the ABI as throw */
+    }
+    /* The only create-time device resources are the single stream and the
+     * reuse event; the staging is allocated lazily on first decode (grow-only,
+     * so create takes no sizing parameters). */
+    if (ctx->stream.create() != cudaSuccess ||
+        ctx->reuse_ev.create() != cudaSuccess) {
+        delete ctx; /* RAII frees whichever of the two succeeded */
+        return CUDEC_ERR_CUDA;
+    }
+    *out_ctx = ctx;
+    return CUDEC_OK;
+}
+
+cudec_status cudec_lz4_decompress_stream_ctx(
+    cudec_stream_ctx* ctx, const void* const* h_src_ptrs,
+    const size_t* h_src_sizes, void* const* dst_ptrs, const size_t* dst_caps,
+    size_t chunk_count, cudec_mem_space dst_space,
+    cudec_chunk_result* h_results) {
+    if (ctx == nullptr || h_src_ptrs == nullptr || h_src_sizes == nullptr ||
+        dst_ptrs == nullptr || dst_caps == nullptr || h_results == nullptr ||
+        chunk_count == 0 || chunk_count > cudec_stream_detail::kMaxChunks ||
+        (dst_space != CUDEC_MEM_HOST && dst_space != CUDEC_MEM_DEVICE)) {
+        return CUDEC_ERR_INVALID_ARGUMENT;
+    }
+    /* A NULL source with a non-zero size (a host read that would segfault) or a
+     * NULL destination for a chunk that claims capacity is a caller error;
+     * reject the whole call before touching the device. Argument rejects never
+     * poison the context. */
+    for (size_t i = 0; i < chunk_count; i++) {
+        if ((h_src_ptrs[i] == nullptr && h_src_sizes[i] != 0) ||
+            (dst_ptrs[i] == nullptr && dst_caps[i] != 0)) {
+            return CUDEC_ERR_INVALID_ARGUMENT;
+        }
+    }
+    /* A context poisoned by an earlier CUDA fault decodes nothing further. */
+    if (ctx->poisoned) {
+        return CUDEC_ERR_CUDA;
+    }
+    try {
+        return DecodeStreamCtx(*ctx, h_src_ptrs, h_src_sizes, dst_ptrs,
+                               dst_caps, chunk_count, dst_space, h_results);
+    } catch (...) {
+        /* A host allocation failed mid-decode; never let it cross the C ABI,
+         * and poison since the context's state is now unknown. */
+        ctx->poisoned = true;
+        return CUDEC_ERR_CUDA;
+    }
+}
+
+void cudec_stream_ctx_destroy(cudec_stream_ctx* ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    /* The decode entry drains on every return, so nothing is normally pending;
+     * this defensive sync is valid on a poisoned context too (it simply
+     * surfaces the fault, which is ignored) and guarantees no async work
+     * touches the buffers the destructor is about to free. */
+    if (ctx->stream.s != nullptr) {
+        (void)cudaStreamSynchronize(ctx->stream.s);
+    }
+    delete ctx;
+}
 
 cudec_status cudec_lz4_decompress_stream(const void* const* h_src_ptrs,
                                          const size_t* h_src_sizes,
@@ -393,28 +511,18 @@ cudec_status cudec_lz4_decompress_stream(const void* const* h_src_ptrs,
                                          const size_t* dst_caps,
                                          size_t chunk_count,
                                          cudec_mem_space dst_space,
-                                         unsigned streams,
                                          cudec_chunk_result* h_results) {
-    if (h_src_ptrs == nullptr || h_src_sizes == nullptr ||
-        dst_ptrs == nullptr || dst_caps == nullptr || h_results == nullptr ||
-        chunk_count == 0 || chunk_count > kMaxChunks ||
-        (dst_space != CUDEC_MEM_HOST && dst_space != CUDEC_MEM_DEVICE)) {
-        return CUDEC_ERR_INVALID_ARGUMENT;
+    /* One-shot: create a context, decode once, destroy it. The reusable
+     * context (create/decode/destroy) is the amortized path; this wrapper pays
+     * the full per-call setup and is here for the single-shot caller. */
+    cudec_stream_ctx* ctx = nullptr;
+    const cudec_status created = cudec_stream_ctx_create(&ctx);
+    if (created != CUDEC_OK) {
+        return created;
     }
-    /* A NULL source with a non-zero size (a host read that would segfault) or
-     * a NULL destination for a chunk that claims capacity is a caller error;
-     * reject the whole call before touching the device. */
-    for (size_t i = 0; i < chunk_count; i++) {
-        if ((h_src_ptrs[i] == nullptr && h_src_sizes[i] != 0) ||
-            (dst_ptrs[i] == nullptr && dst_caps[i] != 0)) {
-            return CUDEC_ERR_INVALID_ARGUMENT;
-        }
-    }
-    try {
-        return DecodeStream(h_src_ptrs, h_src_sizes, dst_ptrs, dst_caps,
-                            chunk_count, dst_space, streams, h_results);
-    } catch (...) {
-        /* A host allocation failed; never let it cross the C ABI. */
-        return CUDEC_ERR_CUDA;
-    }
+    const cudec_status st = cudec_lz4_decompress_stream_ctx(
+        ctx, h_src_ptrs, h_src_sizes, dst_ptrs, dst_caps, chunk_count,
+        dst_space, h_results);
+    cudec_stream_ctx_destroy(ctx);
+    return st;
 }

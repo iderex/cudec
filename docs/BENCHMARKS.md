@@ -191,60 +191,75 @@ Reproduce with `bench_lz4 --worst4b --gpu`; the construction is oracle-
 validated in-harness and locked against rot by the `bench_worst4b_selfcheck`
 ctest on the GPU-less runner.
 
-## M2: pinned-host streaming decode, end-to-end (Silesia)
+## M2: reusable streaming context, end-to-end (Silesia)
 
-The streaming decode path (`cudec_lz4_decompress_stream`, issue #24) times the
-whole synchronous call by CPU wall clock — pinned staging, H2D, decode, and,
-for host output, D2H, plus the **one-shot per-call ring setup** — the number a
-caller of the one-shot entry actually sees. Recorded 2026-07-17, same container
-and RTX 3080 as the M1 rows. `--gpu --gpu-stream`, 3 warmup + 30 measured
-(the device-resident row below is the `--gpu` path in the same run, for
-comparison; it is CUDA-event timed, the streaming rows are wall-clock).
+The streaming decode path is now a reusable context
+(`cudec_stream_ctx_create` / `cudec_lz4_decompress_stream_ctx` /
+`cudec_stream_ctx_destroy`, issue #29) that owns one CUDA stream and grow-only
+pinned/device staging, created once and reused across decodes. It replaces the
+per-call N-stream ring of #24 (dropped — the overlap it provided is not worth
+its complexity for LZ4; see below). The wall is CPU-clocked around the whole
+synchronous decode call (pinned staging + H2D + decode +, for host output,
+D2H). Recorded 2026-07-17, same container and RTX 3080 as the M1 rows.
+`--gpu --gpu-stream-ctx`, 3 warmup + 30 measured. **Steady-state** is the
+acceptance datum: repeated decodes on one reused context whose staging is
+already grown. **Cold** is the first decode on a fresh context, which pays the
+staging allocation.
 
 ```
-- GPU decode (device-resident, CUDA-event timed): p50 11.9 ms, 17.8 GB/s
-- GPU streaming, end-to-end, ONE-SHOT-SETUP-DOMINATED (host compressed in -> decoded out; wall clock around the whole synchronous call incl. per-call ring setup; 3 warmup + 30 runs):
-    device out: 1 stream p50 249.1 ms, 0.85 GB/s ; 4 streams (of 4 requested) p50 288.6 ms, 0.73 GB/s
-    host out (1 internal stream; readback synchronous): p50 384.2 ms, 0.55 GB/s
-    context: pure contiguous H2D of 102.44 MB compressed = p50 3.928 ms (a best-case floor; the pipeline stages many smaller per-wave copies) - dwarfed by the walls above, so the walls are setup-bound, not PCIe-bound
+- GPU decode (device-resident, CUDA-event timed): p50 12.1 ms, 17.5 GB/s
+- GPU streaming, reusable context, end-to-end (host compressed in -> decoded out; wall clock around the whole synchronous decode call; 3 warmup + 30 runs):
+    device out: steady-state (reused ctx) p50 229.5 ms, 0.92 GB/s ; cold (fresh ctx, first call) p50 237.8 ms, 0.89 GB/s
+    host out (readback synchronous): steady-state p50 365.2 ms, 0.58 GB/s ; cold p50 373.5 ms, 0.57 GB/s
+    amortized setup removed by the reusable context (cold - steady): device 8.3 ms, host 8.3 ms; 102.44 MB compressed in, 211.94 MB decoded out
 ```
 
-**The measurement falsifies the streaming path's value proposition as built —
-two honest findings (masterplan section 5: numbers decide, not intentions):**
+**The measurement corrects #24's own diagnosis: the per-call allocation was
+NOT the dominant cost.** #24 could not account for ~233 ms of its ~249 ms
+one-shot wall, named the per-call `cudaHostAlloc`/`cudaMalloc` of the ring as
+the prime suspect, and declared a reusable context "required, not optional." A
+reusable context that allocates nothing in steady state now measures the
+allocation directly — and it is only **~8 ms** (cold − steady), not ~233 ms.
+The steady-state device wall is still **~230 ms**, against a ~12 ms
+device-resident decode (one launch over all 3239 chunks) and a ~4 ms compressed
+H2D (M1/#24). The ~213 ms residual is therefore neither allocation (excluded:
+steady == cold to within 8 ms) nor copy/decode (~16 ms together) — it is the
+**per-wave serial submission** of the batch in 64-chunk waves (~51 waves for
+Silesia), one H2D + launch + event-gated reuse + result D2H per wave on this
+WSL2/WDDM setup where each submission flush costs milliseconds. The
+device-resident path is ~12 ms precisely because it submits **once**; the
+streaming path submits ~51 times. Not separately isolated, but attributed by
+exclusion. Raising the wave granularity so the path submits once is the real
+lever, out of this change's scope — **issue #33**.
 
-1. **Overlap does not pay off for LZ4.** The premise (issue #24) was that a
-   caller "serializes copy-then-decode." But the compressed H2D is only
-   **3.9 ms** — LZ4 compresses ~2:1, so the copy is small, while the decode is
-   ~12 ms. Serial copy-then-decode is ~16 ms; perfect overlap is
-   `max(4, 12) = 12 ms`, a ~25 % / ~4 ms win at best. The copy was never the
-   wall for LZ4, so there is little to hide. (Overlap pays off when the
-   compressed input is large relative to decode — not this format.)
+**So the reusable context is a simplification, not the speedup #24
+anticipated** — and it still earns its place under correctness > measured
+performance > minimal code: it deletes the entire N-stream ring (the overlap
+machinery the analysis below shows LZ4 does not benefit from), removes a
+`streams` ABI parameter the #24 measurement proved only degraded throughput,
+and is the correct primitive issue #33 builds on. The `stream_twin` conformance
+property now locks the reuse guarantee: the same input decoded on a reused
+context — after any number of prior decodes, including one that grew the
+staging — is bit-identical to a fresh-context decode.
 
-2. **The one-shot per-call ring setup dominates and is the real cost.** The
-   end-to-end wall (249 ms device-serial) dwarfs copy (~4 ms) + decode
-   (~12 ms) by ~15×; the unaccounted ~233 ms is not separately isolated, but
-   the prime suspect is the per-call `cudaHostAlloc` / `cudaMalloc` (and their
-   frees) of the pinned ring, disproportionately expensive on this WSL2/WDDM
-   setup — corroborated by the fact that it scales with stream count. Adding
-   streams makes it **slower**
-   (289 ms at 4 streams), because 4 streams provision ~4× the ring: the
-   setup, not the pipeline, scales with stream count, so the two device rows
-   are not a clean overlap comparison. PR1 deferred a reusable context "until
-   profiling shows per-call allocation dominating" — profiling now shows
-   exactly that. **The reusable context is required, not optional** (issue
-   filed as the #24-PR2 follow-up).
+**Why dropping the N-stream overlap was right — a better compression ratio
+makes input-H2D overlap LESS valuable.** #24's overlap premise was that a
+caller serializes copy-then-decode; but for LZ4 the compressed H2D is only
+~4 ms against a ~12 ms decode (LZ4's ~2:1 ratio keeps the input small), so
+perfect input-side overlap saves `16 − max(4, 12) = 4 ms` at best (~25 %
+ceiling) and was never realized. The better a format compresses, the smaller
+its input half relative to decode, and the less input-H2D overlap can ever pay
+— LZ4's ratio is exactly why it does not. The genuine overlap lever for the
+high-ratio M3+ formats (Zstd, GDeflate), where decode dwarfs the input
+transfer, is overlapping decode against the decoded-**output** D2H (an output
+ring on the host-output path), NOT the input H2D. That is the change that would
+reverse this simplification, and it needs its own test when it lands — the
+removed `stream_overlap` test locked the input-H2D‖kernel capability LZ4 no
+longer uses, so it was removed rather than left as an orphaned lock.
 
-The device-resident M1 row (~18 GB/s, H2D excluded) remains the kernel
-throughput; the streaming number is a different, honest metric (copy +
-setup included) and is not a regression of it. The `stream_overlap`
-conformance test verifies the copy/decode **overlap capability** holds on
-this hardware — an async H2D and the decode kernel on separate streams
-complete in materially less than the sum of their individual times. Whether
-cudec's own one-shot pipeline achieves that overlap is not externally
-observable while the per-call setup dominates the wall; it becomes a
-measurable, gate-able number once the reusable context lands. Both facts —
-the capability exists, the one-shot form buries it and overlap is weak for
-LZ4 anyway — are recorded rather than hidden.
+The device-resident M1 row (~18 GB/s, H2D/D2H excluded) remains the kernel
+throughput; the streaming numbers are a different, honest metric (copy +
+per-wave submission included) and are not a regression of it.
 
 ## Baseline: CPU oracle (M0, pre-kernel)
 

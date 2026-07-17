@@ -22,31 +22,35 @@ bool cudec_bench_gpu(const unsigned char* const* comp,
                      const size_t* comp_sizes, const size_t* orig_sizes,
                      size_t n, int warmup, int runs, cudec_gpu_result* out);
 
-struct cudec_stream_result {
+struct cudec_stream_ctx_result {
     size_t chunks;
     size_t output_bytes;
     size_t compressed_bytes;
-    unsigned overlap_streams;   /* the N used for the overlapped device row */
-    double device_serial_ms;    /* device out, streams=1 (no overlap) */
-    double device_overlap_ms;   /* device out, streams=N (overlapped) */
-    double host_ms;             /* host out, end to end (serial by design) */
-    double h2d_ms;              /* pure H2D of the compressed bytes, context */
-    double device_serial_gbps;
-    double device_overlap_gbps;
-    double host_gbps;
+    /* Steady-state: the p50 of repeated decodes on ONE reused context, its
+     * staging already grown - the setup-free number, the acceptance datum. */
+    double device_steady_ms;
+    double host_steady_ms;
+    /* Cold: the p50 of the FIRST decode on a freshly created context, which
+     * pays the staging grow - so (cold - steady) is the amortized setup. */
+    double device_cold_ms;
+    double host_cold_ms;
+    double device_steady_gbps;
+    double host_steady_gbps;
+    double device_cold_gbps;
+    double host_cold_gbps;
 };
 
-/* Times the streaming entry cudec_lz4_decompress_stream END TO END (host
- * compressed in -> decoded out, wall clock around the whole synchronous
- * call, so the pinned staging, H2D, decode, and D2H are all included, as a
- * caller would see them) over `runs` iterations after `warmup`. Measures the
- * device-output path at streams=1 (serial) and streams=`streams` (overlapped)
- * to expose the copy/decode overlap, plus the host-output path, plus a pure
- * H2D of the compressed bytes for context. Returns false on any CUDA failure
- * or if a chunk fails to decode. */
-bool cudec_bench_gpu_stream(const unsigned char* const* comp,
-                            const size_t* comp_sizes, const size_t* orig_sizes,
-                            size_t n, int warmup, int runs, unsigned streams,
-                            cudec_stream_result* out);
+/* Times the reusable streaming context END TO END (host compressed in ->
+ * decoded out, wall clock around the whole synchronous decode call, so the
+ * pinned staging, H2D, decode, and D2H are all included as a caller sees them).
+ * For each memory space it reports the STEADY-STATE p50 - repeated decodes on
+ * one context whose staging is already grown (the setup-free datum) - and the
+ * COLD p50 - the first decode on a fresh context, which pays the grow - so the
+ * difference is the amortized per-call setup the reusable context removes.
+ * Returns false on any CUDA failure or if a chunk fails to decode. */
+bool cudec_bench_gpu_stream_ctx(const unsigned char* const* comp,
+                                const size_t* comp_sizes,
+                                const size_t* orig_sizes, size_t n, int warmup,
+                                int runs, cudec_stream_ctx_result* out);
 
 #endif /* CUDEC_BENCH_GPU_BENCH_H */

@@ -104,8 +104,6 @@ cudec_add_test(frame_twin SOURCES frame_twin.cu LIBS lz4_frame_oracle GPU)
 target_include_directories(frame_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 cudec_add_test(stream_twin SOURCES stream_twin.cu LIBS cudec_test_fixtures GPU)
-cudec_add_test(stream_overlap SOURCES stream_overlap.cu LIBS
-               cudec_test_fixtures GPU)
 
 # ---- Structural conformance, configure time: a violation reds every CI
 # build. These are drift detectors, not tamper-proofing - the honest limits

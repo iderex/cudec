@@ -130,45 +130,77 @@ typedef enum cudec_mem_space {
     CUDEC_MEM_DEVICE = 1  /* dst_ptrs are device pointers; output stays in VRAM */
 } cudec_mem_space;
 
-/* Streaming batch LZ4 block decode from HOST-resident compressed chunks. The
- * H2D copy is pipelined against decode across CUDA streams the call manages
- * internally. Synchronous: the pipeline is fully drained before return, so
+/* A reusable streaming-decode context (opaque). It owns the CUDA stream and
+ * the pinned/device staging the streaming decoder needs; create it once and
+ * reuse it across decodes so the staging allocation is paid once, not per
+ * call. The staging grows on demand to the largest batch decoded so far and is
+ * reused for same-or-smaller batches (grow-only high-water sizing), so create
+ * takes no sizing parameters. Not thread-safe: use one context per thread. */
+typedef struct cudec_stream_ctx cudec_stream_ctx;
+
+/* Creates a streaming-decode context and stores it in *out_ctx. Allocates only
+ * the CUDA stream and a small event up front; the staging is allocated lazily
+ * on the first decode. Returns CUDEC_ERR_INVALID_ARGUMENT if out_ctx is NULL,
+ * CUDEC_ERR_CUDA on a stream/event/host allocation failure. On any error
+ * *out_ctx is set to NULL. Never throws across this boundary. */
+cudec_status cudec_stream_ctx_create(cudec_stream_ctx** out_ctx);
+
+/* Streaming batch LZ4 block decode from HOST-resident compressed chunks, on a
+ * reusable context. Synchronous: the work is fully drained before return, so
  * every dst[k] and h_results[k] is valid on a CUDEC_OK return.
  *
  * All array arguments are HOST arrays of chunk_count entries. h_src_ptrs[k] /
  * h_src_sizes[k] is the k-th compressed block in host memory; all input is
- * staged through the library's own pinned ring, so the H2D copy does not
+ * staged through the context's own pinned buffer, so the H2D copy does not
  * depend on the caller pinning its input. dst_ptrs[k] / dst_caps[k] is the
  * k-th output slot, in the space named by dst_space: for CUDEC_MEM_DEVICE the
- * decode writes device memory directly and the copy/decode pipeline overlaps;
- * for CUDEC_MEM_HOST the decoded bytes are read back to host memory, and that
- * readback is synchronous in this release (the copy/decode overlap applies to
- * the device-output path). On a successful chunk the caller's destination
- * holds exactly bytes_written bytes and the space beyond is left untouched,
- * in both spaces. h_results[k] receives the k-th outcome.
+ * decode writes device memory directly; for CUDEC_MEM_HOST the decoded bytes
+ * are read back to host memory. On a successful chunk the caller's destination
+ * holds exactly bytes_written bytes and the space beyond is left untouched, in
+ * both spaces. h_results[k] receives the k-th outcome. The decoded output is
+ * BIT-IDENTICAL whether the context is fresh or reused (including after the
+ * staging has grown) and matches a single-stream reference decode.
  *
- * `streams` is the overlap depth for the device-output pipeline: 0 selects a
- * library default; 1 serializes copy and decode; N>=2 round-robins the work
- * so the copy of later chunks can overlap the decode of earlier ones. The
- * decoded output is BIT-IDENTICAL for every `streams` value.
- *
- * Fail-closed: a NULL array, a NULL h_src_ptrs[k] with a non-zero
+ * Fail-closed: a NULL ctx, a NULL array, a NULL h_src_ptrs[k] with a non-zero
  * h_src_sizes[k], a NULL dst[k] with a non-zero dst_caps[k], an unknown
  * dst_space, chunk_count == 0, or a batch beyond the launch limit returns
- * CUDEC_ERR_INVALID_ARGUMENT and decodes nothing. A rejected chunk
- * reports its defined error in h_results[k] with bytes_written 0; neighbours
- * are unaffected and its destination is unspecified but never presented as a
- * valid decode. The aggregate return is CUDEC_OK iff every chunk decoded OK;
- * otherwise a host/device resource failure (CUDEC_ERR_CUDA) takes precedence,
- * then the first non-OK chunk's status in index order. Never throws across
- * this boundary. */
+ * CUDEC_ERR_INVALID_ARGUMENT, decodes nothing, and does NOT poison the
+ * context. A rejected chunk reports its defined error in h_results[k] with
+ * bytes_written 0; neighbours are unaffected and its destination is
+ * unspecified but never presented as a valid decode. The aggregate return is
+ * CUDEC_OK iff every chunk decoded OK; otherwise a host/device resource
+ * failure (CUDEC_ERR_CUDA) takes precedence, then the first non-OK chunk's
+ * status in index order.
+ *
+ * A CUDA fault during a decode POISONS the context: it returns CUDEC_ERR_CUDA,
+ * every later decode on it returns CUDEC_ERR_CUDA without touching the device,
+ * and only cudec_stream_ctx_destroy is valid on it thereafter. Never throws
+ * across this boundary. */
+cudec_status cudec_lz4_decompress_stream_ctx(
+    cudec_stream_ctx* ctx, const void* const* h_src_ptrs,
+    const size_t* h_src_sizes, void* const* dst_ptrs, const size_t* dst_caps,
+    size_t chunk_count, cudec_mem_space dst_space,
+    cudec_chunk_result* h_results);
+
+/* Destroys a streaming-decode context and frees everything it owns. NULL-safe
+ * and valid on a poisoned context. After it returns the pointer is dangling. */
+void cudec_stream_ctx_destroy(cudec_stream_ctx* ctx);
+
+/* One-shot streaming batch LZ4 block decode: equivalent to
+ * cudec_stream_ctx_create, one cudec_lz4_decompress_stream_ctx, and
+ * cudec_stream_ctx_destroy. It pays the full staging allocation on every call;
+ * a caller decoding repeatedly should hold a context and call the _ctx entry
+ * instead. Same arguments, contract, and fail-closed behavior as the _ctx
+ * entry (a NULL array, a NULL h_src_ptrs[k] with a non-zero h_src_sizes[k], a
+ * NULL dst[k] with a non-zero dst_caps[k], an unknown dst_space, chunk_count
+ * == 0, or a batch beyond the launch limit returns CUDEC_ERR_INVALID_ARGUMENT
+ * and decodes nothing). Never throws across this boundary. */
 cudec_status cudec_lz4_decompress_stream(const void* const* h_src_ptrs,
                                          const size_t* h_src_sizes,
                                          void* const* dst_ptrs,
                                          const size_t* dst_caps,
                                          size_t chunk_count,
                                          cudec_mem_space dst_space,
-                                         unsigned streams,
                                          cudec_chunk_result* h_results);
 
 #ifdef __cplusplus

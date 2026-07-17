@@ -346,7 +346,7 @@ int main(int argc, char** argv) {
     size_t warmup = 3;
     bool selfcheck = false;
     bool gpu = false;
-    bool gpu_stream = false;
+    bool gpu_stream_ctx = false;
     bool worst4b = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
@@ -355,8 +355,8 @@ int main(int argc, char** argv) {
             selfcheck = true;
         } else if (arg == "--gpu") {
             gpu = true;
-        } else if (arg == "--gpu-stream") {
-            gpu_stream = true;
+        } else if (arg == "--gpu-stream-ctx") {
+            gpu_stream_ctx = true;
         } else if (arg == "--worst4b") {
             worst4b = true;
         } else if (arg == "--runs" && i + 1 < argc) {
@@ -377,7 +377,7 @@ int main(int argc, char** argv) {
         } else if (!arg.empty() && arg[0] == '-') {
             std::fprintf(stderr,
                          "usage: bench_lz4 [--runs N] [--warmup N] [--gpu] "
-                         "[--gpu-stream] [--worst4b] [--selfcheck] "
+                         "[--gpu-stream-ctx] [--worst4b] [--selfcheck] "
                          "[corpus files...]\n");
             return 2;
         } else {
@@ -499,7 +499,7 @@ int main(int argc, char** argv) {
                     g.parse_only_ms_p50, g.parse_only_gbps_p50);
     }
 
-    if (gpu_stream) {
+    if (gpu_stream_ctx) {
         std::vector<const unsigned char*> comp_ptrs(corpus.compressed.size());
         std::vector<size_t> comp_sizes(corpus.compressed.size());
         std::vector<size_t> orig_sizes(corpus.originals.size());
@@ -508,52 +508,43 @@ int main(int argc, char** argv) {
             comp_sizes[i] = corpus.compressed[i].size();
             orig_sizes[i] = corpus.originals[i].size();
         }
-        const unsigned kStreams = 4;
-        cudec_stream_result s;
-        if (!cudec_bench_gpu_stream(comp_ptrs.data(), comp_sizes.data(),
-                                    orig_sizes.data(), corpus.originals.size(),
-                                    static_cast<int>(warmup),
-                                    static_cast<int>(runs), kStreams, &s)) {
-            std::fprintf(stderr, "GPU streaming bench failed\n");
+        cudec_stream_ctx_result s;
+        if (!cudec_bench_gpu_stream_ctx(
+                comp_ptrs.data(), comp_sizes.data(), orig_sizes.data(),
+                corpus.originals.size(), static_cast<int>(warmup),
+                static_cast<int>(runs), &s)) {
+            std::fprintf(stderr, "GPU streaming-context bench failed\n");
             return 1;
         }
-        /* The effective overlap depth: the entry caps streams to the wave
-         * count (64 chunks/wave), so a small corpus runs fewer than requested.
-         */
-        const size_t kWaveChunks = 64;
-        const size_t waves =
-            (corpus.originals.size() + kWaveChunks - 1) / kWaveChunks;
-        const unsigned eff_streams = static_cast<unsigned>(
-            s.overlap_streams < waves ? s.overlap_streams : waves);
         /* End-to-end throughput = decoded output bytes / wall time (H2D and,
-         * for host output, D2H included). The wall also includes the one-shot
-         * per-call ring allocation this synchronous entry does (a reusable
-         * context is deferred): the numbers below are DOMINATED by that setup,
-         * not by copy or decode - compare the device wall to the pure-H2D and
-         * device-resident-decode rows. For the same reason the two device rows
-         * are NOT a clean overlap comparison: the higher-stream config
-         * provisions proportionally more ring, so its extra time is setup, not
-         * a copy/decode-overlap regression. A setup-free overlap number needs
-         * the reusable context (follow-up); the overlap CAPABILITY itself is
-         * locked by the stream_overlap test. */
-        std::printf("- GPU streaming, end-to-end, ONE-SHOT-SETUP-DOMINATED "
-                    "(host compressed in -> decoded out; wall clock around the "
-                    "whole synchronous call incl. per-call ring setup; %d "
-                    "warmup + %d runs):\n",
+         * for host output, D2H included). STEADY-STATE is the setup-free datum:
+         * repeated decodes on one reused context whose staging is already
+         * grown, so the per-call allocation the reusable context amortizes away
+         * is out of the wall. COLD is the first decode on a fresh context,
+         * which pays that staging grow; (cold - steady) is the amortized setup.
+         * For LZ4 the steady-state wall is the compressed-H2D + decode floor -
+         * see docs/BENCHMARKS.md for why input-H2D overlap does not pay for
+         * this format and where the output-D2H lever would. */
+        std::printf("- GPU streaming, reusable context, end-to-end (host "
+                    "compressed in -> decoded out; wall clock around the whole "
+                    "synchronous decode call; %d warmup + %d runs):\n",
                     static_cast<int>(warmup), static_cast<int>(runs));
-        std::printf("    device out: 1 stream p50 %.1f ms, %.2f GB/s ; %u "
-                    "streams (of %u requested) p50 %.1f ms, %.2f GB/s\n",
-                    s.device_serial_ms, s.device_serial_gbps, eff_streams,
-                    s.overlap_streams, s.device_overlap_ms,
-                    s.device_overlap_gbps);
-        std::printf("    host out (1 internal stream; readback synchronous): "
-                    "p50 %.1f ms, %.2f GB/s\n",
-                    s.host_ms, s.host_gbps);
-        std::printf("    context: pure contiguous H2D of %.2f MB compressed = "
-                    "p50 %.3f ms (a best-case floor; the pipeline stages many "
-                    "smaller per-wave copies) - dwarfed by the walls above, so "
-                    "the walls are setup-bound, not PCIe-bound\n",
-                    static_cast<double>(s.compressed_bytes) / 1e6, s.h2d_ms);
+        std::printf("    device out: steady-state (reused ctx) p50 %.1f ms, "
+                    "%.2f GB/s ; cold (fresh ctx, first call) p50 %.1f ms, "
+                    "%.2f GB/s\n",
+                    s.device_steady_ms, s.device_steady_gbps, s.device_cold_ms,
+                    s.device_cold_gbps);
+        std::printf("    host out (readback synchronous): steady-state p50 %.1f "
+                    "ms, %.2f GB/s ; cold p50 %.1f ms, %.2f GB/s\n",
+                    s.host_steady_ms, s.host_steady_gbps, s.host_cold_ms,
+                    s.host_cold_gbps);
+        std::printf("    amortized setup removed by the reusable context "
+                    "(cold - steady): device %.1f ms, host %.1f ms; %.2f MB "
+                    "compressed in, %.2f MB decoded out\n",
+                    s.device_cold_ms - s.device_steady_ms,
+                    s.host_cold_ms - s.host_steady_ms,
+                    static_cast<double>(s.compressed_bytes) / 1e6,
+                    static_cast<double>(s.output_bytes) / 1e6);
     }
 
     if (selfcheck) {
