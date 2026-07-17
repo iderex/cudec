@@ -55,6 +55,23 @@ int main(void) {
                                        aligned, 0) ==
             CUDEC_ERR_INVALID_ARGUMENT);
 
+    /* The frame entry point resolves its own C linkage here. Every call
+     * below is a documented argument reject that returns before any CUDA
+     * call, so it runs on the GPU-less runner and never dereferences the
+     * host pointers. */
+    {
+        size_t written = 123;
+        unsigned char byte = 0;
+        REQUIRE(cudec_lz4f_decompress(0, 0, &byte, 1, &written) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null frame */
+        REQUIRE(written == 0);
+        REQUIRE(cudec_lz4f_decompress(&byte, 1, &byte, 1, 0) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null bytes_written */
+        REQUIRE(cudec_lz4f_decompress(&byte, 1, 0, 1, &written) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null dst, nonzero capacity */
+        REQUIRE(written == 0);
+    }
+
     printf("PASS: plain-C caller exercised every public symbol\n");
     return 0;
 }
