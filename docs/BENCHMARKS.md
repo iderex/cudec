@@ -78,6 +78,61 @@ phase-1, which shares the identical serial parse, so two-phase cannot reach
 two-phase help? — is answered NO by the arithmetic. The path to higher
 throughput is structural single-pass work, not a decomposition change.
 
+## M2: pinned-host streaming decode, end-to-end (Silesia)
+
+The streaming decode path (`cudec_lz4_decompress_stream`, issue #24) times the
+whole synchronous call by CPU wall clock — pinned staging, H2D, decode, and,
+for host output, D2H, plus the **one-shot per-call ring setup** — the number a
+caller of the one-shot entry actually sees. Recorded 2026-07-17, same container
+and RTX 3080 as the M1 rows. `--gpu --gpu-stream`, 3 warmup + 30 measured
+(the device-resident row below is the `--gpu` path in the same run, for
+comparison; it is CUDA-event timed, the streaming rows are wall-clock).
+
+```
+- GPU decode (device-resident, CUDA-event timed): p50 11.9 ms, 17.8 GB/s
+- GPU streaming, end-to-end, ONE-SHOT-SETUP-DOMINATED (host compressed in -> decoded out; wall clock around the whole synchronous call incl. per-call ring setup; 3 warmup + 30 runs):
+    device out: 1 stream p50 249.1 ms, 0.85 GB/s ; 4 streams (of 4 requested) p50 288.6 ms, 0.73 GB/s
+    host out (1 internal stream; readback synchronous): p50 384.2 ms, 0.55 GB/s
+    context: pure contiguous H2D of 102.44 MB compressed = p50 3.928 ms (a best-case floor; the pipeline stages many smaller per-wave copies) - dwarfed by the walls above, so the walls are setup-bound, not PCIe-bound
+```
+
+**The measurement falsifies the streaming path's value proposition as built —
+two honest findings (masterplan section 5: numbers decide, not intentions):**
+
+1. **Overlap does not pay off for LZ4.** The premise (issue #24) was that a
+   caller "serializes copy-then-decode." But the compressed H2D is only
+   **3.9 ms** — LZ4 compresses ~2:1, so the copy is small, while the decode is
+   ~12 ms. Serial copy-then-decode is ~16 ms; perfect overlap is
+   `max(4, 12) = 12 ms`, a ~25 % / ~4 ms win at best. The copy was never the
+   wall for LZ4, so there is little to hide. (Overlap pays off when the
+   compressed input is large relative to decode — not this format.)
+
+2. **The one-shot per-call ring setup dominates and is the real cost.** The
+   end-to-end wall (249 ms device-serial) dwarfs copy (~4 ms) + decode
+   (~12 ms) by ~15×; the unaccounted ~233 ms is not separately isolated, but
+   the prime suspect is the per-call `cudaHostAlloc` / `cudaMalloc` (and their
+   frees) of the pinned ring, disproportionately expensive on this WSL2/WDDM
+   setup — corroborated by the fact that it scales with stream count. Adding
+   streams makes it **slower**
+   (289 ms at 4 streams), because 4 streams provision ~4× the ring: the
+   setup, not the pipeline, scales with stream count, so the two device rows
+   are not a clean overlap comparison. PR1 deferred a reusable context "until
+   profiling shows per-call allocation dominating" — profiling now shows
+   exactly that. **The reusable context is required, not optional** (issue
+   filed as the #24-PR2 follow-up).
+
+The device-resident M1 row (~18 GB/s, H2D excluded) remains the kernel
+throughput; the streaming number is a different, honest metric (copy +
+setup included) and is not a regression of it. The `stream_overlap`
+conformance test verifies the copy/decode **overlap capability** holds on
+this hardware — an async H2D and the decode kernel on separate streams
+complete in materially less than the sum of their individual times. Whether
+cudec's own one-shot pipeline achieves that overlap is not externally
+observable while the per-call setup dominates the wall; it becomes a
+measurable, gate-able number once the reusable context lands. Both facts —
+the capability exists, the one-shot form buries it and overlap is weak for
+LZ4 anyway — are recorded rather than hidden.
+
 ## Baseline: CPU oracle (M0, pre-kernel)
 
 The reference the GPU decoder is measured against: the single-threaded CPU
