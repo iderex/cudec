@@ -66,8 +66,12 @@ typedef char cudec_chunk_result_layout_check
          : -1];
 #endif
 
-/* Batch LZ4 block decode. M1 lands the decoder; until then every chunk
- * reports CUDEC_ERR_NOT_IMPLEMENTED and writes no output.
+/* Batch LZ4 block decode. Each chunk is an independent LZ4 block; on
+ * success the chunk's result reports CUDEC_OK and bytes_written, and the
+ * destination holds exactly bytes_written decoded bytes. A malformed
+ * chunk reports a defined error (CUDEC_ERR_CORRUPT_INPUT /
+ * CUDEC_ERR_OUTPUT_TOO_SMALL) with bytes_written == 0; its destination
+ * contents are then unspecified but never presented as a valid decode.
  *
  * All array arguments are device memory holding chunk_count entries, and
  * the pointers those arrays contain are device pointers; d_results must be
