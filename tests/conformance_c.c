@@ -72,7 +72,7 @@ int main(void) {
         REQUIRE(written == 0);
     }
 
-    /* The streaming entry and its enum resolve their C linkage here. Every
+    /* The streaming entries and the enum resolve their C linkage here. Every
      * call is an argument reject that returns before any CUDA call. */
     {
         const void* one_src[1] = {0};
@@ -80,15 +80,38 @@ int main(void) {
         void* one_dst[1] = {0};
         size_t one_cap[1] = {0};
         cudec_chunk_result sres[1];
+
+        /* The one-shot wrapper (no `streams` parameter). */
         REQUIRE(cudec_lz4_decompress_stream(0, one_size, one_dst, one_cap, 1,
-                                            CUDEC_MEM_DEVICE, 4, sres) ==
+                                            CUDEC_MEM_DEVICE, sres) ==
                 CUDEC_ERR_INVALID_ARGUMENT); /* null array */
         REQUIRE(cudec_lz4_decompress_stream(one_src, one_size, one_dst, one_cap,
-                                            0, CUDEC_MEM_DEVICE, 4, sres) ==
+                                            0, CUDEC_MEM_DEVICE, sres) ==
                 CUDEC_ERR_INVALID_ARGUMENT); /* zero chunks */
         REQUIRE(cudec_lz4_decompress_stream(one_src, one_size, one_dst, one_cap,
-                                            1, (cudec_mem_space)7, 4, sres) ==
+                                            1, (cudec_mem_space)7, sres) ==
                 CUDEC_ERR_INVALID_ARGUMENT); /* unknown dst_space */
+
+        /* The reusable-context entries. create with a NULL out_ctx, and the
+         * decode entry with a NULL ctx / zero chunks / unknown dst_space, all
+         * reject synchronously before any CUDA call. The decode rejects use a
+         * NULL ctx so no context is created on the GPU-less runner. */
+        REQUIRE(cudec_stream_ctx_create(0) == CUDEC_ERR_INVALID_ARGUMENT);
+        REQUIRE(cudec_lz4_decompress_stream_ctx(0, one_src, one_size, one_dst,
+                                                one_cap, 1, CUDEC_MEM_DEVICE,
+                                                sres) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null ctx */
+        REQUIRE(cudec_lz4_decompress_stream_ctx(0, one_src, one_size, one_dst,
+                                                one_cap, 0, CUDEC_MEM_DEVICE,
+                                                sres) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null ctx + zero chunks */
+        REQUIRE(cudec_lz4_decompress_stream_ctx(0, one_src, one_size, one_dst,
+                                                one_cap, 1, (cudec_mem_space)7,
+                                                sres) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null ctx + unknown dst_space */
+
+        /* destroy is NULL-safe. */
+        cudec_stream_ctx_destroy(0);
     }
 
     printf("PASS: plain-C caller exercised every public symbol\n");

@@ -84,36 +84,79 @@ cudec_status LaunchFull(const void* const* s, const size_t* ss,
     return cudec_lz4_decompress_batch(s, ss, d, dc, n, r, stream);
 }
 
-/* Wall-clock-times the synchronous streaming entry over `runs` iterations
- * after `warmup`, returning the p50 milliseconds. The call drains internally,
- * so std::chrono around it is the honest end-to-end (pinned staging + H2D +
- * decode + [D2H] + the one-shot ring setup, as a caller sees it). */
-bool TimeStream(const void* const* h_src, const size_t* h_ssz,
-                void* const* h_dst, const size_t* h_cap, size_t n,
-                cudec_mem_space space, unsigned streams,
-                cudec_chunk_result* results, int warmup, int runs,
-                double* p50_ms) {
-    for (int i = 0; i < warmup; i++) {
-        if (cudec_lz4_decompress_stream(h_src, h_ssz, h_dst, h_cap, n, space,
-                                        streams, results) != CUDEC_OK) {
-            return false;
+double Median(std::vector<double>* t) {
+    std::sort(t->begin(), t->end());
+    const size_t rank = (t->size() * 50 + 99) / 100;
+    return (*t)[(rank == 0 ? 1 : rank) - 1];
+}
+
+/* Steady-state wall time: one reusable context, warmed (so its staging is
+ * already grown), then `runs` decodes on that SAME context. The call drains
+ * internally, so std::chrono around it is the honest end-to-end MINUS the
+ * per-call setup the context amortizes away - the setup-free datum. */
+bool TimeCtxSteady(const void* const* h_src, const size_t* h_ssz,
+                   void* const* dst, const size_t* h_cap, size_t n,
+                   cudec_mem_space space, int warmup, int runs,
+                   double* p50_ms) {
+    cudec_stream_ctx* ctx = nullptr;
+    if (cudec_stream_ctx_create(&ctx) != CUDEC_OK) {
+        return false;
+    }
+    std::vector<cudec_chunk_result> res(n);
+    bool ok = true;
+    /* warmup + 1: at least one decode must run to grow the staging before the
+     * steady-state timing, even when warmup is 0. */
+    for (int i = 0; i < warmup + 1 && ok; i++) {
+        ok = cudec_lz4_decompress_stream_ctx(ctx, h_src, h_ssz, dst, h_cap, n,
+                                             space, res.data()) == CUDEC_OK;
+    }
+    std::vector<double> t;
+    if (ok) {
+        t.resize(static_cast<size_t>(runs));
+        for (int i = 0; i < runs && ok; i++) {
+            const auto s = std::chrono::steady_clock::now();
+            const cudec_status st = cudec_lz4_decompress_stream_ctx(
+                ctx, h_src, h_ssz, dst, h_cap, n, space, res.data());
+            const auto e = std::chrono::steady_clock::now();
+            ok = (st == CUDEC_OK);
+            t[static_cast<size_t>(i)] =
+                std::chrono::duration<double, std::milli>(e - s).count();
         }
     }
+    cudec_stream_ctx_destroy(ctx);
+    if (!ok) {
+        return false;
+    }
+    *p50_ms = Median(&t);
+    return true;
+}
+
+/* Cold wall time: each iteration creates a FRESH context and times only its
+ * first decode - which pays the staging grow (cudaHostAlloc/cudaMalloc) - then
+ * destroys it. So (cold - steady) is the amortized per-call setup the reusable
+ * context removes. */
+bool TimeCtxCold(const void* const* h_src, const size_t* h_ssz,
+                 void* const* dst, const size_t* h_cap, size_t n,
+                 cudec_mem_space space, int runs, double* p50_ms) {
+    std::vector<cudec_chunk_result> res(n);
     std::vector<double> t(static_cast<size_t>(runs));
     for (int i = 0; i < runs; i++) {
+        cudec_stream_ctx* ctx = nullptr;
+        if (cudec_stream_ctx_create(&ctx) != CUDEC_OK) {
+            return false;
+        }
         const auto s = std::chrono::steady_clock::now();
-        const cudec_status st = cudec_lz4_decompress_stream(
-            h_src, h_ssz, h_dst, h_cap, n, space, streams, results);
+        const cudec_status st = cudec_lz4_decompress_stream_ctx(
+            ctx, h_src, h_ssz, dst, h_cap, n, space, res.data());
         const auto e = std::chrono::steady_clock::now();
+        cudec_stream_ctx_destroy(ctx);
         if (st != CUDEC_OK) {
             return false;
         }
         t[static_cast<size_t>(i)] =
             std::chrono::duration<double, std::milli>(e - s).count();
     }
-    std::sort(t.begin(), t.end());
-    const size_t rank = (t.size() * 50 + 99) / 100;
-    *p50_ms = t[(rank == 0 ? 1 : rank) - 1];
+    *p50_ms = Median(&t);
     return true;
 }
 
@@ -204,10 +247,10 @@ bool cudec_bench_gpu(const unsigned char* const* comp,
     return true;
 }
 
-bool cudec_bench_gpu_stream(const unsigned char* const* comp,
-                            const size_t* comp_sizes, const size_t* orig_sizes,
-                            size_t n, int warmup, int runs, unsigned streams,
-                            cudec_stream_result* out) {
+bool cudec_bench_gpu_stream_ctx(const unsigned char* const* comp,
+                                const size_t* comp_sizes,
+                                const size_t* orig_sizes, size_t n, int warmup,
+                                int runs, cudec_stream_ctx_result* out) {
     size_t total_out = 0;
     size_t total_comp = 0;
     for (size_t i = 0; i < n; i++) {
@@ -221,8 +264,8 @@ bool cudec_bench_gpu_stream(const unsigned char* const* comp,
         total_comp += comp_sizes[i];
     }
 
-    /* Host input arrays: the compressed blocks stay where the caller has
-     * them (host memory); the library stages them through its pinned ring. */
+    /* Host input arrays: the compressed blocks stay where the caller has them
+     * (host memory); the context stages them through its pinned buffer. */
     std::vector<const void*> h_src(n);
     std::vector<size_t> h_ssz(n), h_cap(n);
     for (size_t i = 0; i < n; i++) {
@@ -247,16 +290,16 @@ bool cudec_bench_gpu_stream(const unsigned char* const* comp,
         }
     }
 
-    /* Correctness precondition on both paths: every chunk returns CUDEC_OK
-     * with its original decoded size, or the numbers are meaningless
-     * (honest-numbers rule). Byte-for-byte correctness is gated by the
-     * stream_twin / gpu_fixture oracle tests, not re-verified here. */
+    /* Correctness precondition on both paths: every chunk returns CUDEC_OK with
+     * its original decoded size, or the numbers are meaningless (honest-numbers
+     * rule). Byte-for-byte correctness is gated by the stream_twin / gpu_fixture
+     * oracle tests, not re-verified here. */
     for (int pass = 0; pass < 2; pass++) {
         void* const* dst = (pass == 0) ? d_dst.data() : h_dst.data();
         const cudec_mem_space sp =
             (pass == 0) ? CUDEC_MEM_DEVICE : CUDEC_MEM_HOST;
         if (cudec_lz4_decompress_stream(h_src.data(), h_ssz.data(), dst,
-                                        h_cap.data(), n, sp, streams,
+                                        h_cap.data(), n, sp,
                                         res.data()) != CUDEC_OK) {
             return false;
         }
@@ -271,74 +314,34 @@ bool cudec_bench_gpu_stream(const unsigned char* const* comp,
         }
     }
 
-    /* Device output at 1 stream (no overlap) and at `streams` (overlapped);
-     * host output at 1 stream (the entry forces it serial anyway, so more
-     * would only provision unused ring). */
-    double dev_serial = 0.0;
-    double dev_overlap = 0.0;
-    double host_ms = 0.0;
-    if (!TimeStream(h_src.data(), h_ssz.data(), d_dst.data(), h_cap.data(), n,
-                    CUDEC_MEM_DEVICE, 1, res.data(), warmup, runs,
-                    &dev_serial) ||
-        !TimeStream(h_src.data(), h_ssz.data(), d_dst.data(), h_cap.data(), n,
-                    CUDEC_MEM_DEVICE, streams, res.data(), warmup, runs,
-                    &dev_overlap) ||
-        !TimeStream(h_src.data(), h_ssz.data(), h_dst.data(), h_cap.data(), n,
-                    CUDEC_MEM_HOST, 1, res.data(), warmup, runs, &host_ms)) {
+    /* Steady-state (setup-free, the acceptance datum) and cold (first call on a
+     * fresh context, paying the staging grow) for both memory spaces. */
+    double dev_steady = 0.0, host_steady = 0.0;
+    double dev_cold = 0.0, host_cold = 0.0;
+    if (!TimeCtxSteady(h_src.data(), h_ssz.data(), d_dst.data(), h_cap.data(),
+                       n, CUDEC_MEM_DEVICE, warmup, runs, &dev_steady) ||
+        !TimeCtxSteady(h_src.data(), h_ssz.data(), h_dst.data(), h_cap.data(),
+                       n, CUDEC_MEM_HOST, warmup, runs, &host_steady) ||
+        !TimeCtxCold(h_src.data(), h_ssz.data(), d_dst.data(), h_cap.data(), n,
+                     CUDEC_MEM_DEVICE, runs, &dev_cold) ||
+        !TimeCtxCold(h_src.data(), h_ssz.data(), h_dst.data(), h_cap.data(), n,
+                     CUDEC_MEM_HOST, runs, &host_cold)) {
         return false;
-    }
-
-    /* Pure H2D of the compressed bytes, pinned->device, for context: a
-     * best-case PCIe floor. Comparing it to the end-to-end wall shows whether
-     * that wall is copy-bound or (as measured) dominated by per-call setup. */
-    double h2d_ms = 0.0;
-    {
-        void* d_comp = nullptr;
-        void* p_comp = nullptr;
-        BG_CUDA(cudaMalloc(&d_comp, total_comp ? total_comp : 1));
-        BG_CUDA(cudaHostAlloc(&p_comp, total_comp ? total_comp : 1,
-                              cudaHostAllocDefault));
-        size_t off = 0;
-        for (size_t i = 0; i < n; i++) {
-            if (comp_sizes[i]) {
-                std::copy(comp[i], comp[i] + comp_sizes[i],
-                          static_cast<unsigned char*>(p_comp) + off);
-            }
-            off += comp_sizes[i];
-        }
-        for (int i = 0; i < warmup; i++) {
-            BG_CUDA(cudaMemcpy(d_comp, p_comp, total_comp ? total_comp : 1,
-                               cudaMemcpyHostToDevice));
-        }
-        std::vector<double> t(static_cast<size_t>(runs));
-        for (int i = 0; i < runs; i++) {
-            const auto s = std::chrono::steady_clock::now();
-            BG_CUDA(cudaMemcpy(d_comp, p_comp, total_comp ? total_comp : 1,
-                               cudaMemcpyHostToDevice));
-            const auto e = std::chrono::steady_clock::now();
-            t[static_cast<size_t>(i)] =
-                std::chrono::duration<double, std::milli>(e - s).count();
-        }
-        std::sort(t.begin(), t.end());
-        const size_t rank = (t.size() * 50 + 99) / 100;
-        h2d_ms = t[(rank == 0 ? 1 : rank) - 1];
     }
 
     const double gb = static_cast<double>(total_out) / 1e9;
     out->chunks = n;
     out->output_bytes = total_out;
     out->compressed_bytes = total_comp;
-    out->overlap_streams = streams;
-    out->device_serial_ms = dev_serial;
-    out->device_overlap_ms = dev_overlap;
-    out->host_ms = host_ms;
-    out->h2d_ms = h2d_ms;
-    out->device_serial_gbps = dev_serial > 0.0 ? gb / (dev_serial / 1e3) : 0.0;
-    out->device_overlap_gbps =
-        dev_overlap > 0.0 ? gb / (dev_overlap / 1e3) : 0.0;
-    out->host_gbps = host_ms > 0.0 ? gb / (host_ms / 1e3) : 0.0;
-    /* The output/context arenas (d_out, d_comp, p_comp) are reclaimed at
-     * process exit; the bench is a short-lived one-shot called once, like
-     * cudec_bench_gpu above. */
+    out->device_steady_ms = dev_steady;
+    out->host_steady_ms = host_steady;
+    out->device_cold_ms = dev_cold;
+    out->host_cold_ms = host_cold;
+    out->device_steady_gbps = dev_steady > 0.0 ? gb / (dev_steady / 1e3) : 0.0;
+    out->host_steady_gbps = host_steady > 0.0 ? gb / (host_steady / 1e3) : 0.0;
+    out->device_cold_gbps = dev_cold > 0.0 ? gb / (dev_cold / 1e3) : 0.0;
+    out->host_cold_gbps = host_cold > 0.0 ? gb / (host_cold / 1e3) : 0.0;
+    /* The output arenas (d_out) are reclaimed at process exit; the bench is a
+     * short-lived one-shot called once, like cudec_bench_gpu above. */
     return true;
 }
