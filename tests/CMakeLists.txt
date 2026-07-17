@@ -76,6 +76,12 @@ cudec_add_test(conformance_c SOURCES conformance_c.c)
 set_target_properties(conformance_c PROPERTIES C_STANDARD 99
                                                C_STANDARD_REQUIRED ON)
 cudec_add_test(oracle_lz4 SOURCES oracle_lz4.cpp LIBS cudec_test_fixtures)
+cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
+# The twin compiles the decoder core from src/ on the host - the
+# fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
+# ladder step 2).
+target_include_directories(parser_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 cudec_add_test(launch_fail SOURCES launch_fail.cpp)
 # Belt and suspenders with the setenv inside launch_fail.cpp: zero visible
 # devices is the test condition, on the GPU machine too.
