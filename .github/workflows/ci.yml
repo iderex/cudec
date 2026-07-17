@@ -169,11 +169,20 @@ jobs:
       # Run the untrusted-input subset under the sanitizers. --no-tests=error
       # reds a vacuous selection; the regex pins exactly the host tests this
       # gate owns (launch_fail and bench are excluded: they initialise the CUDA
-      # runtime / are nvcc-linked, outside the host attack surface).
+      # runtime / are nvcc-linked, outside the host attack surface). The
+      # per-name identity greps mirror the build job: --no-tests=error only
+      # reds on a ZERO selection, so a single sanitized test silently losing
+      # its registration (say, by gaining a gpu-matching label) would shrink
+      # the set unnoticed - the greps pin all four by name so that reds too.
       - name: Run the untrusted-input decode path under ASan+UBSan
         run: >-
           ctest --test-dir build-san --no-tests=error --output-on-failure -R
-          '^(conformance_c|oracle_lz4|parser_twin|frame_host_negative)$'
+          '^(conformance_c|oracle_lz4|parser_twin|frame_host_negative)$' &&
+          ctest --test-dir build-san -N | tee san-selected.txt &&
+          grep -E ': conformance_c$' san-selected.txt &&
+          grep -E ': oracle_lz4$' san-selected.txt &&
+          grep -E ': parser_twin$' san-selected.txt &&
+          grep -E ': frame_host_negative$' san-selected.txt
 
   format:
     name: format

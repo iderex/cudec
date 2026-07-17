@@ -11,6 +11,8 @@
 #include "require.h"
 
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,7 +25,19 @@ namespace {
 cudec_status TwinDecode(const std::vector<unsigned char>& stream,
                         size_t capacity, std::vector<unsigned char>* out) {
     out->assign(capacity, 0);
-    cudec_detail::Lz4Parser parser{stream.data(), stream.size(), capacity};
+    /* Parse from an EXACTLY-sized copy of the stream: the mutation corpus
+     * truncates by resize()-DOWN, which leaves the vector's rounded-up
+     * capacity readable, so a src/lz4_block.h over-read past src_size would
+     * land in that slack and leave ASan green. A tight allocation puts an ASan
+     * redzone right after the last stream byte so the over-read reds instead.
+     * Literals are still executed from `stream` below, but only over the
+     * ranges the parser has already bound to <= src_size. */
+    const size_t stream_size = stream.size();
+    auto tight = std::make_unique<unsigned char[]>(stream_size);
+    if (stream_size != 0) {
+        std::memcpy(tight.get(), stream.data(), stream_size);
+    }
+    cudec_detail::Lz4Parser parser{tight.get(), stream_size, capacity};
     cudec_detail::Lz4Sequence seq;
     bool done = false;
     while (true) {

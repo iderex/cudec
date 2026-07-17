@@ -16,6 +16,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -35,6 +37,12 @@ void Put32(Bytes* f, uint32_t v) {
     f->push_back(static_cast<unsigned char>((v >> 8) & 0xFF));
     f->push_back(static_cast<unsigned char>((v >> 16) & 0xFF));
     f->push_back(static_cast<unsigned char>((v >> 24) & 0xFF));
+}
+
+void Put64(Bytes* f, uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+        f->push_back(static_cast<unsigned char>((v >> (i * 8)) & 0xFF));
+    }
 }
 
 /* The frame header checksum byte: (XXH32(descriptor) >> 8) & 0xFF over the
@@ -74,15 +82,62 @@ Bytes BuildFrame(unsigned char flg, unsigned char bd,
     return f;
 }
 
+/* Like BuildFrame but with the optional declared content-size field (FLG bit 3)
+ * present: the 8-byte little-endian `declared` size follows BD, and the header
+ * checksum is recomputed over the now-10-byte descriptor. Lets the
+ * content-size match/mismatch branch in src/frame.cpp be driven in both
+ * directions. The caller passes an FLG with bit 3 set (0x68). */
+Bytes BuildFrameContentSize(unsigned char flg, unsigned char bd,
+                            const std::vector<Bytes>& blocks,
+                            uint64_t declared) {
+    const bool block_ck = (flg >> 4) & 1;
+    const bool content_ck = (flg >> 2) & 1;
+    Bytes f;
+    PutMagic(&f);
+    f.push_back(flg);
+    f.push_back(bd);
+    Put64(&f, declared);
+    f.push_back(Hc(f, 10)); /* descriptor is FLG,BD,8-byte content size */
+    Bytes out;
+    for (const auto& b : blocks) {
+        Put32(&f, 0x80000000u | static_cast<uint32_t>(b.size())); /* uncompressed */
+        f.insert(f.end(), b.begin(), b.end());
+        if (block_ck) {
+            Put32(&f, cudec_detail::xxhash32(b.data(), b.size()));
+        }
+        out.insert(out.end(), b.begin(), b.end());
+    }
+    Put32(&f, 0); /* end mark */
+    if (content_ck) {
+        Put32(&f, cudec_detail::xxhash32(out.data(), out.size()));
+    }
+    return f;
+}
+
+/* Copies the crafted frame into an EXACTLY-sized heap allocation and decodes
+ * from THAT pointer. The crafted frames are assembled with std::vector, whose
+ * capacity is rounded up past the logical size, so a 1-4-byte over-read past
+ * frame_size would read valid slack and leave ASan green - hiding exactly the
+ * truncation/off-by-one class this gate exists to catch. A tight allocation
+ * puts an ASan redzone immediately after the last frame byte, so any such
+ * over-read reds the sanitizer build. */
+cudec_status DecodeTight(const Bytes& frame, unsigned char* dst,
+                         size_t dst_capacity, size_t* written) {
+    const size_t n = frame.size();
+    auto tight = std::make_unique<unsigned char[]>(n);
+    if (n != 0) {
+        std::memcpy(tight.get(), frame.data(), n);
+    }
+    return cudec_lz4f_decompress(tight.get(), n, dst, dst_capacity, written);
+}
+
 /* A frame that must be rejected: pins the exact status AND that no output byte
  * is presented (bytes_written stays 0). The output buffer is generous so a
  * reject is never masked by an OUTPUT_TOO_SMALL from a small buffer. */
 int ExpectReject(const char* name, const Bytes& frame, cudec_status expected) {
     Bytes out(1u << 16, 0xCC);
     size_t written = 777;
-    const cudec_status s = cudec_lz4f_decompress(frame.data(), frame.size(),
-                                                 out.data(), out.size(),
-                                                 &written);
+    const cudec_status s = DecodeTight(frame, out.data(), out.size(), &written);
     REQUIRE_CTX(s == expected, "%s: status %d (want %d)", name,
                 static_cast<int>(s), static_cast<int>(expected));
     REQUIRE_CTX(written == 0, "%s: bytes_written %zu (want 0)", name, written);
@@ -93,9 +148,7 @@ int ExpectReject(const char* name, const Bytes& frame, cudec_status expected) {
 int ExpectDecode(const char* name, const Bytes& frame, const Bytes& expected) {
     Bytes out(expected.size() + 16, 0xEE); /* padding proves we stop at size */
     size_t written = 777;
-    const cudec_status s = cudec_lz4f_decompress(frame.data(), frame.size(),
-                                                 out.data(), out.size(),
-                                                 &written);
+    const cudec_status s = DecodeTight(frame, out.data(), out.size(), &written);
     REQUIRE_CTX(s == CUDEC_OK, "%s: status %d (want OK)", name,
                 static_cast<int>(s));
     REQUIRE_CTX(written == expected.size(), "%s: size %zu (want %zu)", name,
@@ -132,10 +185,49 @@ int main() {
     {
         const Bytes f = BuildFrame(0x60, 0x40, {});
         size_t written = 777;
-        REQUIRE(cudec_lz4f_decompress(f.data(), f.size(), nullptr, 0,
-                                      &written) == CUDEC_OK);
+        REQUIRE(DecodeTight(f, nullptr, 0, &written) == CUDEC_OK);
         REQUIRE(written == 0);
     }
+
+    /* --- C-ABI argument validation: the extern "C" guard rejects before any
+     * parse with nothing written. Each case pins CUDEC_ERR_INVALID_ARGUMENT
+     * and, where bytes_written is observable, written == 0. --- */
+    {
+        const Bytes f = BuildFrame(0x60, 0x40, {b8});
+        Bytes out(1u << 16, 0xCC);
+        size_t written = 777;
+        /* NULL frame. */
+        REQUIRE(cudec_lz4f_decompress(nullptr, f.size(), out.data(),
+                                      out.size(), &written) ==
+                CUDEC_ERR_INVALID_ARGUMENT);
+        REQUIRE(written == 0);
+        /* NULL bytes_written (no output parameter left to observe). */
+        REQUIRE(cudec_lz4f_decompress(f.data(), f.size(), out.data(),
+                                      out.size(), nullptr) ==
+                CUDEC_ERR_INVALID_ARGUMENT);
+        /* NULL destination with a non-zero capacity. */
+        written = 777;
+        REQUIRE(cudec_lz4f_decompress(f.data(), f.size(), nullptr, out.size(),
+                                      &written) == CUDEC_ERR_INVALID_ARGUMENT);
+        REQUIRE(written == 0);
+    }
+
+    /* --- Declared content size (FLG bit 3): the size-match branch driven in
+     * both directions. --- */
+    /* Valid: the declared size equals the produced size. */
+    REQUIRE(ExpectDecode("content-size-ok",
+                         BuildFrameContentSize(0x68, 0x40, {b8}, b8.size()),
+                         b8) == 0);
+    /* Declared too large. */
+    REQUIRE(ExpectReject(
+                "content-size-too-large",
+                BuildFrameContentSize(0x68, 0x40, {b8}, b8.size() + 1),
+                CUDEC_ERR_CORRUPT_INPUT) == 0);
+    /* Declared too small. */
+    REQUIRE(ExpectReject(
+                "content-size-too-small",
+                BuildFrameContentSize(0x68, 0x40, {b8}, b8.size() - 1),
+                CUDEC_ERR_CORRUPT_INPUT) == 0);
 
     /* --- Header reject branches (all fire before the block-table walk). --- */
 
@@ -160,6 +252,9 @@ int main() {
                          CUDEC_ERR_CORRUPT_INPUT) == 0);
     /* Reserved BD bit (bit 0) set. */
     REQUIRE(ExpectReject("bd-reserved", BuildFrame(0x60, 0x41, {b8}),
+                         CUDEC_ERR_CORRUPT_INPUT) == 0);
+    /* Reserved BD bit 7 set (the high reserved bit; bmax field still 4). */
+    REQUIRE(ExpectReject("bd-reserved-bit7", BuildFrame(0x60, 0xC0, {b8}),
                          CUDEC_ERR_CORRUPT_INPUT) == 0);
     /* Block-max code out of the 4..7 range. */
     REQUIRE(ExpectReject("bad-bmax", BuildFrame(0x60, 0x30, {b8}),
@@ -268,6 +363,42 @@ int main() {
         REQUIRE(ExpectReject("content-checksum-mismatch", f,
                              CUDEC_ERR_CORRUPT_INPUT) == 0);
     }
+    /* Block-checksum flag set (FLG bit 4) but the 4-byte block checksum is
+     * truncated: frame_size < pos + blen + 4, so the checksum read must not
+     * happen. */
+    {
+        Bytes f;
+        PutMagic(&f);
+        f.push_back(0x70); /* FLG bit 4: block checksum */
+        f.push_back(0x40);
+        f.push_back(Hc(f, 2));
+        Put32(&f, 0x80000000u | 8u); /* uncompressed, 8-byte block */
+        for (int i = 0; i < 8; i++) {
+            f.push_back(0xAB); /* the 8 payload bytes */
+        }
+        f.push_back(0x00);
+        f.push_back(0x00); /* only 2 of the 4 block-checksum bytes */
+        REQUIRE(ExpectReject("block-checksum-truncated", f,
+                             CUDEC_ERR_CORRUPT_INPUT) == 0);
+    }
+    /* Content-checksum flag set (FLG bit 2) but the 4-byte content checksum is
+     * truncated: frame_size < pos + 4 after the end mark. */
+    {
+        Bytes f;
+        PutMagic(&f);
+        f.push_back(0x64); /* FLG bit 2: content checksum */
+        f.push_back(0x40);
+        f.push_back(Hc(f, 2));
+        Put32(&f, 0x80000000u | 8u); /* uncompressed, 8-byte block */
+        for (int i = 0; i < 8; i++) {
+            f.push_back(0xAB);
+        }
+        Put32(&f, 0); /* end mark */
+        f.push_back(0x00);
+        f.push_back(0x00); /* only 2 of the 4 content-checksum bytes */
+        REQUIRE(ExpectReject("content-checksum-truncated", f,
+                             CUDEC_ERR_CORRUPT_INPUT) == 0);
+    }
 
     /* An output buffer too small for an all-uncompressed frame: the host
      * assembly checks capacity before writing and rejects with nothing
@@ -276,8 +407,7 @@ int main() {
         const Bytes f = BuildFrame(0x60, 0x40, {b8});
         Bytes out(4, 0xEE);
         size_t written = 777;
-        REQUIRE(cudec_lz4f_decompress(f.data(), f.size(), out.data(),
-                                      out.size(), &written) ==
+        REQUIRE(DecodeTight(f, out.data(), out.size(), &written) ==
                 CUDEC_ERR_OUTPUT_TOO_SMALL);
         REQUIRE(written == 0);
     }
