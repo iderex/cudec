@@ -6,6 +6,7 @@
  * optional declared content size are verified fail-closed. Frame spec
  * (public): lz4_Frame_format.md. */
 #include "cudec.h"
+#include "cuda_raii.h"
 #include "xxhash32.h"
 
 #include <cuda_runtime.h>
@@ -37,25 +38,6 @@ struct FrameBlock {
     bool uncompressed;
 };
 
-/* Owns one cudaMalloc allocation and frees it on every scope exit - so the
- * device buffers are reclaimed on ALL return paths, including the hostile-
- * input reject paths, not just on success. A leak on the expected corrupt-
- * frame path is a GPU-memory-exhaustion DoS in a library entry point. */
-struct DevPtr {
-    void* p = nullptr;
-    DevPtr() = default;
-    DevPtr(const DevPtr&) = delete;
-    DevPtr& operator=(const DevPtr&) = delete;
-    ~DevPtr() {
-        /* Cleanup errors are not actionable and must not mask the real
-         * status; the discard is deliberate. */
-        if (p != nullptr) {
-            (void)cudaFree(p);
-        }
-    }
-    cudaError_t alloc(size_t bytes) { return cudaMalloc(&p, bytes); }
-};
-
 /* Decodes the compressed blocks in one device batch and assembles the whole
  * frame output (compressed decoded bytes + uncompressed blocks copied
  * verbatim) into `out`, bounded by dst_capacity, writing the produced size
@@ -72,12 +54,7 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
                                const std::vector<FrameBlock>& blocks,
                                size_t block_max, unsigned char* out,
                                size_t dst_capacity, size_t* total_out) {
-#define FRAME_CUDA(call)                        \
-    do {                                        \
-        if ((call) != cudaSuccess) {            \
-            return CUDEC_ERR_CUDA;              \
-        }                                       \
-    } while (0)
+#define FRAME_CUDA(call) CUDEC_CUDA_CHECK(call, return CUDEC_ERR_CUDA)
 
     std::vector<size_t> cidx;
     size_t total_src = 0;
@@ -92,15 +69,19 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
     /* Decoded output size per block; uncompressed blocks use src_len. */
     std::vector<size_t> decoded_len(blocks.size(), 0);
 
-    DevPtr d_src, d_dst, dd_src, dd_dst, dd_ssz, dd_dcp, dd_res;
+    /* One-shot owners: each buffer is allocated once here and freed on every
+     * scope exit. The shared grow-only DevBuf serves this by a single ensure()
+     * from cap 0 - every size below is non-zero (guarded by n != 0), so the
+     * first ensure allocates exactly once, identical to a bare cudaMalloc. */
+    cudec_cuda::DevBuf d_src, d_dst, dd_src, dd_dst, dd_ssz, dd_dcp, dd_res;
     if (n != 0) {
         /* One destination slot of block_max per compressed block. Guard the
          * product against size_t overflow before asking the driver. */
         if (block_max != 0 && n > SIZE_MAX / block_max) {
             return CUDEC_ERR_CORRUPT_INPUT;
         }
-        FRAME_CUDA(d_src.alloc(total_src));
-        FRAME_CUDA(d_dst.alloc(n * block_max));
+        FRAME_CUDA(d_src.ensure(total_src));
+        FRAME_CUDA(d_dst.ensure(n * block_max));
 
         std::vector<const void*> h_src(n);
         std::vector<void*> h_dst(n);
@@ -123,11 +104,11 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
                                   cudaMemcpyHostToDevice));
         }
 
-        FRAME_CUDA(dd_src.alloc(n * sizeof(void*)));
-        FRAME_CUDA(dd_dst.alloc(n * sizeof(void*)));
-        FRAME_CUDA(dd_ssz.alloc(n * sizeof(size_t)));
-        FRAME_CUDA(dd_dcp.alloc(n * sizeof(size_t)));
-        FRAME_CUDA(dd_res.alloc(n * sizeof(cudec_chunk_result)));
+        FRAME_CUDA(dd_src.ensure(n * sizeof(void*)));
+        FRAME_CUDA(dd_dst.ensure(n * sizeof(void*)));
+        FRAME_CUDA(dd_ssz.ensure(n * sizeof(size_t)));
+        FRAME_CUDA(dd_dcp.ensure(n * sizeof(size_t)));
+        FRAME_CUDA(dd_res.ensure(n * sizeof(cudec_chunk_result)));
         FRAME_CUDA(cudaMemcpy(dd_src.p, h_src.data(), n * sizeof(void*),
                               cudaMemcpyHostToDevice));
         FRAME_CUDA(cudaMemcpy(dd_dst.p, h_dst.data(), n * sizeof(void*),

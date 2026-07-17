@@ -25,6 +25,8 @@
  * for the corrected overlap analysis and the output-D2H future lever. */
 #include "cudec.h"
 
+#include "cuda_raii.h"
+
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -49,105 +51,6 @@ inline bool MulOverflows(size_t a, size_t b) {
     return a != 0 && b > SIZE_MAX / a;
 }
 
-/* Grow-only device buffer. ensure() reuses the existing allocation when it is
- * already large enough (the amortization); otherwise it frees the old one and
- * allocates the larger size. On failure the owner holds nothing (null, cap 0),
- * so the destructor never double-frees - the enclosing context is poisoned by
- * the caller and only its destruction is valid afterwards. All grows happen
- * before any staging in a decode, so no live buffer is ever reallocated
- * mid-call. */
-struct DevBuf {
-    void* p = nullptr;
-    size_t cap = 0;
-    DevBuf() = default;
-    DevBuf(const DevBuf&) = delete;
-    DevBuf& operator=(const DevBuf&) = delete;
-    ~DevBuf() {
-        if (p != nullptr) {
-            (void)cudaFree(p);
-        }
-    }
-    cudaError_t ensure(size_t bytes) {
-        if (bytes <= cap) {
-            return cudaSuccess;
-        }
-        if (p != nullptr) {
-            (void)cudaFree(p);
-            p = nullptr;
-            cap = 0;
-        }
-        const cudaError_t e = cudaMalloc(&p, bytes);
-        if (e != cudaSuccess) {
-            p = nullptr;
-            return e;
-        }
-        cap = bytes;
-        return cudaSuccess;
-    }
-};
-
-/* Grow-only pinned host buffer, same contract as DevBuf. */
-struct PinnedBuf {
-    void* p = nullptr;
-    size_t cap = 0;
-    PinnedBuf() = default;
-    PinnedBuf(const PinnedBuf&) = delete;
-    PinnedBuf& operator=(const PinnedBuf&) = delete;
-    ~PinnedBuf() {
-        if (p != nullptr) {
-            (void)cudaFreeHost(p);
-        }
-    }
-    cudaError_t ensure(size_t bytes) {
-        if (bytes <= cap) {
-            return cudaSuccess;
-        }
-        if (p != nullptr) {
-            (void)cudaFreeHost(p);
-            p = nullptr;
-            cap = 0;
-        }
-        const cudaError_t e = cudaHostAlloc(&p, bytes, cudaHostAllocDefault);
-        if (e != cudaSuccess) {
-            p = nullptr;
-            return e;
-        }
-        cap = bytes;
-        return cudaSuccess;
-    }
-};
-
-struct StreamOwner {
-    cudaStream_t s = nullptr;
-    StreamOwner() = default;
-    StreamOwner(const StreamOwner&) = delete;
-    StreamOwner& operator=(const StreamOwner&) = delete;
-    ~StreamOwner() {
-        if (s != nullptr) {
-            (void)cudaStreamDestroy(s);
-        }
-    }
-    cudaError_t create() {
-        /* Non-blocking so a wave does not depend on the legacy default stream
-         * staying idle (a caller with default-stream work in the same context
-         * would otherwise serialize every wave). */
-        return cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
-    }
-};
-
-struct EventOwner {
-    cudaEvent_t e = nullptr;
-    EventOwner() = default;
-    EventOwner(const EventOwner&) = delete;
-    EventOwner& operator=(const EventOwner&) = delete;
-    ~EventOwner() {
-        if (e != nullptr) {
-            (void)cudaEventDestroy(e);
-        }
-    }
-    cudaError_t create() { return cudaEventCreate(&e); }
-};
-
 }  // namespace cudec_stream_detail
 
 /* The opaque context (the header forward-declares `struct cudec_stream_ctx`).
@@ -159,18 +62,19 @@ struct EventOwner {
  * during a decode: only destruction is valid afterwards.
  *
  * Not thread-safe: one context per thread, no internal locking (documented on
- * the ABI). The member types have external linkage (named namespace) so this
- * ABI-visible struct triggers no subobject-linkage diagnostic. */
+ * the ABI). The member types have external linkage (the shared cudec_cuda
+ * namespace, not an anonymous one) so this ABI-visible struct triggers no
+ * subobject-linkage diagnostic. */
 struct cudec_stream_ctx {
-    cudec_stream_detail::StreamOwner stream;
-    cudec_stream_detail::EventOwner reuse_ev;
-    cudec_stream_detail::PinnedBuf p_src;
-    cudec_stream_detail::DevBuf d_src;
-    cudec_stream_detail::PinnedBuf p_meta;
-    cudec_stream_detail::DevBuf d_meta;
-    cudec_stream_detail::DevBuf d_dst; /* host-output staging only */
-    cudec_stream_detail::DevBuf d_results;
-    cudec_stream_detail::PinnedBuf p_results;
+    cudec_cuda::StreamOwner stream;
+    cudec_cuda::EventOwner reuse_ev;
+    cudec_cuda::PinnedBuf p_src;
+    cudec_cuda::DevBuf d_src;
+    cudec_cuda::PinnedBuf p_meta;
+    cudec_cuda::DevBuf d_meta;
+    cudec_cuda::DevBuf d_dst; /* host-output staging only */
+    cudec_cuda::DevBuf d_results;
+    cudec_cuda::PinnedBuf p_results;
     bool poisoned = false;
 };
 
@@ -286,13 +190,8 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
      * cudaMalloc) leaves the context's buffers partially grown; poison so only
      * destruction is valid afterwards. This is a DEFINED failure, reachable
      * through the public API without any undefined behavior. */
-#define GROW(call)                   \
-    do {                             \
-        if ((call) != cudaSuccess) { \
-            ctx.poisoned = true;     \
-            return CUDEC_ERR_CUDA;   \
-        }                            \
-    } while (0)
+#define GROW(call) \
+    CUDEC_CUDA_CHECK(call, { ctx.poisoned = true; return CUDEC_ERR_CUDA; })
     GROW(ctx.p_src.ensure(max_wave_src));
     GROW(ctx.d_src.ensure(max_wave_src));
     GROW(ctx.p_meta.ensure(kMetaBytes));
