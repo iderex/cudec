@@ -232,8 +232,9 @@ the check, so the accumulator cannot wrap for any caller-supplied sizes);
 literal presence vs. remaining src; literal fit vs. remaining dst
 capacity; offset-field presence; `offset == 0` rejected;
 `offset > bytes written so far` rejected; match-length fit vs. remaining
-capacity; success ONLY at exact stream consumption after a literals-only
-tail. Edge semantics (end-of-block rules, empty-block tokens) are settled
+capacity; the LZ4 parsing restriction that a match may not end within the
+last `LASTLITERALS` (5) output bytes; success ONLY at exact stream
+consumption after a literals-only tail. Edge semantics (end-of-block rules, empty-block tokens) are settled
 empirically by oracle parity — whenever liblz4 rejects, cudec rejects; for
 accepted mutants the comparison is against the oracle's own output and
 size. One crafted negative fixture per ladder branch, its oracle verdict
@@ -245,6 +246,18 @@ presented as success. On success, writes touch exactly
 `dst[0, bytes_written)`. Check-before-load is batch isolation, not just
 parity: on a GPU an out-of-bounds read is not a per-chunk failure — it can
 fault the launch and poison the whole batch.
+
+**One deliberate divergence from liblz4 (settled empirically at ladder
+step 2):** a match offset of 0 is invalid per the LZ4 block spec, but
+liblz4 tolerates it as a defined self-referential copy (its decoder
+silences an msan warning there rather than erroring). cudec rejects it —
+fail-closed on spec-invalid input (prime directive 1) outranks bug-for-bug
+parity with the reference. This makes cudec's accept set a strict subset
+of liblz4's: the twin test asserts the two security-critical directions
+(where cudec accepts, liblz4 accepts and the bytes match; where liblz4
+rejects, cudec rejects) and reports the count of stricter-than-liblz4
+cases so the divergence stays visible rather than silent. It is the only
+such point.
 
 **Anti-pattern rule (from the two-phase candidate's disproof):** no packed
 or narrowed field anywhere in the decoder unless its bound derives from an
