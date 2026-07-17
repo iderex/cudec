@@ -98,14 +98,19 @@ docker run --rm --gpus all -v "$PWD:/w" -w /w \
 Issue-driven: every change starts as an issue and lands as a gated PR — see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## AI assistance
+## 🤝 AI-assisted, human-owned
 
-Claude (Anthropic) assisted in building cudec — with development, review, and
-English phrasing — always on individual process steps, never producing
-finished or unreviewed work. AI-assisted does not mean AI-run: a human
-maintainer directs and oversees every step, reviews the result through the
-project's adversarial review gate, has the final say on everything that
-lands, and remains responsible for it at all times.
+Development here is AI-assisted. Claude (Anthropic) helps with individual
+process steps — generating and analysing code, running the adversarial
+security reviews, and translating documentation and comments into English. It
+never hands over finished, unreviewed work: each step is only a proposal. A
+human maintainer reviews, understands, edits where needed, and signs off on
+every one — the AI proposes, a person decides, and a human stays responsible
+for every line that ships, at all times. The review discipline is modelled,
+as far as is practical for a volunteer project, on the change-control
+expected of TÜV/BSI-certified software in a critical sector such as
+healthcare — with no claim to actual certification. In short: nothing lands
+because a tool suggested it; it lands because a person verified it.
 
 ## License
 
