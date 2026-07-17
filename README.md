@@ -55,9 +55,10 @@ and milestones:
   never an out-of-bounds access and never a guess. Every reject path has a
   negative test.
 - **Deterministic.** Same input, same output — bit-exact on every code path.
-- **Honest numbers.** Every performance claim ships with GPU model, driver,
-  CUDA version, corpus, and chunk-size distribution. Benchmarks live in the
-  repo.
+- **Honest numbers.** Recorded baselines: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+  (`bench/bench_lz4`; corpora via `bench/get-corpora.sh`, hash-pinned).
+  Every performance claim ships with GPU model, driver,
+  CUDA version, corpus, and chunk-size distribution.
 - **Minimal.** The least code that does the job; structural rules are locked
   in by conformance tests.
 

@@ -36,6 +36,11 @@ if(CUDEC_ENABLE_CUDA)
     set(CMAKE_CUDA_ARCHITECTURES 80 86-real)
   endif()
   enable_language(CUDA)
+  # The project language is C; the test net and the bench harness add .cpp
+  # translation units, so CXX is enabled here where both subdirectories
+  # can see it (a language enabled inside one subdirectory is invisible to
+  # its siblings).
+  enable_language(CXX)
   enable_testing()
 
   # Single source of truth for the strict device flags: the raw list also
@@ -54,8 +59,11 @@ if(CUDEC_ENABLE_CUDA)
                      CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
   target_compile_options(cudec PRIVATE ${CUDEC_CUDA_STRICT_FLAGS})
 
-  # Keep this last in the CUDA block: the conformance checks in tests/
-  # snapshot the cudec target's properties at this point - anything added
-  # to the target below this line would escape them.
+  # Keep tests/ after everything that may touch the cudec target: its
+  # conformance checks snapshot the target's properties at this point -
+  # anything added to the target below this line would escape them. bench/
+  # follows because it consumes targets defined in tests/ and is
+  # consumer-only by rule (it links project targets, never modifies them).
   add_subdirectory(tests)
+  add_subdirectory(bench)
 endif()

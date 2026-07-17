@@ -58,7 +58,9 @@ std::vector<unsigned char> TextLike(size_t size, uint64_t seed) {
     return out;
 }
 
-std::vector<unsigned char> Lz4Compress(
+}  // namespace
+
+std::vector<unsigned char> Lz4CompressBlock(
     const std::vector<unsigned char>& original) {
     const int bound = LZ4_compressBound(static_cast<int>(original.size()));
     std::vector<unsigned char> compressed(static_cast<size_t>(bound));
@@ -66,16 +68,14 @@ std::vector<unsigned char> Lz4Compress(
         reinterpret_cast<const char*>(original.data()),
         reinterpret_cast<char*>(compressed.data()),
         static_cast<int>(original.size()), bound);
-    /* Fixture generation is infrastructure, not a test: a compressor
-     * failure here would silently hollow out every downstream assertion. */
+    /* Corpus generation is infrastructure, not a test: a compressor
+     * failure here would silently hollow out every downstream consumer. */
     if (written <= 0) {
         std::abort();
     }
     compressed.resize(static_cast<size_t>(written));
     return compressed;
 }
-
-}  // namespace
 
 std::vector<Fixture> MakeLz4BlockFixtures() {
     std::vector<Fixture> out;
@@ -85,7 +85,7 @@ std::vector<Fixture> MakeLz4BlockFixtures() {
         f.name = std::move(name);
         f.seed = seed;
         f.original = std::move(original);
-        f.compressed = Lz4Compress(f.original);
+        f.compressed = Lz4CompressBlock(f.original);
         out.push_back(std::move(f));
     };
     add("zeros-65536", 0x01, std::vector<unsigned char>(65536, 0));
