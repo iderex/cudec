@@ -107,12 +107,23 @@ void CompressAll(Corpus* corpus) {
  * The trailing literal run keeps the last match clear of the block end,
  * satisfying LZ4's parsing restrictions (LASTLITERALS = 5, last match >= 12
  * bytes before the end); the oracle is the sole authority and confirms the
- * verdict in BuildWorst4bCorpus before any timing. Assumes out_bytes is a
- * full chunk (kChunkBytes) - comfortably above the tail minimum. */
-void BuildWorst4bBlock(size_t out_bytes, std::vector<unsigned char>* original,
+ * verdict in BuildWorst4bCorpus before any timing. */
+bool BuildWorst4bBlock(size_t out_bytes, std::vector<unsigned char>* original,
                        std::vector<unsigned char>* compressed) {
     constexpr unsigned char kSeed = 0xA5;
-    constexpr size_t kMinTail = 12; /* >= LZ4's last-match distance rule */
+    constexpr size_t kMinTail = 12;   /* >= LZ4's last-match distance rule */
+    constexpr size_t kMinBytes = 256; /* fail loud below this, never wrap the
+                                       * out_bytes - kMinTail subtraction */
+
+    /* Only ever called with kChunkBytes today, but the signature invites
+     * reuse: a small out_bytes would wrap the size_t subtraction below into
+     * a huge loop bound and OOM. Reject it loudly instead. */
+    if (out_bytes < kMinBytes) {
+        std::fprintf(stderr, "worst-4Bmatch block needs at least %zu output "
+                             "bytes, got %zu\n",
+                     kMinBytes, out_bytes);
+        return false;
+    }
 
     original->assign(out_bytes, kSeed);
 
@@ -150,6 +161,7 @@ void BuildWorst4bBlock(size_t out_bytes, std::vector<unsigned char>* original,
         c.push_back(static_cast<unsigned char>(rem));
     }
     c.insert(c.end(), tail, kSeed);
+    return true;
 }
 
 /* Replicates the worst-case block to `chunks` identical chunks. Rejects an
@@ -159,7 +171,9 @@ void BuildWorst4bBlock(size_t out_bytes, std::vector<unsigned char>* original,
 bool BuildWorst4bCorpus(Corpus* corpus, size_t chunks) {
     std::vector<unsigned char> original;
     std::vector<unsigned char> compressed;
-    BuildWorst4bBlock(kChunkBytes, &original, &compressed);
+    if (!BuildWorst4bBlock(kChunkBytes, &original, &compressed)) {
+        return false;
+    }
 
     std::vector<unsigned char> decoded;
     if (!OracleDecodes(compressed, original.size(), &decoded) ||
@@ -167,6 +181,23 @@ bool BuildWorst4bCorpus(Corpus* corpus, size_t chunks) {
         std::memcmp(decoded.data(), original.data(), decoded.size()) != 0) {
         std::fprintf(stderr, "worst-4Bmatch construction rejected by the "
                              "oracle - refusing to time an invalid stream\n");
+        return false;
+    }
+
+    /* Lock the WORST-CASE property, not just validity. A future edit that
+     * yields a valid-but-non-adversarial block (say, one long match) would
+     * still round-trip and leave CI green while the report claims "worst
+     * case". The intended block is ~0.75 (minimum matches barely compress);
+     * a single-long-match best case is ~0.0001. Requiring the compression
+     * ratio to stay >= 0.70 reds the selfcheck if the generator ever stops
+     * being adversarial. original.size() is non-zero (kChunkBytes). */
+    const double ratio = static_cast<double>(compressed.size()) /
+                         static_cast<double>(original.size());
+    if (ratio < 0.70) {
+        std::fprintf(stderr, "worst-4Bmatch block is not adversarial: "
+                             "compressed/original %.4f below the 0.70 "
+                             "sequence-density floor\n",
+                     ratio);
         return false;
     }
 
