@@ -78,6 +78,61 @@ phase-1, which shares the identical serial parse, so two-phase cannot reach
 two-phase help? — is answered NO by the arithmetic. The path to higher
 throughput is structural single-pass work, not a decomposition change.
 
+### Perf pass 2 (issue #21): the occupancy lever does not help either
+
+Perf pass 1 named the remaining structural lever — raise the ~34 GB/s parse
+ceiling through higher occupancy. This pass profiled the kernel and measured
+that lever directly; it too is rejected by measurement.
+
+**Profile (pinned container, RTX 3080 sm_86, `nvcc -Xptxas -v`).** The shipped
+`lz4_decode_batch` (Full) uses **46 registers/thread** on sm_86 (48 on sm_80).
+On sm_86 — 65536 registers/SM, 256-register warp allocation granularity,
+128-thread blocks — 46 rounds up to 1536 registers/warp, giving 10 resident
+blocks → **40 warps/SM (~83% occupancy)**. Register granularity is the wall:
+41–48 registers/thread all fall in the same 1536-register/warp bucket and all
+yield 40 warps; the next occupancy step (48 warps/SM, 100%) requires
+**≤ 40 registers/thread**.
+
+**The only reachable path forces a spill.** The parser's live state is
+dominated by the 64-bit stream cursors and the six-field `Lz4Sequence`. The
+anti-pattern rule (masterplan section 9) forbids narrowing any of it to 32-bit
+— the ABI's `size_t` capacities admit values above 2^32, pinned by the
+`SIZE_MAX` and beyond-convention capacity tests — so a legitimate drop to 40
+registers is not available. `__launch_bounds__(kBlockThreads, 12)` caps ptxas
+at 40 registers only by **spilling to local memory** (sm_86: 16-byte stack
+frame, 20 bytes spill stores, 20 bytes spill loads).
+
+Measured on Silesia, same session and hardware, with the CPU-oracle row and
+the parse-only row as controls (both run in the same invocation, so machine
+state is shared):
+
+| Configuration                                                     | Full decode                        | Parse-only (control) |
+| ----------------------------------------------------------------- | ---------------------------------- | -------------------- |
+| Baseline (`__launch_bounds__(kBlockThreads)`, 46 reg, 40 warps)   | p50 12.178 ms, **17.4 GB/s**       | 6.302 ms, 33.6 GB/s  |
+| `__launch_bounds__(kBlockThreads, 12)` (40 reg + spill, 48 warps) | p50 12.801 ms, **16.6 GB/s (−5%)** | 6.244 ms, 33.9 GB/s  |
+
+Forcing 100% occupancy **regresses** the full decode ~5%. Parse-only (still 28
+registers, no spill, so unaffected by the register cap) stays flat across the
+same runs — an internal control that attributes the regression to the spill,
+not to run-to-run variance; the CPU oracle baseline was in fact slightly faster
+during the variant run. The extra local-memory traffic in the already
+latency-bound parse loop costs more than the eight added warps hide. All ten
+ctest gates (`parser_twin` and `gpu_fixture` oracle parity, `stream_twin`
+determinism, and the rest) stay green on the variant — the change is
+measurement-rejected, not correctness-rejected. No code shipped; the kernel is
+unchanged.
+
+**Empirical conclusion.** The occupancy lever cannot be realized under the
+current fail-closed architecture: more warps need ≤ 40 registers/thread; ≤ 40
+registers needs either a forbidden 64-bit narrowing or a spill; and the spill
+regresses. Raising the parse ceiling therefore requires the warp-specialization
+rewrite that abandons the load-bearing redundant-lockstep-parse invariant — its
+own design panel, not a measured micro-pass — and under "formats over
+percentage points" (masterplan section 2) the next format outranks it. Of the
+two levers issue #21 named, the register-reduction lever is measured and
+rejected here; the warp-specialization lever is scoped as a larger design
+change deferred behind the format ladder.
+
 ## M2: pinned-host streaming decode, end-to-end (Silesia)
 
 The streaming decode path (`cudec_lz4_decompress_stream`, issue #24) times the
