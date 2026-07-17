@@ -1,6 +1,7 @@
 # Build output - reproducible from the sources via CMake.
 build/
 build-cuda/
+build-san/
 
 # Downloaded benchmark corpora - hash-pinned by bench/get-corpora.sh,
 # never committed.

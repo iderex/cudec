@@ -8,12 +8,48 @@ project(cudec VERSION 0.0.1 LANGUAGES C)
 # gate). CI flips this on together with the CUDA toolchain (issue #3).
 option(CUDEC_ENABLE_CUDA "Build the CUDA decode engine and its tests" OFF)
 
+# Host-side sanitizer gate (issue #42): opt-in, default OFF. When set (e.g.
+# -DCUDEC_SANITIZE=address,undefined) it instruments the HOST untrusted-input
+# attack surface - the frame parse (src/frame.cpp), the single-sourced block
+# parser exercised by the CPU twin, and the C-ABI argument validation - and the
+# GPU-less test subset runs under the sanitizer, so an out-of-bounds access, an
+# uninitialised read, or integer/shift UB on a hostile bitstream reds the
+# build. It never touches device (nvcc) compilation: host ASan cannot
+# instrument device code, and the device net stays compute-sanitizer plus the
+# whole-corpus GPU/oracle byte diff (masterplan section 5). Fail-closed:
+# -fno-sanitize-recover=all makes a UBSan finding abort with a non-zero status
+# instead of printing and continuing green.
+set(CUDEC_SANITIZE ""
+    CACHE STRING
+          "Host sanitizers to enable, e.g. 'address,undefined' (empty = off)")
+if(CUDEC_SANITIZE)
+  if(MSVC)
+    message(FATAL_ERROR "CUDEC_SANITIZE requires a GCC/Clang host toolchain "
+                        "(the pinned Linux container is the maintained path).")
+  endif()
+  # Host C/C++ only - the generator expression keeps these off any CUDA
+  # translation unit. The compile flags instrument the TUs; the link flags pull
+  # in the sanitizer runtimes on the executables that run under the gate.
+  set(CUDEC_SANITIZE_COMPILE_FLAGS
+      -fsanitize=${CUDEC_SANITIZE} -fno-sanitize-recover=all
+      -fno-omit-frame-pointer)
+  set(CUDEC_SANITIZE_LINK_FLAGS -fsanitize=${CUDEC_SANITIZE})
+endif()
+
 add_library(cudec src/version.c)
 target_include_directories(cudec PUBLIC include)
 
 if(NOT MSVC)
   target_compile_options(cudec
                          PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra;-Werror>)
+endif()
+
+# Instrument the library's host TUs (version.c now; frame.cpp/stream.cpp once
+# the CUDA engine is enabled). Guarded to C/C++ so batch.cu is never sanitized.
+if(CUDEC_SANITIZE)
+  target_compile_options(
+    cudec
+    PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:${CUDEC_SANITIZE_COMPILE_FLAGS}>)
 endif()
 
 if(CUDEC_ENABLE_CUDA)
@@ -72,5 +108,11 @@ if(CUDEC_ENABLE_CUDA)
   # follows because it consumes targets defined in tests/ and is
   # consumer-only by rule (it links project targets, never modifies them).
   add_subdirectory(tests)
-  add_subdirectory(bench)
+  # bench_lz4 is a single nvcc-linked binary (bench_lz4.cpp + gpu_bench.cu); it
+  # cannot link the ASan-instrumented cudec without dragging the sanitizer onto
+  # the device link, so the host-only sanitizer gate omits bench entirely. Its
+  # CPU self-checks stay covered by the normal (non-sanitized) build.
+  if(NOT CUDEC_SANITIZE)
+    add_subdirectory(bench)
+  endif()
 endif()

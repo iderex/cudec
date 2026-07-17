@@ -105,6 +105,76 @@ jobs:
           grep -E ': frame_twin$' gpu-deferred.txt &&
           grep -E ': stream_twin$' gpu-deferred.txt
 
+  sanitize:
+    # The host-side ASan/UBSan gate over the untrusted-input decode path (issue
+    # #42): builds only the GPU-less, host-instrumentable subset (the frame
+    # parse, the single-sourced block parser via the CPU twin, and the C-ABI
+    # argument validation) with AddressSanitizer + UndefinedBehaviorSanitizer,
+    # and runs the negative/mutation/oracle/conformance tests under it, so an
+    # out-of-bounds access, an uninitialised read, or integer/shift UB on a
+    # hostile bitstream reds the build. The sanitizer never touches nvcc/device
+    # compilation (CUDEC_SANITIZE guards it to the host C/C++ path); the device
+    # net stays compute-sanitizer + the whole-corpus GPU/oracle byte diff.
+    name: sanitize
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Same pinned image/digest as build: nvcc is present (the library's device
+    # TU still compiles) and the runner has no GPU (the sanitized subset rejects
+    # or decodes all-uncompressed frames before any CUDA call).
+    container:
+      image: nvidia/cuda:12.6.2-devel-ubuntu24.04@sha256:738fba0fbdb225b7a2931c58a5c8f03a84d3cd2f6a84975826a157339ef750b8
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Same git-before-checkout lesson as the build job: git in the container
+      # keeps actions/checkout off the flakier REST-tarball fallback, and the
+      # CUDA apt repo is dropped before the update.
+      - name: Install git and CMake
+        run: >-
+          rm -f /etc/apt/sources.list.d/cuda*.list &&
+          apt-get update -q -o Acquire::Retries=3 &&
+          apt-get install -yq -o Acquire::Retries=3 --no-install-recommends
+          git cmake
+
+      - name: Check out the source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Host-only subset with the sanitizers on. The GPU tests and bench are
+      # skipped by the CMake gate (they are nvcc-linked), so the build is pure
+      # host. The test -x lines are fail-closed: the four sanitized binaries
+      # must exist, so a build that silently stopped producing them reds here.
+      - name: Build the host attack surface with ASan+UBSan
+        run: >-
+          cmake -B build-san -DCUDEC_ENABLE_CUDA=ON
+          -DCUDEC_SANITIZE=address,undefined &&
+          cmake --build build-san -j &&
+          test -x build-san/tests/conformance_c &&
+          test -x build-san/tests/oracle_lz4 &&
+          test -x build-san/tests/parser_twin &&
+          test -x build-san/tests/frame_host_negative
+
+      # Prove the sanitizer runtimes are actually linked: a dropped or renamed
+      # -fsanitize flag would still build and test green but check nothing, so
+      # pin it empirically here - a sanitized binary links libasan and libubsan.
+      - name: Verify the sanitizer runtimes are linked
+        run: >-
+          ldd build-san/tests/parser_twin | grep -q libasan &&
+          ldd build-san/tests/parser_twin | grep -q libubsan
+
+      # Run the untrusted-input subset under the sanitizers. --no-tests=error
+      # reds a vacuous selection; the regex pins exactly the host tests this
+      # gate owns (launch_fail and bench are excluded: they initialise the CUDA
+      # runtime / are nvcc-linked, outside the host attack surface).
+      - name: Run the untrusted-input decode path under ASan+UBSan
+        run: >-
+          ctest --test-dir build-san --no-tests=error --output-on-failure -R
+          '^(conformance_c|oracle_lz4|parser_twin|frame_host_negative)$'
+
   format:
     name: format
     runs-on: ubuntu-latest
