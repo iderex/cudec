@@ -292,11 +292,20 @@ parse-only ceiling is ~35 GB/s (~10× CPU) — so parse and copy each cost
 roughly half the wall time. Since parse-only ceilings any two-phase phase-1
 (shared serial parse), two-phase cannot exceed ~35 GB/s; its only lever is
 a faster copy, which single-pass optimizes equally without a table or
-barrier. The perf pass (#16) targets the copy first (the per-byte 64-bit
-modulo in the gather) to pull end-to-end toward the parse ceiling, then the
-parse (register-window staging) to raise it. Recorded in
-[docs/BENCHMARKS.md](BENCHMARKS.md); the falsification trigger is evaluated
-at #16.
+barrier. Recorded in [docs/BENCHMARKS.md](BENCHMARKS.md).
+
+**Perf pass 1 outcome (issue #16): the designed micro-optimizations were
+rejected by measurement** — the incremental-mod gather regressed 16% (its
+loop-carried dependency pipelines worse than the independent modulo the
+compiler overlaps) and the vectorized literal copy regressed 6% (real
+literal runs are too short for the wide path); a `__syncwarp` elision was
+neutral. The kernel is at a local optimum for its structure; the bottleneck
+is structural (the redundant 32-lane parse ceiling and latency-bound
+short-run copies), so raising throughput needs higher occupancy or
+warp-specialization — larger than a micro-op pass, tracked as issue #21. The
+falsification trigger does NOT reopen two-phase: it stays ruled out by the
+shared parse ceiling regardless of the numeric condition (see
+BENCHMARKS.md).
 
 **Known limits, published:** the redundant-parse family ceiling is roughly
 250–400 GB/s after perf passes — deliberately accepted under "formats over
