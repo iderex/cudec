@@ -211,6 +211,7 @@ int main(int argc, char** argv) {
     size_t warmup = 3;
     bool selfcheck = false;
     bool gpu = false;
+    bool gpu_stream = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -218,6 +219,8 @@ int main(int argc, char** argv) {
             selfcheck = true;
         } else if (arg == "--gpu") {
             gpu = true;
+        } else if (arg == "--gpu-stream") {
+            gpu_stream = true;
         } else if (arg == "--runs" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n",
@@ -234,8 +237,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "%s needs a value\n", arg.c_str());
             return 2;
         } else if (!arg.empty() && arg[0] == '-') {
-            std::fprintf(stderr, "usage: bench_lz4 [--runs N] [--warmup N] "
-                                 "[--gpu] [--selfcheck] [corpus files...]\n");
+            std::fprintf(stderr,
+                         "usage: bench_lz4 [--runs N] [--warmup N] [--gpu] "
+                         "[--gpu-stream] [--selfcheck] [corpus files...]\n");
             return 2;
         } else {
             files.push_back(arg);
@@ -336,6 +340,63 @@ int main(int argc, char** argv) {
                     "%.1f GB/s - ceilings this design AND any two-phase "
                     "phase-1 (shared parse)\n",
                     g.parse_only_ms_p50, g.parse_only_gbps_p50);
+    }
+
+    if (gpu_stream) {
+        std::vector<const unsigned char*> comp_ptrs(corpus.compressed.size());
+        std::vector<size_t> comp_sizes(corpus.compressed.size());
+        std::vector<size_t> orig_sizes(corpus.originals.size());
+        for (size_t i = 0; i < corpus.compressed.size(); i++) {
+            comp_ptrs[i] = corpus.compressed[i].data();
+            comp_sizes[i] = corpus.compressed[i].size();
+            orig_sizes[i] = corpus.originals[i].size();
+        }
+        const unsigned kStreams = 4;
+        cudec_stream_result s;
+        if (!cudec_bench_gpu_stream(comp_ptrs.data(), comp_sizes.data(),
+                                    orig_sizes.data(), corpus.originals.size(),
+                                    static_cast<int>(warmup),
+                                    static_cast<int>(runs), kStreams, &s)) {
+            std::fprintf(stderr, "GPU streaming bench failed\n");
+            return 1;
+        }
+        /* The effective overlap depth: the entry caps streams to the wave
+         * count (64 chunks/wave), so a small corpus runs fewer than requested.
+         */
+        const size_t kWaveChunks = 64;
+        const size_t waves =
+            (corpus.originals.size() + kWaveChunks - 1) / kWaveChunks;
+        const unsigned eff_streams = static_cast<unsigned>(
+            s.overlap_streams < waves ? s.overlap_streams : waves);
+        /* End-to-end throughput = decoded output bytes / wall time (H2D and,
+         * for host output, D2H included). The wall also includes the one-shot
+         * per-call ring allocation this synchronous entry does (a reusable
+         * context is deferred): the numbers below are DOMINATED by that setup,
+         * not by copy or decode - compare the device wall to the pure-H2D and
+         * device-resident-decode rows. For the same reason the two device rows
+         * are NOT a clean overlap comparison: the higher-stream config
+         * provisions proportionally more ring, so its extra time is setup, not
+         * a copy/decode-overlap regression. A setup-free overlap number needs
+         * the reusable context (follow-up); the overlap CAPABILITY itself is
+         * locked by the stream_overlap test. */
+        std::printf("- GPU streaming, end-to-end, ONE-SHOT-SETUP-DOMINATED "
+                    "(host compressed in -> decoded out; wall clock around the "
+                    "whole synchronous call incl. per-call ring setup; %d "
+                    "warmup + %d runs):\n",
+                    static_cast<int>(warmup), static_cast<int>(runs));
+        std::printf("    device out: 1 stream p50 %.1f ms, %.2f GB/s ; %u "
+                    "streams (of %u requested) p50 %.1f ms, %.2f GB/s\n",
+                    s.device_serial_ms, s.device_serial_gbps, eff_streams,
+                    s.overlap_streams, s.device_overlap_ms,
+                    s.device_overlap_gbps);
+        std::printf("    host out (1 internal stream; readback synchronous): "
+                    "p50 %.1f ms, %.2f GB/s\n",
+                    s.host_ms, s.host_gbps);
+        std::printf("    context: pure contiguous H2D of %.2f MB compressed = "
+                    "p50 %.3f ms (a best-case floor; the pipeline stages many "
+                    "smaller per-wave copies) - dwarfed by the walls above, so "
+                    "the walls are setup-bound, not PCIe-bound\n",
+                    static_cast<double>(s.compressed_bytes) / 1e6, s.h2d_ms);
     }
 
     if (selfcheck) {
