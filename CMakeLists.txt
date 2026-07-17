@@ -54,7 +54,7 @@ if(CUDEC_ENABLE_CUDA)
   # frame.cpp (the LZ4 frame orchestrator) is host C++ that drives the
   # device batch decoder, so it needs the CUDA runtime.
   find_package(CUDAToolkit REQUIRED)
-  target_sources(cudec PRIVATE src/batch.cu src/frame.cpp)
+  target_sources(cudec PRIVATE src/batch.cu src/frame.cpp src/stream.cpp)
   target_link_libraries(cudec PRIVATE CUDA::cudart)
   # The cudec target predates enable_language(CUDA), so the architecture
   # list must be applied as an explicit target property.

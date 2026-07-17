@@ -124,6 +124,53 @@ cudec_status cudec_lz4f_decompress(const void* frame, size_t frame_size,
                                    void* dst, size_t dst_capacity,
                                    size_t* bytes_written);
 
+/* Memory space of the streaming decoder's per-chunk destinations. */
+typedef enum cudec_mem_space {
+    CUDEC_MEM_HOST = 0,   /* dst_ptrs are host pointers; output is copied D2H */
+    CUDEC_MEM_DEVICE = 1  /* dst_ptrs are device pointers; output stays in VRAM */
+} cudec_mem_space;
+
+/* Streaming batch LZ4 block decode from HOST-resident compressed chunks. The
+ * H2D copy is pipelined against decode across CUDA streams the call manages
+ * internally. Synchronous: the pipeline is fully drained before return, so
+ * every dst[k] and h_results[k] is valid on a CUDEC_OK return.
+ *
+ * All array arguments are HOST arrays of chunk_count entries. h_src_ptrs[k] /
+ * h_src_sizes[k] is the k-th compressed block in host memory; all input is
+ * staged through the library's own pinned ring, so the H2D copy does not
+ * depend on the caller pinning its input. dst_ptrs[k] / dst_caps[k] is the
+ * k-th output slot, in the space named by dst_space: for CUDEC_MEM_DEVICE the
+ * decode writes device memory directly and the copy/decode pipeline overlaps;
+ * for CUDEC_MEM_HOST the decoded bytes are read back to host memory, and that
+ * readback is synchronous in this release (the copy/decode overlap applies to
+ * the device-output path). On a successful chunk the caller's destination
+ * holds exactly bytes_written bytes and the space beyond is left untouched,
+ * in both spaces. h_results[k] receives the k-th outcome.
+ *
+ * `streams` is the overlap depth for the device-output pipeline: 0 selects a
+ * library default; 1 serializes copy and decode; N>=2 round-robins the work
+ * so the copy of later chunks can overlap the decode of earlier ones. The
+ * decoded output is BIT-IDENTICAL for every `streams` value.
+ *
+ * Fail-closed: a NULL array, a NULL h_src_ptrs[k] with a non-zero
+ * h_src_sizes[k], a NULL dst[k] with a non-zero dst_caps[k], an unknown
+ * dst_space, chunk_count == 0, or a batch beyond the launch limit returns
+ * CUDEC_ERR_INVALID_ARGUMENT and decodes nothing. A rejected chunk
+ * reports its defined error in h_results[k] with bytes_written 0; neighbours
+ * are unaffected and its destination is unspecified but never presented as a
+ * valid decode. The aggregate return is CUDEC_OK iff every chunk decoded OK;
+ * otherwise a host/device resource failure (CUDEC_ERR_CUDA) takes precedence,
+ * then the first non-OK chunk's status in index order. Never throws across
+ * this boundary. */
+cudec_status cudec_lz4_decompress_stream(const void* const* h_src_ptrs,
+                                         const size_t* h_src_sizes,
+                                         void* const* dst_ptrs,
+                                         const size_t* dst_caps,
+                                         size_t chunk_count,
+                                         cudec_mem_space dst_space,
+                                         unsigned streams,
+                                         cudec_chunk_result* h_results);
+
 #ifdef __cplusplus
 }
 #endif
