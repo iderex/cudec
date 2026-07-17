@@ -88,8 +88,8 @@ The full per-report methodology blocks are in
 
 | Path                                   | Throughput | Relative      |
 | -------------------------------------- | ---------- | ------------- |
-| CPU oracle, liblz4 single thread       | 3.46 GB/s  | 1× (baseline) |
-| GPU decode, device-resident (cudec)    | 18.1 GB/s  | ~5.2× CPU     |
+| CPU oracle, liblz4 single thread       | 3.41 GB/s  | 1× (baseline) |
+| GPU decode, device-resident (cudec)    | 18.1 GB/s  | ~5.3× CPU     |
 | GPU parse-only ceiling (copies elided) | 34.6 GB/s  | ~10× CPU      |
 
 The device-resident kernel decodes Silesia at **~18 GB/s**, roughly 5× the
