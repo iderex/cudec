@@ -189,3 +189,37 @@ foreach(_probe host_warning device_warning)
         "under the strict flags")
   endif()
 endforeach()
+
+# Single-source lock (issue #40): the host-side CUDA RAII owners live once, in
+# src/cuda_raii.h, and every CUDA host translation unit reuses them instead of
+# carrying its own copy. This detector reds the build if the header stops
+# defining an owner, or if a host TU drops the include or re-introduces a local
+# owner definition. Honest limit (as with the checks above): it catches a
+# re-copy under the SAME struct names, not one smuggled in under a fresh name -
+# a drift detector, not tamper-proofing.
+set(_raii_header ${CMAKE_CURRENT_SOURCE_DIR}/../src/cuda_raii.h)
+if(NOT EXISTS ${_raii_header})
+  message(FATAL_ERROR "src/cuda_raii.h is missing: the shared CUDA RAII owners "
+                      "must be single-sourced there (issue #40)")
+endif()
+file(READ ${_raii_header} _raii_src)
+foreach(_owner DevBuf PinnedBuf StreamOwner EventOwner)
+  if(NOT _raii_src MATCHES "struct ${_owner}")
+    message(FATAL_ERROR "src/cuda_raii.h no longer defines the shared owner "
+                        "'${_owner}' (issue #40)")
+  endif()
+endforeach()
+foreach(_tu frame.cpp stream.cpp)
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_tu} _tu_src)
+  if(NOT _tu_src MATCHES "#include \"cuda_raii.h\"")
+    message(FATAL_ERROR "src/${_tu} no longer includes cuda_raii.h: it must "
+                        "reuse the shared CUDA RAII owners (issue #40)")
+  endif()
+  foreach(_owner DevBuf PinnedBuf StreamOwner EventOwner DevPtr)
+    if(_tu_src MATCHES "struct ${_owner}")
+      message(FATAL_ERROR "src/${_tu} defines a local 'struct ${_owner}': the "
+                          "CUDA RAII owners are single-sourced in cuda_raii.h "
+                          "(issue #40)")
+    endif()
+  endforeach()
+endforeach()
