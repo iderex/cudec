@@ -27,8 +27,8 @@ timed. GPU timing jitters ~1–2% run to run.
 - corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3239 chunks, 211.94 MB original, 102.44 MB compressed (ratio 0.483), compressed in-harness via LZ4_compress_default
 - chunk sizes: min 8066 / median 65536 / max 65536 bytes
 - method: 3 warmup + 30 measured runs; CPU wall clock per whole-batch decode; GPU device-resident, CUDA-event timed; output byte-verified before timing
-- CPU decode throughput (liblz4 baseline): p50 3.46 GB/s
-- GPU decode (cudec, device-resident): p50 11.7 ms, 18.1 GB/s (~5.2x the CPU baseline)
+- CPU decode throughput (liblz4 baseline; full methodology in "Baseline: CPU oracle" below): p50 3.41 GB/s
+- GPU decode (cudec, device-resident): p50 11.7 ms, 18.1 GB/s (~5.3x the CPU baseline)
 - GPU parse-only ceiling (copies elided): p50 6.1 ms, 34.6 GB/s
 ```
 
@@ -171,7 +171,7 @@ the device and sit at the Silesia scale for a direct comparison.
 **The degradation is linear and bounded — not an amplification vector.**
 
 - Every path degrades by the same ~2.2–2.3× against the Silesia average:
-  CPU 3.46 → 1.49 GB/s, GPU decode 18.1 → 8.1 GB/s, GPU parse-only ceiling
+  CPU 3.41 → 1.49 GB/s, GPU decode 18.1 → 8.1 GB/s, GPU parse-only ceiling
   34.6 → 15.3 GB/s. The uniform factor is the sequence density (one
   sequence per 4 bytes here versus Silesia's longer average matches): the
   cost is linear in the number of sequences — exactly the redundant parse
@@ -188,7 +188,7 @@ the device and sit at the Silesia scale for a direct comparison.
   per-chunk output cap fail-closes the size axis regardless.
 - The GPU advantage holds under the worst input: 8.1 GB/s worst-case GPU is
   still ~5.4× the CPU worst case (1.49 GB/s) and ~2.3× the CPU's Silesia
-  _average_ (3.46 GB/s). A second run confirmed the numbers within GPU
+  _average_ (3.41 GB/s). A second run confirmed the numbers within GPU
   jitter (8.2 GB/s decode, 15.7 GB/s parse-only).
 
 Reproduce with `bench_lz4 --worst4b --gpu`; the construction is oracle-
@@ -268,18 +268,25 @@ per-wave submission included) and are not a regression of it.
 ## Baseline: CPU oracle (M0, pre-kernel)
 
 The reference the GPU decoder is measured against: the single-threaded CPU
-oracle on the development machine, recorded 2026-07-17.
+oracle on the development machine. Re-measured 2026-07-17 (issue #48) with a
+plain, GPU-less invocation (`bench_lz4 bench/corpora/silesia/*`, no `--gpu`)
+to replace a stale figure that had drifted ~2% from the M1 block's CPU line
+through ordinary run-to-run wall-clock jitter (single-thread CPU decode is
+timed with `wall clock`, not CUDA events, so it is not jitter-free); this is
+now the one authoritative Silesia CPU-oracle figure, cited by the M1 block
+above as well.
 
 ```
 ## bench_lz4 report
 - decoder: CPU oracle, LZ4_decompress_safe (liblz4 1.10.0), single thread
 - host CPU: AMD Ryzen 9 5950X 16-Core Processor
 - CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 12.6, runtime 12.6
+- cudec: 1 (the CPU rows time the liblz4 oracle baseline; the GPU rows below, when --gpu is set, time cudec's decoder)
 - corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3239 chunks, 211.94 MB original, 102.44 MB compressed (ratio 0.483), compressed in-harness via LZ4_compress_default
 - chunk sizes: min 8066 / median 65536 / max 65536 bytes
 - method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is LZ4_decompress_safe only (no clears, no allocation); output byte-verified once before timing; percentiles are nearest-rank
-- wall per run: p50 60.082 ms / p90 60.406 ms / p99 60.816 ms
-- decode throughput: p50 3.528 GB/s / p90 3.509 GB/s / p99 3.485 GB/s
+- wall per run: p50 62.158 ms / p90 62.742 ms / p99 63.291 ms
+- decode throughput: p50 3.410 GB/s / p90 3.378 GB/s / p99 3.349 GB/s
 ```
 
 ```
