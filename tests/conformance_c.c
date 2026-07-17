@@ -72,6 +72,25 @@ int main(void) {
         REQUIRE(written == 0);
     }
 
+    /* The streaming entry and its enum resolve their C linkage here. Every
+     * call is an argument reject that returns before any CUDA call. */
+    {
+        const void* one_src[1] = {0};
+        size_t one_size[1] = {0};
+        void* one_dst[1] = {0};
+        size_t one_cap[1] = {0};
+        cudec_chunk_result sres[1];
+        REQUIRE(cudec_lz4_decompress_stream(0, one_size, one_dst, one_cap, 1,
+                                            CUDEC_MEM_DEVICE, 4, sres) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null array */
+        REQUIRE(cudec_lz4_decompress_stream(one_src, one_size, one_dst, one_cap,
+                                            0, CUDEC_MEM_DEVICE, 4, sres) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* zero chunks */
+        REQUIRE(cudec_lz4_decompress_stream(one_src, one_size, one_dst, one_cap,
+                                            1, (cudec_mem_space)7, 4, sres) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* unknown dst_space */
+    }
+
     printf("PASS: plain-C caller exercised every public symbol\n");
     return 0;
 }

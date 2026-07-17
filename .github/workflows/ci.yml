@@ -77,7 +77,8 @@ jobs:
           cmake --build build-cuda -j &&
           test -x build-cuda/tests/smoke &&
           test -x build-cuda/tests/gpu_fixture &&
-          test -x build-cuda/tests/frame_twin
+          test -x build-cuda/tests/frame_twin &&
+          test -x build-cuda/tests/stream_twin
 
       # The host-side subset; gpu-labeled tests run in this same container
       # on the maintainer's machine and their output is pasted into the PR.
@@ -100,7 +101,8 @@ jobs:
           ctest --test-dir build-cuda -L gpu -N | tee gpu-deferred.txt &&
           grep -E ': smoke$' gpu-deferred.txt &&
           grep -E ': gpu_fixture$' gpu-deferred.txt &&
-          grep -E ': frame_twin$' gpu-deferred.txt
+          grep -E ': frame_twin$' gpu-deferred.txt &&
+          grep -E ': stream_twin$' gpu-deferred.txt
 
   format:
     name: format
