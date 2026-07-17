@@ -1,5 +1,9 @@
 # Benchmarks
 
+The narrative write-up — how these numbers are read, reproduced, and
+positioned — is [BENCHMARK-METHODOLOGY.md](BENCHMARK-METHODOLOGY.md). This
+file is the raw baseline record it is built on.
+
 The baseline record. Every entry carries the full methodology block as
 emitted by the harness (`bench/bench_lz4`, `--gpu` for the device path) — a
 number without its methodology cannot be produced, by construction.
