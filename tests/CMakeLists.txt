@@ -59,6 +59,15 @@ set_target_properties(cudec_test_fixtures PROPERTIES CXX_STANDARD 17
 target_compile_options(
   cudec_test_fixtures
   PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-O2>)
+# Sanitizer gate (issue #42): the harness that builds and byte-verifies the
+# corpora is host code on the untrusted-input path, so it runs under the
+# sanitizer too. The lz4 oracle it links is deliberately left uninstrumented
+# (third-party, audited by hash - the reference must not red the gate).
+if(CUDEC_SANITIZE)
+  target_compile_options(
+    cudec_test_fixtures
+    PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:${CUDEC_SANITIZE_COMPILE_FLAGS}>)
+endif()
 
 # GPU tests carry the label (the GPU-less CI runner selects -LE gpu) and
 # run serially: one physical device, and deterministic device state is
@@ -66,6 +75,13 @@ target_compile_options(
 # banned pattern is recorded in docs/MASTERPLAN.md section 5.
 function(cudec_add_test name)
   cmake_parse_arguments(T "GPU" "" "SOURCES;LIBS" ${ARGN})
+  # The host-only sanitizer gate (issue #42) builds only the GPU-less,
+  # host-instrumentable subset: a GPU test is a .cu binary linked by nvcc,
+  # which cannot pull in the ASan-instrumented cudec without sanitizing the
+  # device link. Skip them so the sanitizer build stays pure host.
+  if(T_GPU AND CUDEC_SANITIZE)
+    return()
+  endif()
   add_executable(${name} ${T_SOURCES})
   target_link_libraries(${name} PRIVATE cudec ${T_LIBS})
   set_target_properties(
@@ -75,6 +91,14 @@ function(cudec_add_test name)
   target_compile_options(
     ${name} PRIVATE ${CUDEC_CUDA_STRICT_FLAGS}
                     $<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Werror>)
+  # Sanitizer flags on the host test's own TUs (C/C++ only) and its link, so
+  # the instrumented cudec/fixtures objects pull in the runtimes. GPU tests
+  # returned above, so this only ever reaches host executables.
+  if(CUDEC_SANITIZE)
+    target_compile_options(
+      ${name} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:${CUDEC_SANITIZE_COMPILE_FLAGS}>)
+    target_link_options(${name} PRIVATE ${CUDEC_SANITIZE_LINK_FLAGS})
+  endif()
   add_test(NAME ${name} COMMAND ${name})
   if(T_GPU)
     set_tests_properties(${name} PROPERTIES LABELS gpu RUN_SERIAL TRUE)
@@ -91,6 +115,15 @@ cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # ladder step 2).
 target_include_directories(parser_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The frame parse's reject branches and its host-only assembly path exercised
+# with NO GPU: every case rejects (or decodes an all-uncompressed frame) before
+# the first CUDA call, so it runs on the GPU-less runner and, under the
+# sanitizer gate (issue #42), gives src/frame.cpp's hostile-input pointer
+# arithmetic ASan/UBSan coverage that the GPU-labeled frame_twin cannot get in
+# CI. It computes header checksums with the library's own xxhash32.h.
+cudec_add_test(frame_host_negative SOURCES frame_host_negative.cpp)
+target_include_directories(frame_host_negative
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 cudec_add_test(launch_fail SOURCES launch_fail.cpp)
 # Belt and suspenders with the setenv inside launch_fail.cpp: zero visible
 # devices is the test condition, on the GPU machine too.
@@ -101,8 +134,12 @@ cudec_add_test(gpu_fixture SOURCES gpu_fixture.cu LIBS cudec_test_fixtures
                GPU)
 cudec_add_test(frame_twin SOURCES frame_twin.cu LIBS lz4_frame_oracle GPU)
 # frame_twin verifies the library's own xxhash32.h against liblz4's XXH32.
-target_include_directories(frame_twin
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# Guarded: the host-only sanitizer build (issue #42) skips the GPU targets, so
+# this follow-up only runs when the target actually exists.
+if(TARGET frame_twin)
+  target_include_directories(frame_twin
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+endif()
 cudec_add_test(stream_twin SOURCES stream_twin.cu LIBS cudec_test_fixtures GPU)
 
 # ---- Structural conformance, configure time: a violation reds every CI
