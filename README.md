@@ -20,7 +20,8 @@ properties a closed binary cannot offer:
 
 - **Auditability.** Decompressors are classic attack surface. Every bounds
   check in cudec is readable, tested, and fuzz-diffed against the reference
-  implementations (liblz4, zlib, libzstd).
+  implementation — liblz4 today, with zlib and libzstd joining as the DEFLATE
+  and Zstd formats land.
 - **Portability.** CUDA first; a HIP port is a planned milestone. A
   vendor-locked binary can never follow.
 - **Hackability.** Format quirks, tuning trade-offs, and kernel design are
@@ -35,19 +36,25 @@ one, and this README will never claim otherwise.
 
 ## Status
 
-**Design phase.** The architecture is being recorded in
-[docs/MASTERPLAN.md](docs/MASTERPLAN.md); progress is tracked in the issues
-and milestones:
+**M0 and M1 are complete; M2 is in progress.** cudec decodes real LZ4 on an
+NVIDIA GPU today — batch block decode, the `.lz4` frame format
+(block-independent subset), and a pinned-host streaming path — all fail-closed
+and fuzz-diffed against liblz4. The design record is
+[docs/MASTERPLAN.md](docs/MASTERPLAN.md); the measured LZ4 block and streaming
+baselines, each carrying its full methodology, are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). Snappy, GDeflate, Zstd, and the HIP
+port are planned, not yet implemented. Progress is tracked in the issues and
+milestones:
 
-| Milestone        | Deliverable                                         |
-| ---------------- | --------------------------------------------------- |
-| M0 — Foundation  | Toolchain, CMake+CUDA skeleton, CI, test harness    |
-| M1 — LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      |
-| M2 — LZ4 batch   | Frame format, batch API, streaming path, benchmarks |
-| M3 — Snappy      | Snappy decode on the same kernel family             |
-| M4 — GDeflate    | The first open GPU GDeflate decoder                 |
-| M5 — Zstd        | Zstd decode (FSE/Huffman sequences)                 |
-| M6 — Portability | HIP port                                            |
+| Milestone        | Deliverable                                         | Status      |
+| ---------------- | --------------------------------------------------- | ----------- |
+| M0 — Foundation  | Toolchain, CMake+CUDA skeleton, CI, test harness    | done        |
+| M1 — LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      | done        |
+| M2 — LZ4 batch   | Frame format, batch API, streaming path, benchmarks | in progress |
+| M3 — Snappy      | Snappy decode on the same kernel family             | planned     |
+| M4 — GDeflate    | The first open GPU GDeflate decoder                 | planned     |
+| M5 — Zstd        | Zstd decode (FSE/Huffman sequences)                 | planned     |
+| M6 — Portability | HIP port                                            | planned     |
 
 ## Principles
 
@@ -64,15 +71,17 @@ and milestones:
 
 ## Building
 
-Host-only stub (CMake ≥ 3.24 and a C compiler, no CUDA toolchain needed):
+Two builds. The host-only build needs just a C compiler and compiles the ABI
+and version surface — not the decoder — so CI has a real build gate without a
+CUDA toolchain (CMake ≥ 3.24):
 
 ```sh
 cmake -B build && cmake --build build
 ```
 
-With the CUDA engine (CUDA 12.x toolchain; the maintained path is the
-pinned dev container — GPU required only for the gpu-labeled tests, not the
-build: without a GPU, drop `--gpus all` and add `-LE gpu` to the ctest line
+The CUDA build is the decoder (CUDA 12.x toolchain; the maintained path is the
+pinned dev container — a GPU is required only for the gpu-labeled tests, not
+the build: without a GPU, drop `--gpus all` and add `-LE gpu` to the ctest line
 to build everything and run the host-side subset):
 
 ```sh

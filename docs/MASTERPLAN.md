@@ -72,10 +72,14 @@ a planned milestone — a vendor binary can never follow), and **hackability**.
   by device-side arrays (src pointers/sizes, dst pointers/capacities) on a
   caller-provided stream, reporting per-chunk status — modeled on the shape
   proven by nvCOMP's batch interface, implemented independently.
-- **Kernel dispatch by chunk size.** Warp-per-chunk for small chunks,
-  block-per-chunk (a warp team sharing staged input) for large ones; the
-  dispatcher picks per batch histogram. Shared-memory staging via
-  `cp.async`.
+- **Kernel dispatch by chunk size.** The shipped M1 decoder is a single
+  warp-per-chunk kernel with no dispatch heuristic, no shared memory, and no
+  `cp.async` staging: the design panel settled that shape on the arithmetic
+  (section 9), and the asynchronous batch ABI rules out host-side
+  histogramming (section 8). A block-per-chunk path (a warp team sharing
+  staged input via `cp.async`) and device-side chunk-size binning remain
+  deferred options for large-chunk or future-format workloads — not a
+  decision the current code took.
 - **Two memory paths.** Device-resident (caller already has the data on the
   GPU) and a pinned-host streaming path that overlaps H2D copies with decode
   — the asset-streaming shape.
@@ -170,9 +174,9 @@ a planned milestone — a vendor binary can never follow), and **hackability**.
 
 - Benchmark corpus set beyond Silesia/enwik (game-asset-like data) — M2.
 - Device-side chunk-size binning for mixed batches — M2 (see section 9:
-  the async ABI rules out host-side histogramming, so section 4's
-  "dispatcher picks per batch histogram" pillar resolves to device-side
-  binning or nothing; M1 ships without a dispatch heuristic).
+  the async ABI rules out host-side histogramming, so the block-per-chunk /
+  binning option in section 4 resolves to device-side binning or nothing;
+  M1 ships without a dispatch heuristic).
 
 Settled: test framework and oracle vendoring (section 5, via the #4 design
 review); dev-container image and CI toolchain pinning (issues #1/#3 —
