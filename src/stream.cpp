@@ -173,6 +173,32 @@ namespace {
 
 using namespace cudec_stream_detail;
 
+/* Pure argument validation: no CUDA call, no context needed. Both the context
+ * entry and the one-shot wrapper run this BEFORE touching the device, so a
+ * malformed call returns CUDEC_ERR_INVALID_ARGUMENT synchronously on any host
+ * (including the GPU-less CI runner, where the conformance test exercises it). */
+cudec_status ValidateStreamArgs(const void* const* h_src_ptrs,
+                                const size_t* h_src_sizes,
+                                void* const* dst_ptrs, const size_t* dst_caps,
+                                size_t chunk_count, cudec_mem_space dst_space,
+                                const cudec_chunk_result* h_results) {
+    if (h_src_ptrs == nullptr || h_src_sizes == nullptr ||
+        dst_ptrs == nullptr || dst_caps == nullptr || h_results == nullptr ||
+        chunk_count == 0 || chunk_count > kMaxChunks ||
+        (dst_space != CUDEC_MEM_HOST && dst_space != CUDEC_MEM_DEVICE)) {
+        return CUDEC_ERR_INVALID_ARGUMENT;
+    }
+    /* A NULL source with a non-zero size (a host read that would segfault) or a
+     * NULL destination for a chunk that claims capacity is a caller error. */
+    for (size_t i = 0; i < chunk_count; i++) {
+        if ((h_src_ptrs[i] == nullptr && h_src_sizes[i] != 0) ||
+            (dst_ptrs[i] == nullptr && dst_caps[i] != 0)) {
+            return CUDEC_ERR_INVALID_ARGUMENT;
+        }
+    }
+    return CUDEC_OK;
+}
+
 /* Decodes the whole batch on the context's single stream. Grows the staging to
  * this call's high-water mark first (reusing it when already large enough),
  * then stages and launches each wave in order. A CUDA-level fault (a failed
@@ -460,21 +486,16 @@ cudec_status cudec_lz4_decompress_stream_ctx(
     const size_t* h_src_sizes, void* const* dst_ptrs, const size_t* dst_caps,
     size_t chunk_count, cudec_mem_space dst_space,
     cudec_chunk_result* h_results) {
-    if (ctx == nullptr || h_src_ptrs == nullptr || h_src_sizes == nullptr ||
-        dst_ptrs == nullptr || dst_caps == nullptr || h_results == nullptr ||
-        chunk_count == 0 || chunk_count > cudec_stream_detail::kMaxChunks ||
-        (dst_space != CUDEC_MEM_HOST && dst_space != CUDEC_MEM_DEVICE)) {
+    if (ctx == nullptr) {
         return CUDEC_ERR_INVALID_ARGUMENT;
     }
-    /* A NULL source with a non-zero size (a host read that would segfault) or a
-     * NULL destination for a chunk that claims capacity is a caller error;
-     * reject the whole call before touching the device. Argument rejects never
-     * poison the context. */
-    for (size_t i = 0; i < chunk_count; i++) {
-        if ((h_src_ptrs[i] == nullptr && h_src_sizes[i] != 0) ||
-            (dst_ptrs[i] == nullptr && dst_caps[i] != 0)) {
-            return CUDEC_ERR_INVALID_ARGUMENT;
-        }
+    /* Argument rejects are synchronous, make no CUDA call, and never poison the
+     * context. */
+    const cudec_status args = ValidateStreamArgs(h_src_ptrs, h_src_sizes,
+                                                 dst_ptrs, dst_caps, chunk_count,
+                                                 dst_space, h_results);
+    if (args != CUDEC_OK) {
+        return args;
     }
     /* A context poisoned by an earlier CUDA fault decodes nothing further. */
     if (ctx->poisoned) {
@@ -514,7 +535,19 @@ cudec_status cudec_lz4_decompress_stream(const void* const* h_src_ptrs,
                                          cudec_chunk_result* h_results) {
     /* One-shot: create a context, decode once, destroy it. The reusable
      * context (create/decode/destroy) is the amortized path; this wrapper pays
-     * the full per-call setup and is here for the single-shot caller. */
+     * the full per-call setup and is here for the single-shot caller.
+     *
+     * Validate the arguments BEFORE creating the context, so a malformed call
+     * returns CUDEC_ERR_INVALID_ARGUMENT synchronously without any CUDA call -
+     * matching the documented contract and the GPU-less conformance test (where
+     * cudec_stream_ctx_create would otherwise fail for lack of a device and
+     * mask the argument error). */
+    const cudec_status args = ValidateStreamArgs(
+        h_src_ptrs, h_src_sizes, dst_ptrs, dst_caps, chunk_count, dst_space,
+        h_results);
+    if (args != CUDEC_OK) {
+        return args;
+    }
     cudec_stream_ctx* ctx = nullptr;
     const cudec_status created = cudec_stream_ctx_create(&ctx);
     if (created != CUDEC_OK) {
