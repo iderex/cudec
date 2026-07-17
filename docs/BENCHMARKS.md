@@ -78,6 +78,61 @@ phase-1, which shares the identical serial parse, so two-phase cannot reach
 two-phase help? — is answered NO by the arithmetic. The path to higher
 throughput is structural single-pass work, not a decomposition change.
 
+### Worst case: the worst-4Bmatch adversarial-but-valid corpus (issue #19)
+
+A security-posture number. The Silesia rows are an average; the worst case
+for this kernel's throughput is an adversarial-but-valid block of
+back-to-back minimum matches (match length 4, offset 1) — the maximum
+sequence density a valid LZ4 block can carry, one parsed sequence per 4
+decoded bytes, which drives the redundant 32-lane lockstep parse and the
+closed-form modular gather on every match byte. The standard compressor
+never emits it (it extends any offset-1 run into a single long match, the
+best case), so the harness constructs the block directly (`--worst4b`) and
+the oracle validates it (LZ4_decompress_safe accepts and it round-trips)
+before any timing. Recorded 2026-07-17, same container and RTX 3080 as the
+M1 rows above; 3200 identical 64 KB chunks (~210 MB), enough to saturate
+the device and sit at the Silesia scale for a direct comparison.
+`--worst4b --gpu`.
+
+```
+## bench_lz4 report
+- decoder: CPU oracle, LZ4_decompress_safe (liblz4 1.10.0), single thread
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 12.6, runtime 12.6
+- corpus: worst-4Bmatch, 3200 chunks, 209.72 MB original, 157.31 MB compressed (ratio 0.750), hand-constructed offset-1 minmatch worst case (oracle-validated; LZ4_compress_default never emits it)
+- chunk sizes: min 65536 / median 65536 / max 65536 bytes
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is LZ4_decompress_safe only (no clears, no allocation); output byte-verified once before timing; percentiles are nearest-rank
+- wall per run: p50 140.704 ms / p90 143.329 ms / p99 146.840 ms
+- decode throughput: p50 1.490 GB/s / p90 1.463 GB/s / p99 1.428 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs): p50 25.917 ms, 8.1 GB/s
+- GPU parse-only ceiling (copies elided): p50 13.710 ms, 15.3 GB/s - ceilings this design AND any two-phase phase-1 (shared parse)
+```
+
+**The degradation is linear and bounded — not an amplification vector.**
+
+- Every path degrades by the same ~2.2–2.3× against the Silesia average:
+  CPU 3.46 → 1.49 GB/s, GPU decode 18.1 → 8.1 GB/s, GPU parse-only ceiling
+  34.6 → 15.3 GB/s. The uniform factor is the sequence density (one
+  sequence per 4 bytes here versus Silesia's longer average matches): the
+  cost is linear in the number of sequences — exactly the redundant parse
+  the kernel design accepts, no super-linear blow-up. This is below the
+  issue's pessimistic ~4× estimate.
+- No size amplification. The block barely compresses (ratio 0.750, 157 MB →
+  210 MB, ~1.33× expansion) and each chunk decodes to exactly 65536 bytes,
+  capped by the caller's destination capacity — never more. The two
+  adversarial axes are mutually exclusive for LZ4: a decompression bomb
+  (one offset-1 match extended to a full 64 KB, ~3000× expansion) is a
+  single fast sequence, the opposite of this throughput worst case, and
+  cudec's fixed per-chunk output cap fail-closes the size axis regardless.
+- The GPU advantage holds under the worst input: 8.1 GB/s worst-case GPU is
+  still ~5.4× the CPU worst case (1.49 GB/s) and ~2.3× the CPU's Silesia
+  _average_ (3.46 GB/s). A second run confirmed the numbers within GPU
+  jitter (8.2 GB/s decode, 15.7 GB/s parse-only).
+
+Reproduce with `bench_lz4 --worst4b --gpu`; the construction is oracle-
+validated in-harness and locked against rot by the `bench_worst4b_selfcheck`
+ctest on the GPU-less runner.
+
 ## M2: pinned-host streaming decode, end-to-end (Silesia)
 
 The streaming decode path (`cudec_lz4_decompress_stream`, issue #24) times the

@@ -26,12 +26,26 @@ constexpr size_t kChunkBytes = 65536;
 
 constexpr size_t kMaxRuns = 1000000;
 
+/* The worst-case sweep replicates one adversarial block to this many chunks:
+ * enough 64 KB warps to saturate the RTX 3080 (68 SMs, >= 32 warps/SM) and
+ * the same ~200 MB scale as the Silesia GPU row, so the two throughput
+ * numbers are directly comparable. */
+constexpr size_t kWorst4bChunks = 3200;
+
+/* The CI rot check (--worst4b --selfcheck) exercises the identical
+ * construction on a handful of chunks so it stays fast on the GPU-less
+ * runner; the block itself is the same regardless of the replica count. */
+constexpr size_t kWorst4bSelfcheckChunks = 4;
+
 struct Corpus {
     std::string name;
     std::vector<std::vector<unsigned char>> originals;
     std::vector<std::vector<unsigned char>> compressed;
     size_t original_bytes = 0;
     size_t compressed_bytes = 0;
+    /* How the compressed streams were produced - printed verbatim in the
+     * methodology block, so it must stay true for whichever corpus ran. */
+    std::string provenance = "compressed in-harness via LZ4_compress_default";
 };
 
 bool AppendFileChunked(const std::string& path, Corpus* corpus) {
@@ -75,6 +89,96 @@ void CompressAll(Corpus* corpus) {
         corpus->original_bytes += original.size();
         corpus->compressed_bytes += corpus->compressed.back().size();
     }
+}
+
+/* Builds one adversarial-but-valid LZ4 block: back-to-back minimum matches
+ * (match length 4, offset 1). This is the maximum sequence density a valid
+ * block can carry - one parsed sequence per 4 decoded bytes - and it drives
+ * the kernel's per-byte closed-form modular gather on every match byte, so
+ * the redundant lockstep parse floors here. LZ4_compress_default never emits
+ * it (it extends any offset-1 run into a single long match, the best case),
+ * so the stream is constructed directly and proven valid by the oracle
+ * before timing.
+ *
+ * The block decodes to `out_bytes` copies of one seed byte. Wire layout:
+ *   token 0x10, 1 seed literal, offset 0x0001      (1 literal + 4 match)
+ *   token 0x00, offset 0x0001               x M    (4 match bytes each)
+ *   token (literal-length tail), >= 12 trailing literals
+ * The trailing literal run keeps the last match clear of the block end,
+ * satisfying LZ4's parsing restrictions (LASTLITERALS = 5, last match >= 12
+ * bytes before the end); the oracle is the sole authority and confirms the
+ * verdict in BuildWorst4bCorpus before any timing. Assumes out_bytes is a
+ * full chunk (kChunkBytes) - comfortably above the tail minimum. */
+void BuildWorst4bBlock(size_t out_bytes, std::vector<unsigned char>* original,
+                       std::vector<unsigned char>* compressed) {
+    constexpr unsigned char kSeed = 0xA5;
+    constexpr size_t kMinTail = 12; /* >= LZ4's last-match distance rule */
+
+    original->assign(out_bytes, kSeed);
+
+    std::vector<unsigned char>& c = *compressed;
+    c.clear();
+    /* Seed sequence: one real literal, then a length-4 offset-1 match that
+     * copies it forward (offset 1 = run-length; the match reads the byte
+     * just written). */
+    c.push_back(0x10);  /* literal length 1, match length 4 */
+    c.push_back(kSeed); /* the one literal byte */
+    c.push_back(0x01);  /* offset low byte (offset = 1) */
+    c.push_back(0x00);  /* offset high byte */
+    size_t produced = 5; /* 1 literal + 4 match bytes */
+
+    /* Minimum matches until only the tail (>= kMinTail literals) remains. */
+    while (produced + 4 <= out_bytes - kMinTail) {
+        c.push_back(0x00); /* literal length 0, match length 4 */
+        c.push_back(0x01);
+        c.push_back(0x00);
+        produced += 4;
+    }
+
+    /* Literals-only tail sequence (no offset/match follows the literals; the
+     * decoder detects end-of-block when the input is exhausted). */
+    const size_t tail = out_bytes - produced;
+    if (tail < 15) {
+        c.push_back(static_cast<unsigned char>(tail << 4));
+    } else {
+        c.push_back(0xF0); /* literal length >= 15: read extension bytes */
+        size_t rem = tail - 15;
+        while (rem >= 255) {
+            c.push_back(255);
+            rem -= 255;
+        }
+        c.push_back(static_cast<unsigned char>(rem));
+    }
+    c.insert(c.end(), tail, kSeed);
+}
+
+/* Replicates the worst-case block to `chunks` identical chunks. Rejects an
+ * invalid construction before any timing: the oracle (liblz4) is the sole
+ * authority on validity, and honest numbers require a stream that actually
+ * decodes (docs/MASTERPLAN.md, "the oracles decide"). */
+bool BuildWorst4bCorpus(Corpus* corpus, size_t chunks) {
+    std::vector<unsigned char> original;
+    std::vector<unsigned char> compressed;
+    BuildWorst4bBlock(kChunkBytes, &original, &compressed);
+
+    std::vector<unsigned char> decoded;
+    if (!OracleDecodes(compressed, original.size(), &decoded) ||
+        decoded.size() != original.size() ||
+        std::memcmp(decoded.data(), original.data(), decoded.size()) != 0) {
+        std::fprintf(stderr, "worst-4Bmatch construction rejected by the "
+                             "oracle - refusing to time an invalid stream\n");
+        return false;
+    }
+
+    corpus->name = "worst-4Bmatch";
+    corpus->originals.assign(chunks, original);
+    corpus->compressed.assign(chunks, compressed);
+    corpus->original_bytes = original.size() * chunks;
+    corpus->compressed_bytes = compressed.size() * chunks;
+    corpus->provenance = "hand-constructed offset-1 minmatch worst case "
+                         "(oracle-validated; LZ4_compress_default never emits "
+                         "it)";
+    return true;
 }
 
 /* One measured repetition: decode the whole batch, wall clock. The timed
@@ -179,13 +283,13 @@ void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
                 "decoder)\n",
                 cudec_version());
     std::printf("- corpus: %s, %zu chunks, %.2f MB original, %.2f MB "
-                "compressed (ratio %.3f), compressed in-harness via "
-                "LZ4_compress_default\n",
+                "compressed (ratio %.3f), %s\n",
                 corpus.name.c_str(), corpus.originals.size(),
                 static_cast<double>(corpus.original_bytes) / 1e6,
                 static_cast<double>(corpus.compressed_bytes) / 1e6,
                 static_cast<double>(corpus.compressed_bytes) /
-                    static_cast<double>(corpus.original_bytes));
+                    static_cast<double>(corpus.original_bytes),
+                corpus.provenance.c_str());
     std::printf("- chunk sizes: min %zu / median %zu / max %zu bytes\n",
                 sizes.front(), sizes[sizes.size() / 2], sizes.back());
     std::printf("- method: %zu warmup + %zu measured runs, wall clock per "
@@ -212,6 +316,7 @@ int main(int argc, char** argv) {
     bool selfcheck = false;
     bool gpu = false;
     bool gpu_stream = false;
+    bool worst4b = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -221,6 +326,8 @@ int main(int argc, char** argv) {
             gpu = true;
         } else if (arg == "--gpu-stream") {
             gpu_stream = true;
+        } else if (arg == "--worst4b") {
+            worst4b = true;
         } else if (arg == "--runs" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n",
@@ -239,7 +346,8 @@ int main(int argc, char** argv) {
         } else if (!arg.empty() && arg[0] == '-') {
             std::fprintf(stderr,
                          "usage: bench_lz4 [--runs N] [--warmup N] [--gpu] "
-                         "[--gpu-stream] [--selfcheck] [corpus files...]\n");
+                         "[--gpu-stream] [--worst4b] [--selfcheck] "
+                         "[corpus files...]\n");
             return 2;
         } else {
             files.push_back(arg);
@@ -251,7 +359,19 @@ int main(int argc, char** argv) {
     }
 
     Corpus corpus;
-    if (files.empty()) {
+    if (worst4b) {
+        /* The worst-case corpus is generated, not read: it carries its own
+         * hand-built compressed streams, so it must not also take files. */
+        if (!files.empty()) {
+            std::fprintf(stderr, "--worst4b builds its own corpus; do not "
+                                 "also pass corpus files\n");
+            return 2;
+        }
+        if (!BuildWorst4bCorpus(&corpus, selfcheck ? kWorst4bSelfcheckChunks
+                                                   : kWorst4bChunks)) {
+            return 1;
+        }
+    } else if (files.empty()) {
         corpus.name = "builtin";
         for (auto& fixture : MakeLz4BlockFixtures()) {
             corpus.originals.push_back(std::move(fixture.original));
@@ -286,7 +406,13 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    CompressAll(&corpus);
+    /* The worst-case corpus already carries its hand-built streams; the
+     * standard compressor would replace them with a single long match (the
+     * best case), defeating the point. Every other corpus is compressed by
+     * the oracle here. */
+    if (!worst4b) {
+        CompressAll(&corpus);
+    }
 
     /* Byte-verify every chunk once, outside the timed region. */
     std::vector<unsigned char> scratch;
