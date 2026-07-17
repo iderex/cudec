@@ -286,6 +286,18 @@ projects ≥ ~10× the CPU p50 baseline (≥ ~35 GB/s); reopen two-phase only
 if the shipped kernel measures below ~15× CPU after the first perf pass or
 profiling attributes the majority of stalls to copy starvation.
 
+**Measured outcome (issue #15, 2026-07-17): SETTLED for single-pass.** On
+Silesia the minimal-correct kernel decodes at ~18 GB/s (~5× CPU) and the
+parse-only ceiling is ~35 GB/s (~10× CPU) — so parse and copy each cost
+roughly half the wall time. Since parse-only ceilings any two-phase phase-1
+(shared serial parse), two-phase cannot exceed ~35 GB/s; its only lever is
+a faster copy, which single-pass optimizes equally without a table or
+barrier. The perf pass (#16) targets the copy first (the per-byte 64-bit
+modulo in the gather) to pull end-to-end toward the parse ceiling, then the
+parse (register-window staging) to raise it. Recorded in
+[docs/BENCHMARKS.md](BENCHMARKS.md); the falsification trigger is evaluated
+at #16.
+
 **Known limits, published:** the redundant-parse family ceiling is roughly
 250–400 GB/s after perf passes — deliberately accepted under "formats over
 percentage points"; batches under ~2,000 chunks underfill the machine and

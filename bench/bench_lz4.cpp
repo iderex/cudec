@@ -5,6 +5,7 @@
  * (docs/MASTERPLAN.md section 5, honest numbers). */
 #include "cudec.h"
 #include "fixtures.h"
+#include "gpu_bench.h"
 
 #include <cuda_runtime.h>
 #include <lz4.h>
@@ -173,7 +174,9 @@ void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
                 LZ4_versionString());
     std::printf("- host CPU: %s\n", HostCpuName().c_str());
     std::printf("- CUDA device: %s\n", CudaDeviceLine().c_str());
-    std::printf("- cudec: %d (stub era - the library decodes nothing yet)\n",
+    std::printf("- cudec: %d (the CPU rows time the liblz4 oracle baseline; "
+                "the GPU rows below, when --gpu is set, time cudec's "
+                "decoder)\n",
                 cudec_version());
     std::printf("- corpus: %s, %zu chunks, %.2f MB original, %.2f MB "
                 "compressed (ratio %.3f), compressed in-harness via "
@@ -207,11 +210,14 @@ int main(int argc, char** argv) {
     size_t runs = 30;
     size_t warmup = 3;
     bool selfcheck = false;
+    bool gpu = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--selfcheck") {
             selfcheck = true;
+        } else if (arg == "--gpu") {
+            gpu = true;
         } else if (arg == "--runs" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n",
@@ -229,7 +235,7 @@ int main(int argc, char** argv) {
             return 2;
         } else if (!arg.empty() && arg[0] == '-') {
             std::fprintf(stderr, "usage: bench_lz4 [--runs N] [--warmup N] "
-                                 "[--selfcheck] [corpus files...]\n");
+                                 "[--gpu] [--selfcheck] [corpus files...]\n");
             return 2;
         } else {
             files.push_back(arg);
@@ -304,6 +310,34 @@ int main(int argc, char** argv) {
     std::sort(times.begin(), times.end());
 
     PrintReport(corpus, times, warmup, runs);
+
+    if (gpu) {
+        std::vector<const unsigned char*> comp_ptrs(corpus.compressed.size());
+        std::vector<size_t> comp_sizes(corpus.compressed.size());
+        std::vector<size_t> orig_sizes(corpus.originals.size());
+        for (size_t i = 0; i < corpus.compressed.size(); i++) {
+            comp_ptrs[i] = corpus.compressed[i].data();
+            comp_sizes[i] = corpus.compressed[i].size();
+            orig_sizes[i] = corpus.originals[i].size();
+        }
+        cudec_gpu_result g;
+        if (!cudec_bench_gpu(comp_ptrs.data(), comp_sizes.data(),
+                             orig_sizes.data(), corpus.originals.size(),
+                             static_cast<int>(warmup), static_cast<int>(runs),
+                             &g)) {
+            std::fprintf(stderr, "GPU bench failed\n");
+            return 1;
+        }
+        std::printf("- GPU decode (device-resident, CUDA-event timed, "
+                    "%d warmup + %d runs): p50 %.3f ms, %.1f GB/s\n",
+                    static_cast<int>(warmup), static_cast<int>(runs),
+                    g.full_ms_p50, g.full_gbps_p50);
+        std::printf("- GPU parse-only ceiling (copies elided): p50 %.3f ms, "
+                    "%.1f GB/s - ceilings this design AND any two-phase "
+                    "phase-1 (shared parse)\n",
+                    g.parse_only_ms_p50, g.parse_only_gbps_p50);
+    }
+
     if (selfcheck) {
         std::printf("PASS: selfcheck complete\n");
     }
