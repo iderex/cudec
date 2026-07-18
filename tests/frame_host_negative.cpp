@@ -52,21 +52,30 @@ unsigned char Hc(const Bytes& f, size_t desc_len) {
         (cudec_detail::xxhash32(f.data() + 4, desc_len) >> 8) & 0xFF);
 }
 
-/* Builds a frame of UNCOMPRESSED blocks with a correct header checksum and no
- * content-size field. BD is fixed at 0x40 (bmax 4 -> 64 KiB block max) unless a
- * caller overrides it. FLG bit 4 (block checksum) and bit 2 (content checksum)
- * are honored so those branches are reachable; every block is stored
- * uncompressed, so a well-formed frame decodes entirely on the host. */
+/* Builds a frame of UNCOMPRESSED blocks with a correct header checksum. BD is
+ * fixed at 0x40 (bmax 4 -> 64 KiB block max) unless a caller overrides it. FLG
+ * bit 4 (block checksum) and bit 2 (content checksum) are honored so those
+ * branches are reachable; every block is stored uncompressed, so a well-formed
+ * frame decodes entirely on the host. `content_size` is the optional declared
+ * content-size field (FLG bit 3): nullptr omits it (the descriptor is the
+ * 2-byte FLG,BD); non-null inserts the 8-byte little-endian size after BD and
+ * extends the header-checksum descriptor to 10 bytes. */
 Bytes BuildFrame(unsigned char flg, unsigned char bd,
-                 const std::vector<Bytes>& blocks) {
+                 const std::vector<Bytes>& blocks,
+                 const uint64_t* content_size = nullptr) {
     const bool block_ck = (flg >> 4) & 1;
     const bool content_ck = (flg >> 2) & 1;
     Bytes f;
     PutMagic(&f);
     f.push_back(flg);
     f.push_back(bd);
-    f.push_back(Hc(f, 2)); /* descriptor is FLG,BD when there is no content size */
-    Bytes out;             /* the assembled content, for the content checksum */
+    size_t desc_len = 2; /* FLG,BD when there is no content size */
+    if (content_size != nullptr) {
+        Put64(&f, *content_size);
+        desc_len = 10; /* FLG,BD,8-byte content size */
+    }
+    f.push_back(Hc(f, desc_len));
+    Bytes out; /* the assembled content, for the content checksum */
     for (const auto& b : blocks) {
         Put32(&f, 0x80000000u | static_cast<uint32_t>(b.size())); /* uncompressed */
         f.insert(f.end(), b.begin(), b.end());
@@ -82,36 +91,13 @@ Bytes BuildFrame(unsigned char flg, unsigned char bd,
     return f;
 }
 
-/* Like BuildFrame but with the optional declared content-size field (FLG bit 3)
- * present: the 8-byte little-endian `declared` size follows BD, and the header
- * checksum is recomputed over the now-10-byte descriptor. Lets the
- * content-size match/mismatch branch in src/frame.cpp be driven in both
- * directions. The caller passes an FLG with bit 3 set (0x68). */
+/* Thin wrapper: BuildFrame with the optional declared content-size field
+ * present. Lets the content-size match/mismatch branch in src/frame.cpp be
+ * driven in both directions. The caller passes an FLG with bit 3 set (0x68). */
 Bytes BuildFrameContentSize(unsigned char flg, unsigned char bd,
                             const std::vector<Bytes>& blocks,
                             uint64_t declared) {
-    const bool block_ck = (flg >> 4) & 1;
-    const bool content_ck = (flg >> 2) & 1;
-    Bytes f;
-    PutMagic(&f);
-    f.push_back(flg);
-    f.push_back(bd);
-    Put64(&f, declared);
-    f.push_back(Hc(f, 10)); /* descriptor is FLG,BD,8-byte content size */
-    Bytes out;
-    for (const auto& b : blocks) {
-        Put32(&f, 0x80000000u | static_cast<uint32_t>(b.size())); /* uncompressed */
-        f.insert(f.end(), b.begin(), b.end());
-        if (block_ck) {
-            Put32(&f, cudec_detail::xxhash32(b.data(), b.size()));
-        }
-        out.insert(out.end(), b.begin(), b.end());
-    }
-    Put32(&f, 0); /* end mark */
-    if (content_ck) {
-        Put32(&f, cudec_detail::xxhash32(out.data(), out.size()));
-    }
-    return f;
+    return BuildFrame(flg, bd, blocks, &declared);
 }
 
 /* Copies the crafted frame into an EXACTLY-sized heap allocation and decodes
