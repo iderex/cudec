@@ -224,9 +224,14 @@ chases itself; it is a modular gather from bytes already final:
 the `__syncwarp()` preceding every copy has frozen. Each output byte is
 written exactly once, by a statically determined lane, as a pure function
 of lower addresses — deterministic because no ordering exists to get
-wrong. The inner loop tracks the modulus incrementally
-(`r += step; if (r >= off) r -= off`) so no lane pays a division per
-iteration.
+wrong. The shipped inner loop computes that `i mod off` directly — one
+64-bit modulo per output byte, so every lane pays a division per
+iteration (`dst[seq.match_dst + i] = dst[seq.match_src + (i % offset)]`
+in `src/lz4_decode.cuh`). Cutting that cost is deferred, measurement-gated
+perf work, not a present property: eliding the modulo when the match
+cannot wrap (`off >= len`, #36) and narrowing it to 32-bit (#58), neither
+merged. The fully incremental `r += step; if (r >= off) r -= off` scheme
+was itself tried and rejected by measurement — see perf pass 1 below.
 
 **The validation ladder** (fail-closed; every stream-decoded value checked
 before first use as address, length, or offset): token existence before
