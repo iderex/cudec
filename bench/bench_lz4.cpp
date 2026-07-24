@@ -37,6 +37,30 @@ constexpr size_t kWorst4bChunks = 3200;
  * runner; the block itself is the same regardless of the replica count. */
 constexpr size_t kWorst4bSelfcheckChunks = 4;
 
+/* The long-non-overlap-match corpus (issue #36). Same 64 KB chunk and
+ * ~200 MB scale as the Silesia/worst-4Bmatch GPU rows so the three
+ * throughput numbers are directly comparable. Its purpose is to expose the
+ * ONE regime neither recorded corpus measures: long matches whose source
+ * range does not overlap the destination (offset >= match_len), where the
+ * match copy has enough bytes to become issue/ALU-bound and the per-byte
+ * 64-bit modulo in the closed-form gather - unnecessary when offset >=
+ * match_len - would dominate if it were on the critical path. */
+constexpr size_t kLongmatchChunks = 3200;
+constexpr size_t kLongmatchSelfcheckChunks = 4;
+
+/* The block's shape: an initial literal seed the length of the match offset
+ * (so the first match's source is in-bounds), then back-to-back 255-byte
+ * matches at that fixed offset, then a literal tail. The offset is
+ * held >= the match length so EVERY match is non-overlapping - the exact,
+ * and only, case the fast path targets; the static_assert locks that. */
+constexpr size_t kLongmatchOffset = 512;
+constexpr size_t kLongmatchMatchLen = 255;
+static_assert(kLongmatchOffset >= kLongmatchMatchLen,
+              "longmatch must stay non-overlapping (offset >= match_len): "
+              "that disjoint-range regime is exactly what issue #36's fast "
+              "path targets, and an overlapping block would measure the "
+              "wrong thing");
+
 struct Corpus {
     std::string name;
     std::vector<std::vector<unsigned char>> originals;
@@ -212,6 +236,154 @@ bool BuildWorst4bCorpus(Corpus* corpus, size_t chunks) {
     return true;
 }
 
+/* Appends an LZ4 length-field extension for a field whose 4-bit token nibble
+ * is saturated at 15: the reference format encodes (value - 15) as a run of
+ * 255 bytes followed by the remainder. `value` is the full field (>= 15;
+ * literal length, or match length minus MINMATCH). */
+void EmitLengthExtension(std::vector<unsigned char>* c, size_t value) {
+    size_t rem = value - 15;
+    while (rem >= 255) {
+        c->push_back(255);
+        rem -= 255;
+    }
+    c->push_back(static_cast<unsigned char>(rem));
+}
+
+unsigned char LengthNibble(size_t value) {
+    return static_cast<unsigned char>(value < 15 ? value : 15);
+}
+
+/* Builds one valid LZ4 block of long, NON-overlapping matches (issue #36):
+ * a `kLongmatchOffset`-byte literal seed, then back-to-back matches of
+ * `kLongmatchMatchLen` bytes at that fixed offset, then a literal tail. The
+ * output is periodic with period `kLongmatchOffset` (each match copies the
+ * window one offset back), so the whole block is `seed[i % offset]` and the
+ * hand-built wire reproduces it exactly - proven by the oracle before timing.
+ *
+ * Every match satisfies offset >= match_len (512 >= 255), so its source and
+ * destination ranges are disjoint: this is precisely the case where the
+ * closed-form gather's per-byte 64-bit modulo is provably unnecessary
+ * (i % offset == i for i < match_len <= offset). The standard compressor
+ * never emits this shape (it would extend the fixed-offset run into a single
+ * long match), so the stream is constructed directly. */
+bool BuildLongmatchBlock(size_t out_bytes,
+                         std::vector<unsigned char>* original,
+                         std::vector<unsigned char>* compressed) {
+    constexpr size_t kMinTail = 12; /* >= LZ4's last-match distance rule */
+    /* Enough output for the seed, at least one match, and the tail; below
+     * this the size_t match-count arithmetic below would wrap. */
+    constexpr size_t kMinBytes = kLongmatchOffset + kLongmatchMatchLen +
+                                 kMinTail + 16;
+    if (out_bytes < kMinBytes) {
+        std::fprintf(stderr, "longmatch block needs at least %zu output "
+                             "bytes, got %zu\n",
+                     kMinBytes, out_bytes);
+        return false;
+    }
+
+    /* The seed pattern. Any deterministic non-degenerate fill works: the
+     * matches reproduce it and the oracle is the sole validity authority. */
+    original->resize(out_bytes);
+    for (size_t i = 0; i < out_bytes; i++) {
+        (*original)[i] =
+            static_cast<unsigned char>((i % kLongmatchOffset) * 191 + 13);
+    }
+
+    /* As many full matches as fit while leaving >= kMinTail literal bytes. */
+    const size_t matches =
+        (out_bytes - kLongmatchOffset - kMinTail) / kLongmatchMatchLen;
+    const size_t body = kLongmatchOffset + matches * kLongmatchMatchLen;
+    const size_t tail = out_bytes - body;
+
+    const size_t match_field = kLongmatchMatchLen - 4; /* minus MINMATCH */
+    std::vector<unsigned char>& c = *compressed;
+    c.clear();
+
+    /* Seed sequence: `kLongmatchOffset` literals, then the first match. */
+    c.push_back(static_cast<unsigned char>(
+        (LengthNibble(kLongmatchOffset) << 4) | LengthNibble(match_field)));
+    if (kLongmatchOffset >= 15) {
+        EmitLengthExtension(&c, kLongmatchOffset);
+    }
+    c.insert(c.end(), original->begin(),
+             original->begin() + static_cast<long>(kLongmatchOffset));
+    c.push_back(static_cast<unsigned char>(kLongmatchOffset & 0xFF));
+    c.push_back(static_cast<unsigned char>((kLongmatchOffset >> 8) & 0xFF));
+    if (match_field >= 15) {
+        EmitLengthExtension(&c, match_field);
+    }
+
+    /* Remaining matches: zero literals, same fixed offset and length. */
+    for (size_t m = 1; m < matches; m++) {
+        c.push_back(static_cast<unsigned char>(LengthNibble(match_field)));
+        c.push_back(static_cast<unsigned char>(kLongmatchOffset & 0xFF));
+        c.push_back(static_cast<unsigned char>((kLongmatchOffset >> 8) & 0xFF));
+        if (match_field >= 15) {
+            EmitLengthExtension(&c, match_field);
+        }
+    }
+
+    /* Literals-only tail (no offset/match follows; end-of-block is detected
+     * at exact input consumption), keeping the last match clear of the block
+     * end per LZ4's parsing restrictions. */
+    c.push_back(static_cast<unsigned char>(LengthNibble(tail) << 4));
+    if (tail >= 15) {
+        EmitLengthExtension(&c, tail);
+    }
+    c.insert(c.end(), original->begin() + static_cast<long>(body),
+             original->end());
+    return true;
+}
+
+/* Replicates the long-non-overlap-match block to `chunks` identical chunks.
+ * Like BuildWorst4bCorpus, the oracle (liblz4) is the sole validity authority
+ * and must accept and round-trip the hand-built stream before any timing, and
+ * a shape lock guards against generator rot leaving a valid-but-wrong block. */
+bool BuildLongmatchCorpus(Corpus* corpus, size_t chunks) {
+    std::vector<unsigned char> original;
+    std::vector<unsigned char> compressed;
+    if (!BuildLongmatchBlock(kChunkBytes, &original, &compressed)) {
+        return false;
+    }
+
+    std::vector<unsigned char> decoded;
+    if (!OracleDecodes(compressed, original.size(), &decoded) ||
+        decoded.size() != original.size() ||
+        std::memcmp(decoded.data(), original.data(), decoded.size()) != 0) {
+        std::fprintf(stderr, "longmatch construction rejected by the oracle "
+                             "- refusing to time an invalid stream\n");
+        return false;
+    }
+
+    /* Lock the SHAPE, not just validity. The intended block is many long
+     * matches over a small literal seed + tail, which compresses hard (ratio
+     * ~0.027). A generator that regressed to short matches or mostly literals
+     * would climb toward ~1.0; one that collapsed into a single giant match
+     * (a decompression-bomb shape, the opposite of this many-long-matches
+     * throughput probe) would fall toward ~1e-4. Requiring the ratio to sit
+     * in a band reds the selfcheck on either drift. original.size() is
+     * non-zero (kChunkBytes). */
+    const double ratio = static_cast<double>(compressed.size()) /
+                         static_cast<double>(original.size());
+    if (ratio < 0.005 || ratio > 0.10) {
+        std::fprintf(stderr, "longmatch block is not the intended shape: "
+                             "compressed/original %.5f outside the "
+                             "[0.005, 0.10] long-non-overlap-match band\n",
+                     ratio);
+        return false;
+    }
+
+    corpus->name = "longmatch";
+    corpus->originals.assign(chunks, original);
+    corpus->compressed.assign(chunks, compressed);
+    corpus->original_bytes = original.size() * chunks;
+    corpus->compressed_bytes = compressed.size() * chunks;
+    corpus->provenance = "hand-constructed long non-overlapping matches "
+                         "(offset 512 >= match length 255; oracle-validated; "
+                         "LZ4_compress_default never emits it)";
+    return true;
+}
+
 /* One measured repetition: decode the whole batch, wall clock. The timed
  * region contains ONLY LZ4_decompress_safe calls into a pre-sized scratch
  * buffer - no buffer clears, no allocation - so the label on the number
@@ -348,6 +520,7 @@ int main(int argc, char** argv) {
     bool gpu = false;
     bool gpu_stream_ctx = false;
     bool worst4b = false;
+    bool longmatch = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -359,6 +532,8 @@ int main(int argc, char** argv) {
             gpu_stream_ctx = true;
         } else if (arg == "--worst4b") {
             worst4b = true;
+        } else if (arg == "--longmatch") {
+            longmatch = true;
         } else if (arg == "--runs" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n",
@@ -377,8 +552,8 @@ int main(int argc, char** argv) {
         } else if (!arg.empty() && arg[0] == '-') {
             std::fprintf(stderr,
                          "usage: bench_lz4 [--runs N] [--warmup N] [--gpu] "
-                         "[--gpu-stream-ctx] [--worst4b] [--selfcheck] "
-                         "[corpus files...]\n");
+                         "[--gpu-stream-ctx] [--worst4b] [--longmatch] "
+                         "[--selfcheck] [corpus files...]\n");
             return 2;
         } else {
             files.push_back(arg);
@@ -387,6 +562,12 @@ int main(int argc, char** argv) {
     if (selfcheck) {
         warmup = 1;
         runs = 3;
+    }
+
+    if (worst4b && longmatch) {
+        std::fprintf(stderr, "--worst4b and --longmatch each build their own "
+                             "corpus; pass at most one\n");
+        return 2;
     }
 
     Corpus corpus;
@@ -400,6 +581,17 @@ int main(int argc, char** argv) {
         }
         if (!BuildWorst4bCorpus(&corpus, selfcheck ? kWorst4bSelfcheckChunks
                                                    : kWorst4bChunks)) {
+            return 1;
+        }
+    } else if (longmatch) {
+        /* Generated and hand-built like --worst4b, for the same reason. */
+        if (!files.empty()) {
+            std::fprintf(stderr, "--longmatch builds its own corpus; do not "
+                                 "also pass corpus files\n");
+            return 2;
+        }
+        if (!BuildLongmatchCorpus(&corpus, selfcheck ? kLongmatchSelfcheckChunks
+                                                     : kLongmatchChunks)) {
             return 1;
         }
     } else if (files.empty()) {
@@ -437,11 +629,11 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    /* The worst-case corpus already carries its hand-built streams; the
-     * standard compressor would replace them with a single long match (the
-     * best case), defeating the point. Every other corpus is compressed by
-     * the oracle here. */
-    if (!worst4b) {
+    /* The worst-case and longmatch corpora already carry their hand-built
+     * streams; the standard compressor would replace them (a single long
+     * match, or a fixed-offset run collapsed into one match), defeating the
+     * point. Every other corpus is compressed by the oracle here. */
+    if (!worst4b && !longmatch) {
         CompressAll(&corpus);
     }
 

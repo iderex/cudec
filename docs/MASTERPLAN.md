@@ -328,6 +328,21 @@ the redundant-lockstep-parse invariant (its own design panel), which under
 "formats over percentage points" ranks below the next format. Recorded in
 [docs/BENCHMARKS.md](BENCHMARKS.md).
 
+**Perf pass 3 outcome (issue #36): the non-overlap match fast path is
+rejected by the worst case.** Splitting the match copy on the warp-uniform
+`offset >= match_len` predicate (straight copy instead of the modular gather
+when the match cannot wrap — bit-identical by construction, all oracle/
+determinism gates green) measured +9–10% on Silesia and +38–42% on the new
+copy-dominated `--longmatch` corpus (throughput speedup), but a consistent
+−5–9% on `--worst4b`:
+the per-match predicate lands in the hottest path of exactly the
+maximum-sequence-density adversarial input. Rejected under the
+pre-registered zero-regression rule — the worst-case number is the
+DoS-resistance margin, and average-case gains do not buy it back. No kernel
+code shipped; the `--longmatch` corpus and its selfcheck ctest shipped so
+the regime stays measurable. Recorded in
+[docs/BENCHMARKS.md](BENCHMARKS.md).
+
 **Known limits, published:** the redundant-parse family ceiling is roughly
 250–400 GB/s after perf passes — deliberately accepted under "formats over
 percentage points"; batches under ~2,000 chunks underfill the machine and

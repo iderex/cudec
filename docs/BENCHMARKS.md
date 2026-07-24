@@ -137,6 +137,82 @@ two levers issue #21 named, the register-reduction lever is measured and
 rejected here; the warp-specialization lever is scoped as a larger design
 change deferred behind the format ladder.
 
+### Perf pass 3 (issue #36): the non-overlap match fast path is rejected by the worst case
+
+The last untried match-copy lever: when `offset >= match_len` the closed-form
+modular gather `dst[m+i] = dst[m-off + (i mod off)]` degenerates to a straight
+copy (`i mod off == i` for every `i < match_len <= off`, and the ranges are
+disjoint, so the copy is bit-identical, hazard-free, and the branch is
+warp-uniform). The fast path elides the per-byte 64-bit modulo on every
+non-overlapping match — the common case in real data.
+
+Measured 2026-07-18, same pinned container and RTX 3080, baseline and patched
+binaries built from the same tree and A/B-interleaved in one session (two full
+passes, 3 warmup + 30 CUDA-event-timed runs each; all twelve ctest gates —
+oracle parity, determinism — green on the patched kernel first):
+
+The Delta column is throughput speedup (`baseline_ms / fast_path_ms − 1`,
+per-pass), one basis for all three rows so they compare on one scale:
+
+| Corpus                    | Baseline p50 (2 passes) | Fast path p50 (2 passes) | Delta (throughput speedup) |
+| ------------------------- | ----------------------- | ------------------------ | -------------------------- |
+| Silesia `--gpu`           | 11.979 / 12.859 ms      | 10.872 / 11.822 ms       | **+10.2% / +8.8%**         |
+| `--worst4b --gpu`         | 25.502 / 26.256 ms      | 27.938 / 27.654 ms       | **−8.7% / −5.1%**          |
+| `--longmatch --gpu` (new) | 1.277 / 1.278 ms        | 0.922 / 0.898 ms         | **+38.5% / +42.3%**        |
+
+The gain is real — but so is the regression, and it lands exactly where this
+project refuses to pay: the adversarial worst case. `--worst4b` is offset-1
+minmatch, always overlapping, so the fast-path arm is never taken; the cost is
+the added per-match predicate and the second copy loop's code in the hottest
+per-sequence path of the maximum-sequence-density input (one match per 4
+bytes). The plan's prediction that this would be "one free warp-uniform
+compare" is refuted by measurement — five independent patched `--worst4b`
+sessions all landed at 26.8–27.9 ms against a 25.1–26.3 ms baseline (a 5–9%
+throughput regression against the 25.1–26.3 ms baseline pair).
+
+**Rejected under the pre-registered accept rule** (issue #36: improvement on
+at least one corpus with zero regression on the others) and under the
+security posture behind it: the worst-case number is the DoS-resistance
+margin (issue #19), and trading it for average-case throughput inverts the
+project's hostile-input-first ordering. No kernel code shipped; the
+`--longmatch` harness corpus and its `bench_longmatch_selfcheck` ctest stay,
+so the regime is one flag away for any future attempt (a formulation that
+recovers the Silesia +9–10% without touching the worst case would be accepted —
+none is known under the single-loop structure, since the predicate is
+inherently per-match).
+
+### Best case: the longmatch corpus (issue #36)
+
+The shipped kernel's baseline on the new `--longmatch` corpus — long
+non-overlapping matches (match length 255 at offset 512), the copy-dominated
+regime that maximally exposes the per-byte modular gather. Hand-constructed
+like `--worst4b` (the standard compressor emits long matches but this shape
+pins `offset >= match_len` on every match), oracle-validated in-harness,
+shape-locked by the `bench_longmatch_selfcheck` ctest. Recorded 2026-07-18,
+same container and RTX 3080. `--longmatch --gpu`.
+
+```
+## bench_lz4 report
+- decoder: CPU oracle, LZ4_decompress_safe (liblz4 1.10.0), single thread
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 12.6, runtime 12.6
+- cudec: 1 (the CPU rows time the liblz4 oracle baseline; the GPU rows below, when --gpu is set, time cudec's decoder)
+- corpus: longmatch, 3200 chunks, 209.72 MB original, 5.72 MB compressed (ratio 0.027), hand-constructed long non-overlapping matches (offset 512 >= match length 255; oracle-validated; LZ4_compress_default never emits it)
+- chunk sizes: min 65536 / median 65536 / max 65536 bytes
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is LZ4_decompress_safe only (no clears, no allocation); output byte-verified once before timing; percentiles are nearest-rank
+- wall per run: p50 5.783 ms / p90 5.847 ms / p99 5.932 ms
+- decode throughput: p50 36.265 GB/s / p90 35.868 GB/s / p99 35.351 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs): p50 1.271 ms, 165.0 GB/s
+- GPU parse-only ceiling (copies elided): p50 0.265 ms, 790.7 GB/s - ceilings this design AND any two-phase phase-1 (shared parse)
+```
+
+At 165 GB/s the copy-dominated best case runs ~9x the Silesia average and
+within ~4.6x of the ~760 GB/s output-bandwidth ceiling — the modular gather,
+not bandwidth, is the limiter in this regime (the rejected fast path reached
+~228–234 GB/s here, from its 0.922 / 0.898 ms A/B passes above over the
+209.72 MB corpus), consistent with the ~250–400 GB/s redundant-parse family
+ceiling published in the masterplan.
+
 ### Worst case: the worst-4Bmatch adversarial-but-valid corpus (issue #19)
 
 A security-posture number. The Silesia rows are an average; the worst case

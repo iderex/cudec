@@ -35,3 +35,11 @@ add_test(NAME bench_selfcheck COMMAND bench_lz4 --selfcheck)
 # oracle no longer accepts, or that stops round-tripping - reds CI, not just
 # a manual bench.
 add_test(NAME bench_worst4b_selfcheck COMMAND bench_lz4 --worst4b --selfcheck)
+
+# The long-non-overlap-match corpus (issue #36) is likewise hand-built and
+# oracle-validated before timing, with a compression-ratio shape lock. This
+# runs that construction through the self-checked path (a few chunks,
+# CPU-only) so a generator that stops round-tripping, or drifts off the
+# intended many-long-matches shape, reds CI rather than a manual bench.
+add_test(NAME bench_longmatch_selfcheck COMMAND bench_lz4 --longmatch
+                                                --selfcheck)
