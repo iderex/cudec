@@ -49,8 +49,8 @@ constexpr size_t kLongmatchChunks = 3200;
 constexpr size_t kLongmatchSelfcheckChunks = 4;
 
 /* The block's shape: an initial literal seed the length of the match offset
- * (so the first match's source is in-bounds), then back-to-back maximum-
- * length matches at that fixed offset, then a literal tail. The offset is
+ * (so the first match's source is in-bounds), then back-to-back 255-byte
+ * matches at that fixed offset, then a literal tail. The offset is
  * held >= the match length so EVERY match is non-overlapping - the exact,
  * and only, case the fast path targets; the static_assert locks that. */
 constexpr size_t kLongmatchOffset = 512;

@@ -151,11 +151,14 @@ binaries built from the same tree and A/B-interleaved in one session (two full
 passes, 3 warmup + 30 CUDA-event-timed runs each; all twelve ctest gates —
 oracle parity, determinism — green on the patched kernel first):
 
-| Corpus                    | Baseline p50 (2 passes) | Fast path p50 (2 passes) | Delta       |
-| ------------------------- | ----------------------- | ------------------------ | ----------- |
-| Silesia `--gpu`           | 11.979 / 12.859 ms      | 10.872 / 11.822 ms       | **+8–9%**   |
-| `--worst4b --gpu`         | 25.502 / 26.256 ms      | 27.938 / 27.654 ms       | **−6–9%**   |
-| `--longmatch --gpu` (new) | 1.277 / 1.278 ms        | 0.922 / 0.898 ms         | **+39–42%** |
+The Delta column is throughput speedup (`baseline_ms / fast_path_ms − 1`,
+per-pass), one basis for all three rows so they compare on one scale:
+
+| Corpus                    | Baseline p50 (2 passes) | Fast path p50 (2 passes) | Delta (throughput speedup) |
+| ------------------------- | ----------------------- | ------------------------ | -------------------------- |
+| Silesia `--gpu`           | 11.979 / 12.859 ms      | 10.872 / 11.822 ms       | **+10.2% / +8.8%**         |
+| `--worst4b --gpu`         | 25.502 / 26.256 ms      | 27.938 / 27.654 ms       | **−8.7% / −5.1%**          |
+| `--longmatch --gpu` (new) | 1.277 / 1.278 ms        | 0.922 / 0.898 ms         | **+38.5% / +42.3%**        |
 
 The gain is real — but so is the regression, and it lands exactly where this
 project refuses to pay: the adversarial worst case. `--worst4b` is offset-1
@@ -164,7 +167,8 @@ the added per-match predicate and the second copy loop's code in the hottest
 per-sequence path of the maximum-sequence-density input (one match per 4
 bytes). The plan's prediction that this would be "one free warp-uniform
 compare" is refuted by measurement — five independent patched `--worst4b`
-sessions all landed at 26.8–27.9 ms against a 25.1–26.3 ms baseline.
+sessions all landed at 26.8–27.9 ms against a 25.1–26.3 ms baseline (a 5–9%
+throughput regression against the 25.1–26.3 ms baseline pair).
 
 **Rejected under the pre-registered accept rule** (issue #36: improvement on
 at least one corpus with zero regression on the others) and under the
@@ -173,7 +177,7 @@ margin (issue #19), and trading it for average-case throughput inverts the
 project's hostile-input-first ordering. No kernel code shipped; the
 `--longmatch` harness corpus and its `bench_longmatch_selfcheck` ctest stay,
 so the regime is one flag away for any future attempt (a formulation that
-recovers the Silesia +8% without touching the worst case would be accepted —
+recovers the Silesia +9–10% without touching the worst case would be accepted —
 none is known under the single-loop structure, since the predicate is
 inherently per-match).
 
@@ -205,7 +209,8 @@ same container and RTX 3080. `--longmatch --gpu`.
 At 165 GB/s the copy-dominated best case runs ~9x the Silesia average and
 within ~4.6x of the ~760 GB/s output-bandwidth ceiling — the modular gather,
 not bandwidth, is the limiter in this regime (the rejected fast path reached
-~257 GB/s here), consistent with the ~250–400 GB/s redundant-parse family
+~228–234 GB/s here, from its 0.922 / 0.898 ms A/B passes above over the
+209.72 MB corpus), consistent with the ~250–400 GB/s redundant-parse family
 ceiling published in the masterplan.
 
 ### Worst case: the worst-4Bmatch adversarial-but-valid corpus (issue #19)

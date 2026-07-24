@@ -327,8 +327,9 @@ the redundant-lockstep-parse invariant (its own design panel), which under
 rejected by the worst case.** Splitting the match copy on the warp-uniform
 `offset >= match_len` predicate (straight copy instead of the modular gather
 when the match cannot wrap — bit-identical by construction, all oracle/
-determinism gates green) measured +8–9% on Silesia and +39–42% on the new
-copy-dominated `--longmatch` corpus, but a consistent −6–9% on `--worst4b`:
+determinism gates green) measured +9–10% on Silesia and +38–42% on the new
+copy-dominated `--longmatch` corpus (throughput speedup), but a consistent
+−5–9% on `--worst4b`:
 the per-match predicate lands in the hottest path of exactly the
 maximum-sequence-density adversarial input. Rejected under the
 pre-registered zero-regression rule — the worst-case number is the
