@@ -36,6 +36,14 @@ __global__ void __launch_bounds__(kBlockThreads)
         (blockIdx.x * blockDim.x + threadIdx.x) / kWarpSize;
     const size_t total_warps =
         (static_cast<size_t>(gridDim.x) * blockDim.x) / kWarpSize;
+    /* A launch geometry holding fewer than one whole warp makes the
+     * grid-stride below advance by zero and spin forever. The shipped entry
+     * always launches kBlockThreads, but the kernel must not depend on its
+     * caller for termination - and the check is lane-uniform, so it cannot
+     * strand lanes at a __syncwarp(). */
+    if (total_warps == 0) {
+        return;
+    }
 
     for (size_t chunk = warp_in_grid; chunk < chunk_count;
          chunk += total_warps) {
@@ -51,6 +59,14 @@ __global__ void __launch_bounds__(kBlockThreads)
         Lz4Sequence seq;
         cudec_status status = CUDEC_OK;
         bool done = false;
+        /* Fuel: Next consumes at least the token byte, so a chunk of n
+         * source bytes admits at most n + 1 calls - a budget no input the
+         * parser accepts or rejects can reach. It is lane-uniform (every
+         * lane parses the same bytes), so it cannot make one lane leave the
+         * loop early and strand the others at a __syncwarp() below. A hung
+         * warp is a fail-closed violation like an out-of-bounds read, and
+         * this is what makes a future parser bug a rejected chunk instead. */
+        uint64_t fuel = src_sizes[chunk] + 1;
         while (true) {
             status = parser.Next(&seq, &done);
             if (status != CUDEC_OK) {
@@ -73,9 +89,18 @@ __global__ void __launch_bounds__(kBlockThreads)
                     __syncwarp();
                 }
             }
-            if (done) {
+            /* The fuel test rides the exit branch that already exists
+             * rather than adding one at the top of the loop; the cap still
+             * costs measurable throughput and the measurement is recorded
+             * in docs/BENCHMARKS.md. */
+            if (done || fuel-- == 0) {
                 break;
             }
+        }
+        /* Fuel exhaustion is a reject, never a success: leaving the loop
+         * without `done` must not report the parse as complete. */
+        if (status == CUDEC_OK && !done) {
+            status = CUDEC_ERR_CORRUPT_INPUT;
         }
 
         /* All lanes agree on status and dst_pos (redundant parse); one lane

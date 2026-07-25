@@ -43,3 +43,13 @@ add_test(NAME bench_worst4b_selfcheck COMMAND bench_lz4 --worst4b --selfcheck)
 # intended many-long-matches shape, reds CI rather than a manual bench.
 add_test(NAME bench_longmatch_selfcheck COMMAND bench_lz4 --longmatch
                                                 --selfcheck)
+
+# Every ctest entry carries a finite TIMEOUT (issue #72): the self-checks run
+# the same corpus construction and CPU decode the decoder is held to, so a
+# non-terminating decode must red them rather than stall the run. The
+# assertion below reds the configure step if an entry added here ever misses
+# one.
+set_tests_properties(
+  bench_selfcheck bench_worst4b_selfcheck bench_longmatch_selfcheck
+  PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
+cudec_assert_test_timeouts()

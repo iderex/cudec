@@ -86,8 +86,20 @@ struct Lz4Parser {
         if (initial_check && src_pos + read_margin >= src_size) {
             return CUDEC_ERR_CORRUPT_INPUT;
         }
+        /* Fuel: the loop's termination otherwise rests entirely on the
+         * guards below staying correct, and a decoder that fails to
+         * terminate hangs the device - a fail-closed violation exactly like
+         * an out-of-bounds read (nvCOMP 5.3 shipped that bug class in its
+         * Snappy decoder). Every step consumes one src byte and the loop is
+         * entered with src_pos <= src_size, so this budget is unreachable
+         * for every input the guards admit: the accept set does not move,
+         * and a future guard bug degrades to a reject instead of a hang. */
+        uint64_t fuel = src_size - src_pos + 1;
         unsigned char byte;
         do {
+            if (fuel-- == 0) {
+                return CUDEC_ERR_CORRUPT_INPUT;
+            }
             if (src_pos >= src_size) {
                 return CUDEC_ERR_CORRUPT_INPUT; /* extension byte missing */
             }
@@ -108,7 +120,10 @@ struct Lz4Parser {
      * then call again); CUDEC_OK with *done set (exact-consumption
      * success - the ONLY success exit, after a literals-only tail); or a
      * reject status. Liveness: every call consumes at least the token
-     * byte, so decode loops terminate on every input. */
+     * byte, so decode loops terminate on every input - asserted per call
+     * over truncated, mutated, and crafted streams in
+     * tests/termination.cpp, and backed by a fuel cap in every driver
+     * loop so a regression rejects rather than hangs. */
     CUDEC_HOST_DEVICE cudec_status Next(Lz4Sequence* sequence, bool* done) {
         *done = false;
         if (src_pos >= src_size) {

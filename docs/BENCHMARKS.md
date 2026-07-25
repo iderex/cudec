@@ -271,6 +271,69 @@ Reproduce with `bench_lz4 --worst4b --gpu`; the construction is oracle-
 validated in-harness and locked against rot by the `bench_worst4b_selfcheck`
 ctest on the GPU-less runner.
 
+### Cost of the termination fuel cap (issue #72)
+
+The sequence loop in `src/lz4_decode.cuh` now carries an explicit decrementing
+fuel cap, so a parser bug that stopped advancing the source cursor would
+produce a rejected chunk instead of a warp that never returns. The cap is one
+64-bit decrement per sequence, folded into the loop's existing exit branch.
+**It is not free, and the number is recorded here rather than waved away.**
+
+Measured back-to-back in one session, same container digest, same machine,
+same corpora: `origin/main` at `e85194d` against this change, `--warmup 3
+--runs 30`, GPU device-resident and CUDA-event timed. The full methodology
+block for the "after" Silesia run:
+
+```
+## bench_lz4 report
+- decoder: CPU oracle, LZ4_decompress_safe (liblz4 1.10.0), single thread
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 12.6, runtime 12.6
+- cudec: 1 (the CPU rows time the liblz4 oracle baseline; the GPU rows below, when --gpu is set, time cudec's decoder)
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3239 chunks, 211.94 MB original, 102.44 MB compressed (ratio 0.483), compressed in-harness via LZ4_compress_default
+- chunk sizes: min 8066 / median 65536 / max 65536 bytes
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is LZ4_decompress_safe only (no clears, no allocation); output byte-verified once before timing; percentiles are nearest-rank
+- wall per run: p50 61.456 ms / p90 64.393 ms / p99 64.967 ms
+- decode throughput: p50 3.449 GB/s / p90 3.291 GB/s / p99 3.262 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs): p50 12.684 ms, 16.7 GB/s
+- GPU parse-only ceiling (copies elided): p50 6.696 ms, 31.7 GB/s - ceilings this design AND any two-phase phase-1 (shared parse)
+```
+
+Every row is the mean of two interleaved before/after passes (after, before,
+after, before) so drifting clocks cannot favour one side:
+
+| Corpus        | Metric                     | Before    | After     | Change |
+| ------------- | -------------------------- | --------- | --------- | ------ |
+| Silesia       | GPU decode p50             | 12.111 ms | 12.470 ms | +3.0%  |
+| Silesia       | GPU parse-only ceiling p50 | 6.116 ms  | 7.108 ms  | +16.2% |
+| worst-4Bmatch | GPU decode p50             | 25.834 ms | 25.888 ms | +0.2%  |
+| worst-4Bmatch | GPU parse-only ceiling p50 | 13.667 ms | 15.484 ms | +13.3% |
+
+The shipped decode path pays **+3.0% on Silesia and nothing measurable on the
+worst case**; the parse-only ceiling — a diagnostic kernel with the copies
+elided, never shipped — pays 13–16%, which is where the per-sequence cost
+shows up undiluted by memory stalls. Honest caveat: the pass-to-pass spread on
+the parse-only rows reached 6% (Silesia before: 6.307 / 5.924 ms), so treat
+those two numbers as "13–16%, direction certain, magnitude approximate"; the
+decode rows were stable to under 1% between passes.
+
+Three formulations were measured before settling. The cap at the top of the
+loop (`while (fuel-- != 0)`) costs 12.74 ms on Silesia; folding it into the
+loop's existing exit branch (`if (done || fuel-- == 0)`, shipped) recovers
+most of that at 12.47 ms; a 32-bit counter lands at 12.70 ms and was dropped
+anyway, because keeping its budget unreachable would need a 4 GiB per-chunk
+limit — an accept-set change for a percent that was not there. The register
+count moves 46 → 48 without crossing an occupancy step on `sm_86`, so **what
+is left is the per-sequence work itself, not the branch or the register
+width** — there is no cheaper spelling to reach for.
+
+The regression is accepted deliberately under the prime-directive ordering —
+**correctness > measured performance**. A decoder that hangs on hostile input
+has failed open in the availability direction; nvCOMP 5.3's release notes
+record shipping exactly that bug class in its Snappy decoder. Recovering the
+throughput later is legitimate measurement-gated perf work, but not at the
+price of the guarantee.
+
 ## M2: reusable streaming context, end-to-end (Silesia)
 
 The streaming decode path is now a reusable context

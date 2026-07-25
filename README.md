@@ -59,9 +59,12 @@ milestones:
 ## Principles
 
 - **Fail-closed.** A malformed or hostile bitstream produces a defined error,
-  never an out-of-bounds access and never a guess. Every reject path has a
-  negative test.
-- **Deterministic.** Same input, same output — bit-exact on every code path.
+  never an out-of-bounds access and never a guess — and never a hang: every
+  loop driven by a value read from the stream is capped, and termination is a
+  tested invariant. Every reject path has a negative test.
+- **Deterministic.** Same input, same output — bit-exact on every code path,
+  in every launch configuration, on every supported GPU. The scope and the
+  tested axes: [docs/DETERMINISM.md](docs/DETERMINISM.md).
 - **Honest numbers.** Recorded baselines: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
   (`bench/bench_lz4`; corpora via `bench/get-corpora.sh`, hash-pinned).
   Every performance claim ships with GPU model, driver,

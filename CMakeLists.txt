@@ -79,6 +79,31 @@ if(CUDEC_ENABLE_CUDA)
   enable_language(CXX)
   enable_testing()
 
+  # Every ctest entry carries a finite TIMEOUT (issue #72). A decoder that
+  # fails to terminate hangs the runner instead of failing it, and a hang is
+  # a fail-closed violation exactly like an out-of-bounds read - so the
+  # timeout is part of the gate, not a convenience. The value is generous
+  # against a loaded machine and a sanitized (-O0 + ASan) build, and finite
+  # against "never".
+  set(CUDEC_TEST_TIMEOUT_SECONDS 300)
+
+  # ...and the property must not be forgettable. This walks the ctest
+  # entries registered in the calling directory and reds the configure step
+  # on any entry without a finite timeout, so a test added by hand (as
+  # bench/ does) is covered exactly like one from cudec_add_test.
+  function(cudec_assert_test_timeouts)
+    get_property(_tests DIRECTORY PROPERTY TESTS)
+    foreach(_test IN LISTS _tests)
+      get_test_property(${_test} TIMEOUT _timeout)
+      if(NOT _timeout)
+        message(
+          FATAL_ERROR
+            "ctest entry '${_test}' has no TIMEOUT: every test must fail on "
+            "a hang rather than stall the run (issue #72)")
+      endif()
+    endforeach()
+  endfunction()
+
   # Single source of truth for the strict device flags: the raw list also
   # feeds the configure-time liveness probes in tests/CMakeLists.txt, so an
   # edit here is probed, not trusted.
