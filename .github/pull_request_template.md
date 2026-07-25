@@ -25,6 +25,10 @@
 - [ ] Every CUDA API call's error is checked; no exceptions cross the C ABI.
 - [ ] An adversarial review (`/security-review`) was run for changes to
       kernels, format parsing, the C-ABI boundary, build/tools, or workflows.
+- [ ] Review record: per lens, its verdict and its findings, with **CONFIRMED
+      __ / PLAUSIBLE __** counts as raised (a finding is CONFIRMED only if a
+      reproduction was produced). Every finding of either kind carries a
+      disposition — FIX, a reasoned DECLINE, or DEFER as its own issue.
 
 ## Performance checklist
 
