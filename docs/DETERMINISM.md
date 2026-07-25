@@ -73,9 +73,16 @@ non-deterministic in it to control:
   `tests/termination_gpu.cu` covers `<<<1, 16>>>`, `<<<2, 16>>>`, and
   `<<<2, 48>>>`. One further geometry bound is **documented rather than
   enforced**: the kernel's thread index is 32-bit, so it requires
-  `gridDim.x * blockDim.x <= 2^32`. Enforcing that costs an sm_86 occupancy
-  step (measured, [BENCHMARKS.md](BENCHMARKS.md)), the shipped grid is capped
-  at 8192 blocks, and no public entry point can approach it.
+  `gridDim.x * blockDim.x <= 2^32`. Exceeding it does **not** break this
+  promise — because a block is already forced to be a whole number of warps,
+  the wrapped index stays warp-aligned, so an aliased block recomputes the
+  same chunks with a full lane range and writes byte-identical values to the
+  same addresses. The output is unchanged; the work is done twice. That
+  asymmetry is why this one is documented and the other two are refused:
+  enforcing it costs a real sm_86 occupancy step on every launch (three
+  spellings measured, all 48 → 52 registers — [BENCHMARKS.md](BENCHMARKS.md)),
+  the shipped grid is capped at 8192 blocks, and no public entry point can
+  approach it.
 - **Nothing about timing.** Throughput varies with geometry, occupancy, clocks,
   and neighbours. Determinism here is about bytes, never about duration.
 - **Nothing about memory addresses.** Allocation addresses and the pointer values

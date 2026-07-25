@@ -112,7 +112,11 @@ if(CUDEC_ENABLE_CUDA)
             "want 1..${CUDEC_TEST_TIMEOUT_CEILING} seconds): every test must "
             "fail on a hang rather than stall the run (issue #72)")
       endif()
-      set_property(GLOBAL APPEND PROPERTY CUDEC_TIMEOUT_CHECKED_TESTS ${_test})
+      # Keyed by directory too: two directories may register the same test
+      # name, and a bare-name key would let the unchecked one ride on the
+      # checked one.
+      set_property(GLOBAL APPEND PROPERTY CUDEC_TIMEOUT_CHECKED_TESTS
+                   "${CMAKE_CURRENT_SOURCE_DIR}::${_test}")
     endforeach()
   endfunction()
 
@@ -120,7 +124,7 @@ if(CUDEC_ENABLE_CUDA)
     get_property(_checked GLOBAL PROPERTY CUDEC_TIMEOUT_CHECKED_TESTS)
     get_property(_tests DIRECTORY ${dir} PROPERTY TESTS)
     foreach(_test IN LISTS _tests)
-      if(NOT _test IN_LIST _checked)
+      if(NOT "${dir}::${_test}" IN_LIST _checked)
         message(
           FATAL_ERROR
             "ctest entry '${_test}' (registered in ${dir}) was never checked "

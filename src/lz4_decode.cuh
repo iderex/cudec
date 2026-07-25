@@ -52,14 +52,22 @@ __global__ void __launch_bounds__(kBlockThreads)
      * __syncwarp().
      *
      * warp_in_grid above stays 32-bit, so this kernel additionally requires
-     * gridDim.x * blockDim.x <= 2^32; past that the index wraps and aliases
-     * two blocks onto one chunk. That bound is not enforced here because
-     * enforcing it is NOT free: widening the expression, or moving it below
-     * this guard, costs 4-6 registers and drops sm_86 occupancy from 40 to 36
-     * warps/SM (measured, docs/BENCHMARKS.md). decode_grid_blocks caps the
-     * shipped grid at 8192 blocks, four orders of magnitude clear of the
-     * bound, so it is a documented limit of this internal header rather than
-     * a reachable defect. */
+     * gridDim.x * blockDim.x <= 2^32. That bound is DOCUMENTED rather than
+     * enforced, and the reason is the asymmetry in what breaking it costs:
+     * past it the index wraps modulo 2^32, but the guard below has already
+     * forced blockDim.x to a multiple of kWarpSize, so the wrapped base stays
+     * warp-aligned and the aliased block recomputes the SAME warp_in_grid
+     * values with a full 0-31 lane range. Two blocks then decode one chunk
+     * redundantly and write byte-identical values to the same addresses -
+     * duplicated work, not missing bytes and not a hang, and the output stays
+     * bit-identical. Enforcing it costs an occupancy step: three spellings
+     * were measured (widening the expression, `total_warps > 1 << 27`, and a
+     * pure 32-bit `gridDim.x > UINT_MAX / blockDim.x`) and all three take the
+     * kernel from 48 to 52 registers, dropping sm_86 from 40 to 36 warps/SM
+     * (docs/BENCHMARKS.md). Trading real throughput on every launch against
+     * redundant-but-correct output on a geometry needing 33 million blocks -
+     * against a decode_grid_blocks cap of 8192, and unreachable through the
+     * public ABI - is not a trade worth making. */
     if (total_warps == 0 || blockDim.x % kWarpSize != 0) {
         return;
     }

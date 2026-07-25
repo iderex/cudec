@@ -340,6 +340,9 @@ function(cudec_scan_source path check_loops out_violations)
   set(_previous "")
   set(_for_open 0)
   set(_for_semis 0)
+  set(_for_start 0)
+  set(_for_lines 0)
+  set(_for_text "")
   set(_lineno 0)
   file(STRINGS "${path}" _lines)
   foreach(_line IN LISTS _lines)
@@ -394,16 +397,31 @@ function(cudec_scan_source path check_loops out_violations)
         endif()
       endif()
       set(_form "")
+      set(_form_line ${_lineno})
       if(_for_open GREATER 0)
         # Continuation of a wrapped `for` header: keep counting until the
         # parenthesis closes, then judge the whole header at once.
         math(EXPR _for_semis "${_for_semis} + ${_line_semis}")
         math(EXPR _for_open "${_for_open} + ${_balance}")
+        math(EXPR _for_lines "${_for_lines} + 1")
+        string(APPEND _for_text " ${_code}")
+        set(_form_line ${_for_start})
         if(_for_open LESS_EQUAL 0)
           set(_for_open 0)
-          if(_for_semis LESS 2)
+          if(_for_semis LESS 2 AND NOT _for_text MATCHES ":")
             set(_form "a 'for' header without a visible condition and increment")
           endif()
+        elseif(_for_lines GREATER 8)
+          # Bail out rather than count forever. The scan does not strip string
+          # literals, so one unbalanced '(' inside a literal would otherwise
+          # leave this tracker open and silently disable the whole loop rule
+          # for the rest of the file - a fail-open in the one rule that exists
+          # to be fail-closed.
+          set(_for_open 0)
+          string(APPEND _violations
+                 "  ${path}:${_for_start}: a 'for' header whose closing "
+                 "parenthesis was not found within 8 lines - the scan cannot "
+                 "judge it, so it is rejected rather than skipped\n")
         endif()
       elseif(_code MATCHES "\\}[ \t]*while")
         # The tail of a do-while; its `do {` carries the requirement.
@@ -418,16 +436,21 @@ function(cudec_scan_source path check_loops out_violations)
         if(_balance GREATER 0)
           set(_for_open ${_balance})
           set(_for_semis ${_line_semis})
-          set(_pending_line ${_lineno})
-        elseif(_line_semis LESS 2)
+          set(_for_start ${_lineno})
+          set(_for_lines 1)
+          set(_for_text "${_code}")
+        elseif(_line_semis LESS 2 AND NOT _code MATCHES ":")
+          # A balanced header with fewer than two semicolons has no visible
+          # induction variable - a macro-hidden loop, say. A range-for
+          # (`for (T& x : container)`) is exempt by the ':': its bound is the
+          # container's size, loop-invariant and visible on the spot, exactly
+          # like the counted form.
           set(_form "a 'for' header without a visible condition and increment")
         endif()
       endif()
       if(_form AND NOT _code MATCHES "fuel" AND NOT _previous MATCHES "fuel")
         set(_pending_reason "${_form}")
-        if(_for_open EQUAL 0 AND NOT _pending_reason MATCHES "'for' header")
-          set(_pending_line ${_lineno})
-        endif()
+        set(_pending_line ${_form_line})
         set(_pending_left 3)
       endif()
       set(_previous "${_code}")
@@ -445,18 +468,39 @@ function(cudec_scan_source path check_loops out_violations)
       endif()
     endforeach()
 
-    if(_code MATCHES "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\([ \t]*$")
-      string(REGEX MATCH "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\([ \t]*$"
-                   _wrapped "${_code}")
-      string(APPEND _violations
-             "  ${path}:${_lineno}: '${CMAKE_MATCH_1}' is wrapped across "
-             "lines - this scan is line-scoped, so a wrapped call hides its "
-             "mask from every rule here; keep a collective on one line\n")
-    elseif(_code MATCHES "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\(")
+    set(_tail_balance 0)
+    if(_code MATCHES "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\(")
+      # Everything from the last collective's '(' to the end of the line. If
+      # its parentheses do not close there, the call is wrapped - and a
+      # wrapped call hides whatever follows the break from EVERY rule below,
+      # which are all line-scoped. Checking the balance rather than only
+      # '(' at end-of-line catches the wrap AFTER the mask, where the source
+      # lane and the predicate live:
+      #     __shfl_sync(0xFFFFFFFFu, value,
+      #                 seq.match_len % kWarpSize);
       string(REGEX MATCH "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\(([^,)]*)"
                    _call "${_code}")
       set(_collective "${CMAKE_MATCH_1}")
       string(STRIP "${CMAKE_MATCH_2}" _mask)
+      string(REGEX REPLACE "^.*(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\(" "("
+                   _call_tail "${_code}")
+      string(LENGTH "${_call_tail}" _tail_all)
+      string(REPLACE "(" "" _stripped "${_call_tail}")
+      string(LENGTH "${_stripped}" _tail_no_open)
+      string(REPLACE ")" "" _stripped "${_call_tail}")
+      string(LENGTH "${_stripped}" _tail_no_close)
+      math(EXPR _tail_opens "${_tail_all} - ${_tail_no_open}")
+      math(EXPR _tail_closes "${_tail_all} - ${_tail_no_close}")
+      math(EXPR _tail_balance "${_tail_opens} - ${_tail_closes}")
+    endif()
+    if(_code MATCHES "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\("
+       AND _tail_balance GREATER 0)
+      string(APPEND _violations
+             "  ${path}:${_lineno}: '${_collective}' is wrapped across "
+             "lines - this scan is line-scoped, so a wrapped call hides its "
+             "mask, source lane and predicate from every rule here; keep a "
+             "collective on one line\n")
+    elseif(_code MATCHES "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\(")
       # An absent mask is the full warp, which only __syncwarp() may imply;
       # every other collective must name its participants.
       if(_mask STREQUAL "" AND NOT _collective STREQUAL "__syncwarp")
@@ -508,6 +552,15 @@ function(cudec_scan_source path check_loops out_violations)
            "  ${path}:${_pending_line}: ${_pending_reason} with no explicit "
            "decrementing 'fuel' cap\n")
   endif()
+  # A `for` header still open at end of file means the scan lost track of the
+  # parentheses and stopped enforcing the loop rule from that point on. Say so
+  # rather than return silently - a scanner that quietly stops checking is the
+  # failure mode these probes and this check exist to prevent.
+  if(check_loops AND _for_open GREATER 0)
+    string(APPEND _violations
+           "  ${path}:${_for_start}: a 'for' header left unbalanced at end of "
+           "file - the loop rule was not enforced below this line\n")
+  endif()
   set(${out_violations} "${_violations}" PARENT_SCOPE)
 endfunction()
 
@@ -535,6 +588,13 @@ file(
   "         outer < n;\n"
   "         outer++) {\n"
   "        total += outer;\n"
+  "    }\n"
+  "    for (const Block& block : blocks) {\n"
+  "        total += block.size;\n"
+  "    }\n"
+  "    for (const Block& wrapped :\n"
+  "         blocks) {\n"
+  "        total += wrapped.size;\n"
   "    }\n"
   "    unsigned fuel = n + 1;\n"
   "    while (fuel-- != 0) {\n"
@@ -608,6 +668,40 @@ file(WRITE ${_probe_dir}/scan_fp_half.cu
 file(WRITE ${_probe_dir}/scan_fp_atomic.cu
      "__device__ void probe(void* p) {\n"
      "    atomicAdd(static_cast<float*>(p), 1);\n" "}\n")
+# The remaining `for` branch: a balanced header with no visible induction
+# variable, single-line and wrapped. Both paths report the same rule but reach
+# it through different code, and the single-line one silently reported the
+# wrong line number until it got a probe of its own.
+file(WRITE ${_probe_dir}/scan_for_opaque.cu
+     "unsigned probe(const unsigned char* src) {\n"
+     "    unsigned count = 0;\n" "    for (EACH_CHUNK(chunk, src)) {\n"
+     "        count += chunk;\n" "    }\n" "    return count;\n" "}\n")
+file(WRITE ${_probe_dir}/scan_for_opaque_wrapped.cu
+     "unsigned probe(const unsigned char* src) {\n"
+     "    unsigned count = 0;\n" "    for (EACH_CHUNK(chunk,\n"
+     "                    src)) {\n" "        count += chunk;\n" "    }\n"
+     "    return count;\n" "}\n")
+# A `for` header the scan cannot balance must be rejected, not skipped: while
+# the tracker is open the whole loop rule is off, so a silent skip would
+# disable the termination check for the rest of the file. String literals are
+# deliberately not stripped, so an unbalanced '(' inside one is exactly how
+# this happens. Both exits are probed - the line cap and end of file.
+file(WRITE ${_probe_dir}/scan_for_unbalanced.cu
+     "void probe() {\n"
+     "    for (int i = 0; i < f(\"an unbalanced ( in a literal\"); i++) {\n"
+     "        g(1);\n" "        g(2);\n" "        g(3);\n" "        g(4);\n"
+     "        g(5);\n" "        g(6);\n" "        g(7);\n" "        g(8);\n"
+     "        g(9);\n" "    }\n" "}\n")
+file(WRITE ${_probe_dir}/scan_for_unbalanced_eof.cu
+     "void probe() {\n"
+     "    for (int i = 0; i < f(\"an unbalanced ( in a literal\"); i++) {\n"
+     "        g(i);\n" "    }\n" "}\n")
+# The wrap AFTER the mask: the mask itself is valid, so only a balance-based
+# wrapped-collective rule catches this one.
+file(WRITE ${_probe_dir}/scan_wrapped_after_mask.cu
+     "__device__ int probe(int v, Lz4Sequence seq) {\n"
+     "    return __shfl_sync(0xFFFFFFFFu, v,\n"
+     "                       seq.match_len % 32);\n" "}\n")
 
 cudec_scan_source(${_probe_dir}/scan_clean.cu TRUE _probe_clean)
 if(_probe_clean)
@@ -632,7 +726,12 @@ set(_scanner_probes
     "scan_missing_mask|has no mask argument on this line"
     "scan_fp_type|floating-point type 'float'"
     "scan_fp_half|floating-point type 'half'"
-    "scan_fp_atomic|floating-point atomic")
+    "scan_fp_atomic|floating-point atomic"
+    "scan_for_opaque|scan_for_opaque.cu:3: a 'for' header without a visible"
+    "scan_for_opaque_wrapped|scan_for_opaque_wrapped.cu:3: a 'for' header without a visible"
+    "scan_for_unbalanced|closing parenthesis was not found within 8 lines"
+    "scan_for_unbalanced_eof|left unbalanced at end of file"
+    "scan_wrapped_after_mask|is wrapped across lines")
 foreach(_entry IN LISTS _scanner_probes)
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\2" _expected "${_entry}")
@@ -647,20 +746,24 @@ foreach(_entry IN LISTS _scanner_probes)
   endif()
 endforeach()
 
-# The decode path: the sources whose loops are driven by lengths and counts
-# read out of a hostile bitstream. Every device translation unit must be on
-# this list, so a new kernel cannot quietly escape the termination rule. The
-# checksum helper (src/xxhash32.h) is deliberately not on it - its loops walk
-# a caller-supplied buffer at a fixed stride with no stream-derived exit.
-set(_decode_path_sources lz4_block.h lz4_decode.cuh frame.cpp batch.cu
-                         stream.cpp)
-# Recursive, and every source extension the tree may grow: device code moves
-# to src/kernels/ from M1 (CLAUDE.md), and a non-recursive glob would make the
-# coverage assertion below pass vacuously over the first file that lands
-# there. Device code is recognised by CONTENT as well as by extension,
-# because the most termination-critical file in the tree today
-# (src/lz4_block.h) is a plain .h - an extension-only rule would scan a future
-# src/lz4_hc_block.h for collectives and floats but not for fuel.
+
+# Every source under src/ is scanned, and the termination rule applies to all
+# of them unless a file is EXPLICITLY exempted below. Opt-out rather than
+# opt-in on purpose: an opt-in list makes a new file invisible by default,
+# which is the wrong direction for a fail-closed rule and would have hidden
+# the first file to land in src/kernels/ (device code moves there from M1) or
+# any future decode header that is a plain .h, like src/lz4_block.h is today.
+# Each exemption carries its reason and is reviewed when it is added.
+#
+#  - xxhash32.h: its loops walk a caller-supplied buffer at a fixed stride
+#    with no stream-derived exit condition, and it is a checksum helper rather
+#    than a decoder.
+#  - cuda_raii.h: its only `do` is the `do { ... } while (0)` wrapper that
+#    makes the CUDA-error-check macro a single statement - an idiom, not a
+#    loop.
+#
+# Both are still held to the warp-collective and floating-point rules.
+set(_loop_rule_exempt xxhash32.h cuda_raii.h)
 file(GLOB_RECURSE _all_sources RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/../src
      CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.c
@@ -675,39 +778,25 @@ if(NOT _all_sources)
   message(FATAL_ERROR "the structural scan found no sources under src/ - the "
                       "glob has stopped matching (issue #72)")
 endif()
-foreach(_source IN LISTS _all_sources)
-  if(_source IN_LIST _decode_path_sources)
-    continue()
-  endif()
-  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source} _source_text)
-  if(_source MATCHES "\\.(cu|cuh)$" OR _source_text MATCHES
-                                       "__global__|__device__|CUDEC_HOST_DEVICE")
-    message(
-      FATAL_ERROR
-        "src/${_source} carries device code but is not on the decode-path "
-        "scan list in tests/CMakeLists.txt - add it, or move the device code "
-        "out (issue #72)")
+# An exemption for a file that no longer exists is stale and hides nothing;
+# say so rather than carry it silently.
+foreach(_exempt IN LISTS _loop_rule_exempt)
+  if(NOT _exempt IN_LIST _all_sources)
+    message(FATAL_ERROR "src/${_exempt} is exempt from the termination rule "
+                        "but no longer exists - drop the exemption "
+                        "(issue #72)")
   endif()
 endforeach()
 
 set(_structural_violations "")
-foreach(_source IN LISTS _decode_path_sources)
-  set(_path ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source})
-  if(NOT EXISTS ${_path})
-    message(FATAL_ERROR "src/${_source} is on the decode-path scan list but "
-                        "does not exist (issue #72)")
-  endif()
-  cudec_scan_source(${_path} TRUE _found)
-  string(APPEND _structural_violations "${_found}")
-endforeach()
-# The remaining sources are held to the collective and floating-point rules
-# only; the termination rule is scoped above.
 foreach(_source IN LISTS _all_sources)
-  if(NOT _source IN_LIST _decode_path_sources)
-    cudec_scan_source(${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source} FALSE
-                      _found)
-    string(APPEND _structural_violations "${_found}")
+  set(_check_loops TRUE)
+  if(_source IN_LIST _loop_rule_exempt)
+    set(_check_loops FALSE)
   endif()
+  cudec_scan_source(${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source}
+                    ${_check_loops} _found)
+  string(APPEND _structural_violations "${_found}")
 endforeach()
 if(_structural_violations)
   message(FATAL_ERROR "structural rules violated (issue #72):\n"

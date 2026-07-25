@@ -254,7 +254,11 @@ chases itself; it is a modular gather from bytes already final:
 the `__syncwarp()` preceding every copy has frozen. Each output byte is
 written exactly once, by a statically determined lane, as a pure function
 of lower addresses — deterministic because no ordering exists to get
-wrong. The shipped inner loop computes that `i mod off` directly — one
+wrong. "Exactly once" holds for a supported launch geometry, which the
+kernel enforces rather than assumes: the copy loops stride by the warp
+size, so a block that is not a whole number of warps would leave a fixed
+slice of every destination written by nobody, and that geometry returns
+without decoding ([DETERMINISM.md](DETERMINISM.md)). The shipped inner loop computes that `i mod off` directly — one
 64-bit modulo per output byte, so every lane pays a division per
 iteration (`dst[seq.match_dst + i] = dst[seq.match_src + (i % offset)]`
 in `src/lz4_decode.cuh`). Cutting that cost is deferred, measurement-gated

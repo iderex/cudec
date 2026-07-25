@@ -331,19 +331,35 @@ blocks and 256-register warp granularity, 41–48 registers all round to
 **49 registers steps down to 36 warps/SM**. The shipped kernel therefore sits
 on the last rung before an occupancy cliff, and that was measured, not assumed:
 
-| Variant                                                         | Registers | Warps/SM | Silesia GPU decode p50 |
-| --------------------------------------------------------------- | --------- | -------- | ---------------------- |
-| `origin/main`, no cap and no geometry guard                     | 46        | 40       | 11.924 ms              |
-| shipped (cap + two-clause geometry guard)                       | 48        | 40       | 12.163 ms              |
-| plus a 32-bit-index overflow guard, or the index moved below it | 52        | 36       | 12.63 ms               |
+| Variant                                          | Registers | Warps/SM | Silesia GPU decode p50 |
+| ------------------------------------------------ | --------- | -------- | ---------------------- |
+| `origin/main`, no cap and no geometry guard      | 46        | 40       | 11.924 ms              |
+| shipped (cap + two-clause geometry guard)        | 48        | 40       | 12.163 ms              |
+| + widen `warp_in_grid` to 64-bit                 | 52        | 36       | 12.63 ms               |
+| + refuse via `total_warps > 1 << 27`             | 52        | 36       | not timed              |
+| + refuse via `gridDim.x > UINT_MAX / blockDim.x` | 52        | 36       | not timed              |
 
-The third row is why the kernel's 32-bit `warp_in_grid` is **left 32-bit and
-documented as a limit rather than widened**: both ways of removing the
-2^32-thread wrap (widening the expression, or refusing the geometry, which
-forces the index below the guard) cost 4–6 registers and a whole occupancy
-step, roughly doubling the regression this change already carries. The shipped
-grid is capped at 8192 blocks by `decode_grid_blocks`, four orders of magnitude
-clear of the bound, and the bound is unreachable through the public ABI at all.
+The last three rows are why the kernel's 32-bit `warp_in_grid` is **left
+32-bit and documented as a limit rather than enforced**. Three spellings of the
+2^32-thread bound were measured, including one that touches no 64-bit value at
+all and compares two values already live in registers — nvcc 12.6 allocates the
+same four extra registers for all three, so neither "widening is free" nor
+"there must be a cheaper spelling" survives contact with the compiler. Only the
+first was timed; the other two share its register count and therefore its
+occupancy, and were not timed separately.
+
+What settles it is not the cost but the asymmetry in the consequence. The guard
+already forces `blockDim.x` to a multiple of the warp size, so a wrapped index
+stays warp-aligned: an aliased block recomputes the **same** `warp_in_grid`
+values with a full 0–31 lane range, decodes the same chunks, and writes
+byte-identical values to the same addresses. Exceeding the documented bound
+therefore costs duplicated work — not missing bytes, not a hang, and the output
+stays bit-identical. That is categorically unlike the two refused geometries,
+where bytes really do go unwritten or the kernel really does spin. Paying an
+occupancy step on every launch to prevent redundant-but-correct output, on a
+geometry needing 33 million blocks against a `decode_grid_blocks` cap of 8192
+and unreachable through the public ABI, is the wrong trade.
+
 Anything added to this kernel from here has a hard budget: **48 registers.**
 
 #### The formulation comparison does not rank the formulations
