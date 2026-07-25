@@ -241,14 +241,21 @@ cudec_status DecodeFrame(const unsigned char* f, size_t frame_size,
     pos += 1;
 
     std::vector<FrameBlock> blocks;
-    while (true) {
+    /* Fuel: every step consumes at least the 4 block-size bytes, so a frame
+     * of frame_size bytes admits at most frame_size / 4 + 1 steps - a budget
+     * no frame the guards below admit can reach. It makes a future bounds
+     * bug a rejected frame instead of a spinning host thread. */
+    uint64_t fuel = frame_size / 4 + 1;
+    bool end_mark = false;
+    while (fuel-- != 0) {
         if (frame_size < pos + 4) {
             return CUDEC_ERR_CORRUPT_INPUT;
         }
         const uint32_t bs = Read32LE(f + pos);
         pos += 4;
         if (bs == 0) {
-            break; /* end mark */
+            end_mark = true;
+            break;
         }
         const bool uncompressed = (bs >> 31) & 1;
         const size_t blen = bs & 0x7FFFFFFFu;
@@ -266,6 +273,9 @@ cudec_status DecodeFrame(const unsigned char* f, size_t frame_size,
         }
         blocks.push_back({pos, blen, uncompressed});
         pos += blen + (block_checksum ? 4 : 0);
+    }
+    if (!end_mark) {
+        return CUDEC_ERR_CORRUPT_INPUT; /* fuel exhausted: no end mark */
     }
 
     size_t total = 0;

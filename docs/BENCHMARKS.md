@@ -271,6 +271,126 @@ Reproduce with `bench_lz4 --worst4b --gpu`; the construction is oracle-
 validated in-harness and locked against rot by the `bench_worst4b_selfcheck`
 ctest on the GPU-less runner.
 
+### Cost of the termination fuel cap (issue #72)
+
+The sequence loop in `src/lz4_decode.cuh` now carries an explicit decrementing
+fuel cap, so a parser bug that stopped advancing the source cursor would
+produce a rejected chunk instead of a warp that never returns. The cap is one
+64-bit decrement per sequence, folded into the loop's existing exit branch.
+**It is not free, and the number is recorded here rather than waved away.**
+
+Measured back-to-back in one session, same container digest, same machine,
+same corpora: `origin/main` at `e85194d` against this change, `--warmup 3
+--runs 30`, GPU device-resident and CUDA-event timed. Every comparison below
+is the mean of two interleaved passes (after, before, after, before) so
+drifting clocks cannot favour one side, and every individual sample is listed
+so the spread is visible rather than averaged away.
+
+The methodology block below is **one standalone run of the "after" build**,
+pasted whole because the rule here is that a number ships with its
+methodology. Its GPU decode p50 is 12.427 ms, inside that build's observed
+run-to-run range but not identical to the paired mean in the table — the same
+build measured twice, not a discrepancy. The paired means are what the claim
+rests on.
+
+```
+## bench_lz4 report
+- decoder: CPU oracle, LZ4_decompress_safe (liblz4 1.10.0), single thread
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 12.6, runtime 12.6
+- cudec: 1 (the CPU rows time the liblz4 oracle baseline; the GPU rows below, when --gpu is set, time cudec's decoder)
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3239 chunks, 211.94 MB original, 102.44 MB compressed (ratio 0.483), compressed in-harness via LZ4_compress_default
+- chunk sizes: min 8066 / median 65536 / max 65536 bytes
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is LZ4_decompress_safe only (no clears, no allocation); output byte-verified once before timing; percentiles are nearest-rank
+- wall per run: p50 60.259 ms / p90 63.591 ms / p99 64.079 ms
+- decode throughput: p50 3.517 GB/s / p90 3.333 GB/s / p99 3.307 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs): p50 12.427 ms, 17.1 GB/s
+- GPU parse-only ceiling (copies elided): p50 7.163 ms, 29.6 GB/s - ceilings this design AND any two-phase phase-1 (shared parse)
+```
+
+| Corpus        | Metric                     | Before (samples)          | After (samples)           | Change                   |
+| ------------- | -------------------------- | ------------------------- | ------------------------- | ------------------------ |
+| Silesia       | GPU decode p50             | 11.924 ms (11.873/11.974) | 12.163 ms (12.107/12.218) | **+2.0%**                |
+| Silesia       | GPU parse-only ceiling p50 | 6.056 ms (5.924/6.188)    | 7.079 ms (7.010/7.147)    | **+16.9%**               |
+| worst-4Bmatch | GPU decode p50             | 25.643 ms (25.364/25.922) | 25.973 ms (25.285/26.661) | +1.3%, inside the spread |
+| worst-4Bmatch | GPU parse-only ceiling p50 | 13.482 ms (13.467/13.496) | 15.437 ms (15.367/15.506) | **+14.5%**               |
+
+The shipped decode path pays **+2.0% on Silesia**; on the worst case the
+difference (+1.3%) is smaller than the "after" side's own pass-to-pass spread
+(25.285 / 26.661 ms), so it is **not a measurement**, only an upper bound. The
+parse-only ceiling — a diagnostic kernel with the copies elided, never shipped
+— pays 14–17% on both corpora, tightly and reproducibly, which is where the
+per-sequence cost shows up undiluted by memory stalls.
+
+#### Occupancy is the constraint, and it bounds what the guard may cost
+
+The kernel uses **48 registers/thread** on `sm_86`, up from 46 on `origin/main`.
+That matters more than the two-register difference suggests: at 128-thread
+blocks and 256-register warp granularity, 41–48 registers all round to
+1536 registers/warp → 6144/block → 10 resident blocks → **40 warps/SM**, while
+**49 registers steps down to 36 warps/SM**. The shipped kernel therefore sits
+on the last rung before an occupancy cliff, and that was measured, not assumed:
+
+| Variant                                          | Registers | Warps/SM | Silesia GPU decode p50 |
+| ------------------------------------------------ | --------- | -------- | ---------------------- |
+| `origin/main`, no cap and no geometry guard      | 46        | 40       | 11.924 ms              |
+| shipped (cap + two-clause geometry guard)        | 48        | 40       | 12.163 ms              |
+| + widen `warp_in_grid` to 64-bit                 | 52        | 36       | 12.63 ms               |
+| + refuse via `total_warps > 1 << 27`             | 52        | 36       | not timed              |
+| + refuse via `gridDim.x > UINT_MAX / blockDim.x` | 52        | 36       | not timed              |
+
+The last three rows are why the kernel's 32-bit `warp_in_grid` is **left
+32-bit and documented as a limit rather than enforced**. Three spellings of the
+2^32-thread bound were measured, including one that touches no 64-bit value at
+all and compares two values already live in registers — nvcc 12.6 allocates the
+same four extra registers for all three, so neither "widening is free" nor
+"there must be a cheaper spelling" survives contact with the compiler. Only the
+first was timed; the other two share its register count and therefore its
+occupancy, and were not timed separately.
+
+What settles it is not the cost but the asymmetry in the consequence. The guard
+already forces `blockDim.x` to a multiple of the warp size, so a wrapped index
+stays warp-aligned: an aliased block recomputes the **same** `warp_in_grid`
+values with a full 0–31 lane range, decodes the same chunks, and writes
+byte-identical values to the same addresses. Exceeding the documented bound
+therefore costs duplicated work — not missing bytes, not a hang, and the output
+stays bit-identical. That is categorically unlike the two refused geometries,
+where bytes really do go unwritten or the kernel really does spin. Paying an
+occupancy step on every launch to prevent redundant-but-correct output, on a
+geometry needing 33 million blocks against a `decode_grid_blocks` cap of 8192
+and unreachable through the public ABI, is the wrong trade.
+
+Anything added to this kernel from here has a hard budget: **48 registers.**
+
+#### The formulation comparison does not rank the formulations
+
+Three spellings of the cap were tried, and the honest reading is that the
+measurement does not separate them. Silesia GPU decode p50, all samples ever
+taken, across sessions:
+
+| Formulation                                    | Samples (ms)                                                 |
+| ---------------------------------------------- | ------------------------------------------------------------ |
+| `origin/main`, no cap                          | 11.873 / 11.974 / 11.980 / 11.987 / 12.011 / 12.218 / 12.234 |
+| folded into the existing exit branch (shipped) | 12.107 / 12.218 / 12.442 / 12.498 / 12.684                   |
+| 32-bit counter                                 | 12.699                                                       |
+| `while (fuel-- != 0)` at the top of the loop   | 12.744 / 12.822                                              |
+
+Only the first two rows were measured under the paired interleaved protocol,
+and only they separate by more than the shipped build's own run-to-run range
+— so the with/without-cap difference is real and the between-formulation
+differences are **not established**. The shipped formulation was chosen on a
+structural argument, not a measured one: folding the test into the loop's
+existing exit branch adds no branch at the top of the loop. The 32-bit counter
+was dropped on correctness, not speed — keeping its budget unreachable would
+need a 4 GiB per-chunk limit, an accept-set change.
+
+The regression is accepted deliberately under the prime-directive ordering —
+**correctness > measured performance**. A decoder that hangs on hostile input
+has failed open in the availability direction; nvCOMP 5.3's release notes
+record shipping exactly that bug class in its Snappy decoder. Recovering the
+throughput later is legitimate measurement-gated perf work, but not at the
+price of the guarantee.
+
 ## M2: reusable streaming context, end-to-end (Silesia)
 
 The streaming decode path is now a reusable context

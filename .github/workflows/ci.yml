@@ -78,7 +78,9 @@ jobs:
           test -x build-cuda/tests/smoke &&
           test -x build-cuda/tests/gpu_fixture &&
           test -x build-cuda/tests/frame_twin &&
-          test -x build-cuda/tests/stream_twin
+          test -x build-cuda/tests/stream_twin &&
+          test -x build-cuda/tests/termination_gpu &&
+          test -x build-cuda/tests/determinism_gpu
 
       # The host-side subset; gpu-labeled tests run in this same container
       # on the maintainer's machine and their output is pasted into the PR.
@@ -95,6 +97,7 @@ jobs:
           grep -E ': conformance_c$' host-selected.txt &&
           grep -E ': oracle_lz4$' host-selected.txt &&
           grep -E ': parser_twin$' host-selected.txt &&
+          grep -E ': termination$' host-selected.txt &&
           grep -E ': launch_fail$' host-selected.txt &&
           grep -E ': bench_selfcheck$' host-selected.txt &&
           grep -E ': bench_worst4b_selfcheck$' host-selected.txt &&
@@ -103,7 +106,9 @@ jobs:
           grep -E ': smoke$' gpu-deferred.txt &&
           grep -E ': gpu_fixture$' gpu-deferred.txt &&
           grep -E ': frame_twin$' gpu-deferred.txt &&
-          grep -E ': stream_twin$' gpu-deferred.txt
+          grep -E ': stream_twin$' gpu-deferred.txt &&
+          grep -E ': termination_gpu$' gpu-deferred.txt &&
+          grep -E ': determinism_gpu$' gpu-deferred.txt
 
   sanitize:
     # The host-side ASan/UBSan gate over the untrusted-input decode path (issue
@@ -156,7 +161,8 @@ jobs:
           test -x build-san/tests/conformance_c &&
           test -x build-san/tests/oracle_lz4 &&
           test -x build-san/tests/parser_twin &&
-          test -x build-san/tests/frame_host_negative
+          test -x build-san/tests/frame_host_negative &&
+          test -x build-san/tests/termination
 
       # Prove the sanitizer runtimes are actually linked: a dropped or renamed
       # -fsanitize flag would still build and test green but check nothing, so
@@ -177,12 +183,14 @@ jobs:
       - name: Run the untrusted-input decode path under ASan+UBSan
         run: >-
           ctest --test-dir build-san --no-tests=error --output-on-failure -R
-          '^(conformance_c|oracle_lz4|parser_twin|frame_host_negative)$' &&
+          '^(conformance_c|oracle_lz4|parser_twin|frame_host_negative|termination)$'
+          &&
           ctest --test-dir build-san -N | tee san-selected.txt &&
           grep -E ': conformance_c$' san-selected.txt &&
           grep -E ': oracle_lz4$' san-selected.txt &&
           grep -E ': parser_twin$' san-selected.txt &&
-          grep -E ': frame_host_negative$' san-selected.txt
+          grep -E ': frame_host_negative$' san-selected.txt &&
+          grep -E ': termination$' san-selected.txt
 
   format:
     name: format

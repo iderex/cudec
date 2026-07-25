@@ -29,7 +29,29 @@ Issue-driven, gate-driven:
   nvCOMP is proprietary: never copy its headers or source, and cudec claims no
   compatibility with it (nominative references and CPU-only benchmark
   comparisons are fine).
-- **Determinism**: same input → same output, bit-exact per code path.
+- **Termination**: every loop whose exit depends on a value read from the
+  bitstream carries an explicit decrementing fuel cap, sized so no input the
+  validation ladder admits can reach it. A decoder that hangs on hostile input
+  has failed open in the availability direction; a configure-time check reds
+  the build on a fuel-free loop in the decode path, and every ctest entry has a
+  finite `TIMEOUT`.
+- **Warp collectives.** Four points, checked on every kernel review:
+  1. **Mask provenance** — a collective's mask is the full-warp constant or
+     `__activemask()`, never a value computed from the bitstream.
+  2. **All participants reach it** — every lane the mask names arrives at the
+     collective; loop bounds and branches around one stay lane-uniform.
+  3. **No source lane or predicate from unvalidated input** — a shuffle's
+     source lane and a vote's predicate are program constants or validated
+     quantities, never a parsed length, offset, or token.
+  4. **No legacy intrinsics** — `__shfl`, `__ballot`, `__any`, `__all`,
+     `__match_any` and friends are banned; only the `_sync` forms are used.
+- **Determinism**: same input → bit-identical output, on every path and in
+  every supported launch configuration — the `gpu_to_gpu` level in NVIDIA's
+  CCCL vocabulary. A kernel that maps work onto lanes states which geometries
+  it supports and refuses the rest, rather than assuming its caller. The scope,
+  the qualifiers, and the tested axes are in
+  [docs/DETERMINISM.md](docs/DETERMINISM.md); no floating-point type or atomic
+  belongs anywhere in the sources.
 - **Performance claims are measured**, never reasoned: numbers ship with GPU
   model, driver, CUDA version, corpus, and chunk-size distribution.
 - **Readable kernels.** Small single-purpose device functions with

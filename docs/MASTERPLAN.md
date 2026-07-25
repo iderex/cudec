@@ -88,9 +88,39 @@ a planned milestone — a vendor binary can never follow), and **hackability**.
   arithmetic is overflow-checked; a chunk that fails validation reports a
   defined error and produces no partial output presented as success. Hostile
   input is the expected case, not the exception.
-- **Determinism.** Same input → bit-identical output on every path. There is
-  no floating point in a lossless decoder; this invariant is cheap here and
-  is locked in by tests.
+- **Termination is part of fail-closed.** A decoder that hangs on hostile
+  input has failed open in the availability direction — nvCOMP 5.3's release
+  notes record fixing an indefinite Snappy-decompression hang on malformed
+  input, so this is a demonstrated bug class in exactly this product
+  category, not a theoretical one. Every loop whose exit depends on a value
+  read from the bitstream carries an explicit decrementing fuel cap whose
+  bound is unreachable for any input the validation ladder admits: the accept
+  set is unchanged, and a future guard bug degrades to a defined reject
+  instead of a hung device. The parser's per-call liveness contract is
+  asserted over truncated, mutated, and crafted streams
+  (`tests/termination.cpp`, `tests/termination_gpu.cu`), every ctest entry
+  carries a finite `TIMEOUT`, and a configure-time check reds the build on a
+  fuel-free loop in the decode path.
+- **Warp collective integrity.** Kernels use only the `_sync` warp
+  primitives; the legacy non-`_sync` intrinsics are banned outright, because
+  since Volta's independent thread scheduling they cannot express which lanes
+  participate at all. A collective's participation metadata — its mask, its
+  source lane, its predicate — is never derived from a value read out of the
+  bitstream: it is the full-warp constant or `__activemask()`, and the loop
+  bounds that decide which lanes reach a collective stay lane-uniform.
+  Corrupting that metadata is a published attack on CUDA kernels
+  ("Gerrymandering the Warp", arXiv:2606.11878) that produces wrong results
+  without touching control flow, and the shipped decoder's redundant
+  all-lane parse is what keeps every lane's path identical. Configure-time
+  checks in `tests/CMakeLists.txt` enforce both halves; `CONTRIBUTING.md`
+  carries the four-point review checklist.
+- **Determinism.** Same input → bit-identical output on every path: the level
+  is `gpu_to_gpu` in NVIDIA's CCCL vocabulary, held by construction rather
+  than by tuning — integer-only arithmetic, every output byte written exactly
+  once by a statically determined lane as a pure function of lower addresses,
+  and no inter-chunk coupling. The scope, the reasoning, and the tested axes
+  (including launch geometry and stream count, which a same-batch-twice
+  compare cannot see) are in [DETERMINISM.md](DETERMINISM.md).
 - **The oracles decide correctness.** liblz4, zlib, and libzstd are vendored
   as test dependencies; decode output is diff-tested against them on real
   corpora (Silesia, enwik) and on fuzzed/mutated streams, including the
@@ -224,7 +254,11 @@ chases itself; it is a modular gather from bytes already final:
 the `__syncwarp()` preceding every copy has frozen. Each output byte is
 written exactly once, by a statically determined lane, as a pure function
 of lower addresses — deterministic because no ordering exists to get
-wrong. The shipped inner loop computes that `i mod off` directly — one
+wrong. "Exactly once" holds for a supported launch geometry, which the
+kernel enforces rather than assumes: the copy loops stride by the warp
+size, so a block that is not a whole number of warps would leave a fixed
+slice of every destination written by nobody, and that geometry returns
+without decoding ([DETERMINISM.md](DETERMINISM.md)). The shipped inner loop computes that `i mod off` directly — one
 64-bit modulo per output byte, so every lane pays a division per
 iteration (`dst[seq.match_dst + i] = dst[seq.match_src + (i % offset)]`
 in `src/lz4_decode.cuh`). Cutting that cost is deferred, measurement-gated
