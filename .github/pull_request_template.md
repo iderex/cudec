@@ -25,6 +25,10 @@
 - [ ] Every CUDA API call's error is checked; no exceptions cross the C ABI.
 - [ ] An adversarial review (`/security-review`) was run for changes to
       kernels, format parsing, the C-ABI boundary, build/tools, or workflows.
+- [ ] Review-gate ledger: **CONFIRMED __ / PLAUSIBLE __ / not-CI-exercisable
+      __**. Every CONFIRMED finding is fixed; every other one carries a
+      disposition (reasoned DECLINE, or DEFER as its own issue). A finding
+      without a reproduction artifact is never counted as CONFIRMED.
 
 ## Performance checklist
 
