@@ -36,12 +36,31 @@ __global__ void __launch_bounds__(kBlockThreads)
         (blockIdx.x * blockDim.x + threadIdx.x) / kWarpSize;
     const size_t total_warps =
         (static_cast<size_t>(gridDim.x) * blockDim.x) / kWarpSize;
-    /* A launch geometry holding fewer than one whole warp makes the
-     * grid-stride below advance by zero and spin forever. The shipped entry
-     * always launches kBlockThreads, but the kernel must not depend on its
-     * caller for termination - and the check is lane-uniform, so it cannot
-     * strand lanes at a __syncwarp(). */
-    if (total_warps == 0) {
+    /* The chunk-to-lane mapping is sound only when the grid holds at least
+     * one whole warp and every block is a whole number of warps. Both
+     * failures are geometry rather than input, and both are silent:
+     *  - fewer than one whole warp in the grid makes the grid-stride below
+     *    advance by zero and spin forever;
+     *  - a block that is not a warp multiple splits a chunk's warp across two
+     *    blocks (<<<2, 16>>> and <<<2, 48>>> both do), so `lane` only ever
+     *    takes the low half of its range while the copy loops stride by
+     *    kWarpSize - every output byte at i % 32 >= 16 is written by nobody,
+     *    and the full-mask __syncwarp() is executed by half a warp.
+     * The shipped entry always launches kBlockThreads, but the kernel must
+     * not depend on its caller for either property. Both tests are
+     * grid-uniform (gridDim/blockDim only), so neither can strand lanes at a
+     * __syncwarp().
+     *
+     * warp_in_grid above stays 32-bit, so this kernel additionally requires
+     * gridDim.x * blockDim.x <= 2^32; past that the index wraps and aliases
+     * two blocks onto one chunk. That bound is not enforced here because
+     * enforcing it is NOT free: widening the expression, or moving it below
+     * this guard, costs 4-6 registers and drops sm_86 occupancy from 40 to 36
+     * warps/SM (measured, docs/BENCHMARKS.md). decode_grid_blocks caps the
+     * shipped grid at 8192 blocks, four orders of magnitude clear of the
+     * bound, so it is a documented limit of this internal header rather than
+     * a reachable defect. */
+    if (total_warps == 0 || blockDim.x % kWarpSize != 0) {
         return;
     }
 
@@ -55,18 +74,21 @@ __global__ void __launch_bounds__(kBlockThreads)
          * dst[] value across the barrier. */
         unsigned char* dst = static_cast<unsigned char*>(dst_ptrs[chunk]);
 
-        Lz4Parser parser{src, src_sizes[chunk], dst_caps[chunk]};
+        const size_t src_size = src_sizes[chunk];
+        Lz4Parser parser{src, src_size, dst_caps[chunk]};
         Lz4Sequence seq;
         cudec_status status = CUDEC_OK;
         bool done = false;
         /* Fuel: Next consumes at least the token byte, so a chunk of n
          * source bytes admits at most n + 1 calls - a budget no input the
-         * parser accepts or rejects can reach. It is lane-uniform (every
-         * lane parses the same bytes), so it cannot make one lane leave the
-         * loop early and strand the others at a __syncwarp() below. A hung
-         * warp is a fail-closed violation like an out-of-bounds read, and
-         * this is what makes a future parser bug a rejected chunk instead. */
-        uint64_t fuel = src_sizes[chunk] + 1;
+         * parser accepts or rejects can reach. The saturating form matters:
+         * a plain n + 1 would wrap to 0 for a SIZE_MAX chunk size and cap a
+         * parse that nothing else would have stopped. It is lane-uniform
+         * (every lane parses the same bytes), so it cannot make one lane
+         * leave the loop early and strand the others at a __syncwarp() below.
+         * A hung warp is a fail-closed violation like an out-of-bounds read,
+         * and this is what makes a future parser bug a rejected chunk. */
+        uint64_t fuel = src_size == SIZE_MAX ? SIZE_MAX : src_size + 1;
         while (true) {
             status = parser.Next(&seq, &done);
             if (status != CUDEC_OK) {
@@ -89,10 +111,11 @@ __global__ void __launch_bounds__(kBlockThreads)
                     __syncwarp();
                 }
             }
-            /* The fuel test rides the exit branch that already exists
-             * rather than adding one at the top of the loop; the cap still
-             * costs measurable throughput and the measurement is recorded
-             * in docs/BENCHMARKS.md. */
+            /* The fuel test rides the exit branch that already exists rather
+             * than adding one at the top of the loop. That is a structural
+             * choice, not a measured one - the formulations were not
+             * separable above run-to-run noise; what IS measured is the cost
+             * of having a cap at all (docs/BENCHMARKS.md). */
             if (done || fuel-- == 0) {
                 break;
             }

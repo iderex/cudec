@@ -46,8 +46,10 @@ Issue-driven, gate-driven:
   4. **No legacy intrinsics** — `__shfl`, `__ballot`, `__any`, `__all`,
      `__match_any` and friends are banned; only the `_sync` forms are used.
 - **Determinism**: same input → bit-identical output, on every path and in
-  every launch configuration — the `gpu_to_gpu` level in NVIDIA's CCCL
-  vocabulary. The scope and the tested axes are in
+  every supported launch configuration — the `gpu_to_gpu` level in NVIDIA's
+  CCCL vocabulary. A kernel that maps work onto lanes states which geometries
+  it supports and refuses the rest, rather than assuming its caller. The scope,
+  the qualifiers, and the tested axes are in
   [docs/DETERMINISM.md](docs/DETERMINISM.md); no floating-point type or atomic
   belongs anywhere in the sources.
 - **Performance claims are measured**, never reasoned: numbers ship with GPU

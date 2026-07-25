@@ -296,8 +296,9 @@ endforeach()
 # rules (issue #72). Same honest scope as the checks above: drift detectors
 # under the known spellings, not tamper-proofing. Every rule below is applied
 # by ONE scanning function, which is then run over inline probe files that
-# must and must not trip it - a detector that silently stopped matching would
-# reassure forever, exactly like a dead warnings gate.
+# must and must not trip it - and each violating probe is matched against the
+# TEXT its rule emits, not merely against a non-empty result, so one rule
+# cannot cover for another that has quietly stopped matching.
 
 # Scans one source and returns every structural violation it finds. Comments
 # are stripped first, so prose ("never double-frees", "decode loops
@@ -318,14 +319,17 @@ endforeach()
 #    lanes participate at all), and a collective's mask must be a full-warp
 #    constant or __activemask(), never a value named after a parsed bitstream
 #    field - corrupting collective participation metadata is a published
-#    attack on CUDA kernels that leaves control flow untouched;
+#    attack on CUDA kernels that leaves control flow untouched. A collective
+#    wrapped across lines is a violation in itself: the scan is line-scoped,
+#    so a wrapped call would hide its mask from every rule here;
 #  - determinism: no floating-point type and no floating-point atomic, which
 #    is what makes the gpu_to_gpu level in docs/DETERMINISM.md hold by
 #    construction rather than by measurement.
 #
 # Limits, stated as the neighbouring checks state theirs: constructs hidden
 # inside string literals are not stripped; a mask computed into a variable on
-# an earlier line is judged by its name at the call site; and a loop or
+# an earlier line is judged by its name at the call site; a `fuel` mention on
+# the line above an unrelated loop satisfies the loop rule; and a loop or
 # intrinsic introduced under a fresh spelling is code review's job.
 function(cudec_scan_source path check_loops out_violations)
   set(_violations "")
@@ -334,6 +338,8 @@ function(cudec_scan_source path check_loops out_violations)
   set(_pending_line 0)
   set(_pending_left 0)
   set(_previous "")
+  set(_for_open 0)
+  set(_for_semis 0)
   set(_lineno 0)
   file(STRINGS "${path}" _lines)
   foreach(_line IN LISTS _lines)
@@ -359,6 +365,21 @@ function(cudec_scan_source path check_loops out_violations)
     endif()
     set(_code " ${_line} ")
 
+    # Parenthesis balance and semicolon count of this line, used to follow a
+    # loop header that wrapped at the 80-column limit instead of misreading
+    # its first line as a header without a condition.
+    string(LENGTH "${_code}" _len_all)
+    string(REPLACE "(" "" _stripped "${_code}")
+    string(LENGTH "${_stripped}" _len_no_open)
+    string(REPLACE ")" "" _stripped "${_code}")
+    string(LENGTH "${_stripped}" _len_no_close)
+    string(REPLACE ";" "" _stripped "${_code}")
+    string(LENGTH "${_stripped}" _len_no_semi)
+    math(EXPR _opens "${_len_all} - ${_len_no_open}")
+    math(EXPR _closes "${_len_all} - ${_len_no_close}")
+    math(EXPR _balance "${_opens} - ${_closes}")
+    math(EXPR _line_semis "${_len_all} - ${_len_no_semi}")
+
     if(check_loops)
       if(_pending_left GREATER 0)
         if(_code MATCHES "fuel")
@@ -373,49 +394,77 @@ function(cudec_scan_source path check_loops out_violations)
         endif()
       endif()
       set(_form "")
-      if(_code MATCHES "\\}[ \t]*while")
+      if(_for_open GREATER 0)
+        # Continuation of a wrapped `for` header: keep counting until the
+        # parenthesis closes, then judge the whole header at once.
+        math(EXPR _for_semis "${_for_semis} + ${_line_semis}")
+        math(EXPR _for_open "${_for_open} + ${_balance}")
+        if(_for_open LESS_EQUAL 0)
+          set(_for_open 0)
+          if(_for_semis LESS 2)
+            set(_form "a 'for' header without a visible condition and increment")
+          endif()
+        endif()
+      elseif(_code MATCHES "\\}[ \t]*while")
         # The tail of a do-while; its `do {` carries the requirement.
       elseif(_code MATCHES "[^A-Za-z_0-9]while[ \t]*\\(")
         set(_form "a 'while' loop")
       elseif(_code MATCHES "[^A-Za-z_0-9]do[ \t]*{")
         set(_form "a 'do' loop")
       elseif(_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\([^)]*;[ \t]*;")
+        # Covers both `for (;;)` and `for (init;; incr)`.
         set(_form "a 'for' loop with an empty condition")
-      elseif(_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\([ \t]*;")
-        set(_form "a 'for (;;)' loop")
       elseif(_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\(")
-        string(REPLACE ";" "" _no_semis "${_code}")
-        string(LENGTH "${_code}" _with_len)
-        string(LENGTH "${_no_semis}" _without_len)
-        math(EXPR _semis "${_with_len} - ${_without_len}")
-        if(_semis LESS 2)
+        if(_balance GREATER 0)
+          set(_for_open ${_balance})
+          set(_for_semis ${_line_semis})
+          set(_pending_line ${_lineno})
+        elseif(_line_semis LESS 2)
           set(_form "a 'for' header without a visible condition and increment")
         endif()
       endif()
       if(_form AND NOT _code MATCHES "fuel" AND NOT _previous MATCHES "fuel")
         set(_pending_reason "${_form}")
-        set(_pending_line ${_lineno})
+        if(_for_open EQUAL 0 AND NOT _pending_reason MATCHES "'for' header")
+          set(_pending_line ${_lineno})
+        endif()
         set(_pending_left 3)
       endif()
       set(_previous "${_code}")
     endif()
 
+    # The legacy intrinsics, matched on the identifier rather than on a
+    # following "(": a call wrapped as `__shfl\n    (v, 0)` is the same
+    # violation, and the _sync forms end in "_sync" so they never match here.
     foreach(_legacy __shfl __shfl_up __shfl_down __shfl_xor __ballot __any
                     __all __match_any)
-      if(_code MATCHES "${_legacy}[ \t]*\\(")
+      if(_code MATCHES "[^A-Za-z_0-9]${_legacy}[^A-Za-z_0-9]")
         string(APPEND _violations
-               "  ${path}:${_lineno}: legacy warp intrinsic '${_legacy}(' - "
+               "  ${path}:${_lineno}: legacy warp intrinsic '${_legacy}' - "
                "only the _sync form can state which lanes participate\n")
       endif()
     endforeach()
 
-    if(_code MATCHES "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\(")
+    if(_code MATCHES "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\([ \t]*$")
+      string(REGEX MATCH "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\([ \t]*$"
+                   _wrapped "${_code}")
+      string(APPEND _violations
+             "  ${path}:${_lineno}: '${CMAKE_MATCH_1}' is wrapped across "
+             "lines - this scan is line-scoped, so a wrapped call hides its "
+             "mask from every rule here; keep a collective on one line\n")
+    elseif(_code MATCHES "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\(")
       string(REGEX MATCH "(__[A-Za-z_0-9]*_sync|__syncwarp)[ \t]*\\(([^,)]*)"
                    _call "${_code}")
       set(_collective "${CMAKE_MATCH_1}")
       string(STRIP "${CMAKE_MATCH_2}" _mask)
-      if(NOT _mask STREQUAL "" AND NOT _mask MATCHES
-         "^(0[xX][fF][fF][fF][fF][fF][fF][fF][fF][uU]?|kFullWarpMask|__activemask\\(?)$")
+      # An absent mask is the full warp, which only __syncwarp() may imply;
+      # every other collective must name its participants.
+      if(_mask STREQUAL "" AND NOT _collective STREQUAL "__syncwarp")
+        string(APPEND _violations
+               "  ${path}:${_lineno}: '${_collective}' has no mask argument "
+               "on this line - only __syncwarp may imply the full warp\n")
+      elseif(NOT _mask STREQUAL "" AND NOT _mask MATCHES
+             "^(0[xX][fF][fF][fF][fF][fF][fF][fF][fF][uU]?|kFullWarpMask|__activemask\\(?)$")
         string(APPEND _violations
                "  ${path}:${_lineno}: '${_collective}' mask '${_mask}' is "
                "neither the full-warp constant nor __activemask()\n")
@@ -436,7 +485,10 @@ function(cudec_scan_source path check_loops out_violations)
       endif()
     endif()
 
-    foreach(_fp float double __half __half2 __nv_bfloat16 __nv_bfloat162)
+    # CUDA spells its half type four ways and C23 adds a fifth; all of them
+    # reintroduce the reassociation the gpu_to_gpu level rules out.
+    foreach(_fp float double half half2 __half __half2 __nv_bfloat16
+                __nv_bfloat162 _Float16 __nv_fp8_e4m3 __nv_fp8_e5m2)
       if(_code MATCHES "[^A-Za-z_0-9]${_fp}[^A-Za-z_0-9]")
         string(APPEND _violations
                "  ${path}:${_lineno}: floating-point type '${_fp}' - the "
@@ -444,8 +496,8 @@ function(cudec_scan_source path check_loops out_violations)
                "gpu_to_gpu determinism level hold (docs/DETERMINISM.md)\n")
       endif()
     endforeach()
-    if(_code MATCHES "atomic[A-Za-z]*[ \t]*\\(" AND _code MATCHES
-                                                   "(float|double|__half|__nv_bfloat16)")
+    if(_code MATCHES "atomic[A-Za-z]*[ \t]*\\("
+       AND _code MATCHES "[^A-Za-z_0-9](float|double|half|__half|__nv_bfloat16|_Float16)[^A-Za-z_0-9]")
       string(APPEND _violations
              "  ${path}:${_lineno}: floating-point atomic - its result "
              "depends on the order the device happens to schedule\n")
@@ -460,10 +512,15 @@ function(cudec_scan_source path check_loops out_violations)
 endfunction()
 
 # Liveness probes for the scanner itself, in the same spirit as the
-# warnings-gate control TU above: the clean probe must come back silent
-# (including its comment full of the very keywords the rules match), and each
-# violating probe must come back naming its rule. These files are scanned as
-# text and never compiled.
+# warnings-gate control TU above. The clean probe must come back silent -
+# including its comment full of the very keywords the rules match, and
+# including a legitimately wrapped `for` header, which an earlier revision of
+# this scanner reported as a header without a condition. Each violating probe
+# must come back with the TEXT of the rule it violates: asserting only
+# non-emptiness let the floating-point-atomic rule ride on the
+# floating-point-TYPE rule firing on the same probe's signature, which is
+# exactly the kind of silently-dead sub-rule these probes exist to catch.
+# These files are scanned as text and never compiled.
 set(_probe_dir ${CMAKE_CURRENT_BINARY_DIR}/probes)
 file(
   WRITE ${_probe_dir}/scan_clean.cu
@@ -473,6 +530,11 @@ file(
   "    unsigned total = 0;\n"
   "    for (unsigned i = 0; i < n; i++) {\n"
   "        total += i;\n"
+  "    }\n"
+  "    for (unsigned outer = 0;\n"
+  "         outer < n;\n"
+  "         outer++) {\n"
+  "        total += outer;\n"
   "    }\n"
   "    unsigned fuel = n + 1;\n"
   "    while (fuel-- != 0) {\n"
@@ -492,8 +554,10 @@ file(
   "    __syncwarp();\n"
   "    return __shfl_sync(0xFFFFFFFFu, v, 0);\n"
   "}\n")
+
+# One probe per sub-rule, each paired with the text it must produce.
 file(
-  WRITE ${_probe_dir}/scan_unbounded_loop.cu
+  WRITE ${_probe_dir}/scan_loop_while.cu
   "unsigned probe(const unsigned char* src, unsigned n) {\n"
   "    unsigned count = src[0];\n"
   "    while (count != 0) {\n"
@@ -501,14 +565,49 @@ file(
   "    }\n"
   "    return count;\n"
   "}\n")
+file(
+  WRITE ${_probe_dir}/scan_loop_do.cu
+  "unsigned probe(const unsigned char* src, unsigned n) {\n"
+  "    unsigned count = src[0];\n"
+  "    do {\n"
+  "        count += src[count % n];\n"
+  "    } while (count != 0);\n"
+  "    return count;\n"
+  "}\n")
+file(WRITE ${_probe_dir}/scan_loop_forever.cu
+     "unsigned probe(const unsigned char* src) {\n"
+     "    unsigned count = 0;\n" "    for (;;) {\n"
+     "        count += src[count];\n" "    }\n" "    return count;\n" "}\n")
+file(WRITE ${_probe_dir}/scan_loop_empty_condition.cu
+     "unsigned probe(const unsigned char* src) {\n"
+     "    unsigned count = 0;\n" "    for (unsigned i = 0;; i++) {\n"
+     "        count += src[i];\n" "    }\n" "    return count;\n" "}\n")
 file(WRITE ${_probe_dir}/scan_legacy_intrinsic.cu
      "__device__ int probe(int v) {\n" "    return __shfl(v, 0);\n" "}\n")
+file(WRITE ${_probe_dir}/scan_legacy_intrinsic_wrapped.cu
+     "__device__ int probe(int v) {\n" "    return __ballot\n"
+     "        (v > 0);\n" "}\n")
 file(WRITE ${_probe_dir}/scan_derived_mask.cu
      "__device__ int probe(int v, unsigned mask_bits) {\n"
      "    return __shfl_sync(mask_bits, v, 0);\n" "}\n")
-file(WRITE ${_probe_dir}/scan_floating_point.cu
-     "__device__ void probe(float* acc, float v) {\n"
-     "    atomicAdd(acc, v);\n" "}\n")
+file(WRITE ${_probe_dir}/scan_bitstream_field.cu
+     "__device__ int probe(int v, unsigned offset) {\n"
+     "    return __shfl_sync(0xFFFFFFFFu, v, offset);\n" "}\n")
+file(WRITE ${_probe_dir}/scan_sequence_field.cu
+     "__device__ int probe(int v, Lz4Sequence seq) {\n"
+     "    return __shfl_sync(0xFFFFFFFFu, v, seq.lane);\n" "}\n")
+file(WRITE ${_probe_dir}/scan_wrapped_collective.cu
+     "__device__ int probe(int v, unsigned mask_from_token) {\n"
+     "    return __shfl_sync(\n" "        mask_from_token, v, 0);\n" "}\n")
+file(WRITE ${_probe_dir}/scan_missing_mask.cu
+     "__device__ int probe(int v) {\n" "    return __shfl_sync();\n" "}\n")
+file(WRITE ${_probe_dir}/scan_fp_type.cu
+     "__device__ float probe(float a) {\n" "    return a + a;\n" "}\n")
+file(WRITE ${_probe_dir}/scan_fp_half.cu
+     "__device__ void probe(half* acc) {\n" "    *acc = *acc;\n" "}\n")
+file(WRITE ${_probe_dir}/scan_fp_atomic.cu
+     "__device__ void probe(void* p) {\n"
+     "    atomicAdd(static_cast<float*>(p), 1);\n" "}\n")
 
 cudec_scan_source(${_probe_dir}/scan_clean.cu TRUE _probe_clean)
 if(_probe_clean)
@@ -517,31 +616,77 @@ if(_probe_clean)
       "the structural scanner rejects a compliant probe - fix the scanner "
       "before trusting it:\n${_probe_clean}")
 endif()
-foreach(_probe scan_unbounded_loop scan_legacy_intrinsic scan_derived_mask
-               scan_floating_point)
+# "probe|the text its rule must emit" - '|' rather than ';' because CMake
+# would split a list element on the latter.
+set(_scanner_probes
+    "scan_loop_while|a 'while' loop with no explicit decrementing 'fuel' cap"
+    "scan_loop_do|a 'do' loop with no explicit decrementing 'fuel' cap"
+    "scan_loop_forever|a 'for' loop with an empty condition with no explicit"
+    "scan_loop_empty_condition|a 'for' loop with an empty condition with no explicit"
+    "scan_legacy_intrinsic|legacy warp intrinsic '__shfl'"
+    "scan_legacy_intrinsic_wrapped|legacy warp intrinsic '__ballot'"
+    "scan_derived_mask|mask 'mask_bits' is neither the full-warp constant"
+    "scan_bitstream_field|names the parsed bitstream field 'offset'"
+    "scan_sequence_field|reads a parsed sequence field"
+    "scan_wrapped_collective|is wrapped across lines"
+    "scan_missing_mask|has no mask argument on this line"
+    "scan_fp_type|floating-point type 'float'"
+    "scan_fp_half|floating-point type 'half'"
+    "scan_fp_atomic|floating-point atomic")
+foreach(_entry IN LISTS _scanner_probes)
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\2" _expected "${_entry}")
   cudec_scan_source(${_probe_dir}/${_probe}.cu TRUE _probe_result)
-  if(NOT _probe_result)
-    message(FATAL_ERROR "the structural scanner is dead: probe '${_probe}' "
-                        "passed clean (issue #72)")
+  string(FIND "${_probe_result}" "${_expected}" _found_at)
+  if(_found_at EQUAL -1)
+    message(
+      FATAL_ERROR
+        "the structural scanner is dead for one rule: probe '${_probe}' did "
+        "not report \"${_expected}\" (issue #72). It reported:\n"
+        "${_probe_result}")
   endif()
 endforeach()
 
 # The decode path: the sources whose loops are driven by lengths and counts
 # read out of a hostile bitstream. Every device translation unit must be on
-# this list, so a new kernel cannot quietly escape the termination rule; the
+# this list, so a new kernel cannot quietly escape the termination rule. The
 # checksum helper (src/xxhash32.h) is deliberately not on it - its loops walk
 # a caller-supplied buffer at a fixed stride with no stream-derived exit.
 set(_decode_path_sources lz4_block.h lz4_decode.cuh frame.cpp batch.cu
                          stream.cpp)
-file(GLOB _device_sources RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/../src
-     CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cu
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cuh)
-foreach(_device_source IN LISTS _device_sources)
-  if(NOT _device_source IN_LIST _decode_path_sources)
+# Recursive, and every source extension the tree may grow: device code moves
+# to src/kernels/ from M1 (CLAUDE.md), and a non-recursive glob would make the
+# coverage assertion below pass vacuously over the first file that lands
+# there. Device code is recognised by CONTENT as well as by extension,
+# because the most termination-critical file in the tree today
+# (src/lz4_block.h) is a plain .h - an extension-only rule would scan a future
+# src/lz4_hc_block.h for collectives and floats but not for fuel.
+file(GLOB_RECURSE _all_sources RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/../src
+     CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.c
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cc
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cu
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cuh
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.hpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.inl)
+if(NOT _all_sources)
+  message(FATAL_ERROR "the structural scan found no sources under src/ - the "
+                      "glob has stopped matching (issue #72)")
+endif()
+foreach(_source IN LISTS _all_sources)
+  if(_source IN_LIST _decode_path_sources)
+    continue()
+  endif()
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source} _source_text)
+  if(_source MATCHES "\\.(cu|cuh)$" OR _source_text MATCHES
+                                       "__global__|__device__|CUDEC_HOST_DEVICE")
     message(
       FATAL_ERROR
-        "src/${_device_source} is device code but is not on the decode-path "
-        "scan list in tests/CMakeLists.txt - add it (issue #72)")
+        "src/${_source} carries device code but is not on the decode-path "
+        "scan list in tests/CMakeLists.txt - add it, or move the device code "
+        "out (issue #72)")
   endif()
 endforeach()
 
@@ -557,11 +702,7 @@ foreach(_source IN LISTS _decode_path_sources)
 endforeach()
 # The remaining sources are held to the collective and floating-point rules
 # only; the termination rule is scoped above.
-file(GLOB _other_sources RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/../src
-     CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.c
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cpp
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.h)
-foreach(_source IN LISTS _other_sources)
+foreach(_source IN LISTS _all_sources)
   if(NOT _source IN_LIST _decode_path_sources)
     cudec_scan_source(${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source} FALSE
                       _found)
@@ -573,5 +714,6 @@ if(_structural_violations)
                       "${_structural_violations}")
 endif()
 
-# Finally: no ctest entry in this directory may be without a timeout.
+# Records this directory's ctest entries as timeout-checked; the sweep at the
+# end of the top-level CMakeLists.txt is what makes the property unforgettable.
 cudec_assert_test_timeouts()

@@ -11,7 +11,12 @@
  * deadline: an expiry FAILS the test with a message instead of blocking. The
  * ctest TIMEOUT on this target is the second line of defence; the process exit
  * on failure is what releases the still-running launch (the driver tears the
- * context down - the test deliberately does not synchronise on the way out). */
+ * context down - the test deliberately does not synchronise on the way out).
+ *
+ * It also covers the launch geometries the kernel refuses. Those are reachable
+ * only through the internal kernel header - never through the public ABI - but
+ * this PR teaches two test binaries to launch it directly, and one of them is
+ * this file. */
 #include "adversarial_blocks.h"
 #include "cudec.h"
 #include "fixtures.h"
@@ -21,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -172,17 +178,33 @@ int DecodeWithWatchdog(const Batch& b, size_t begin, size_t count) {
     return 0;
 }
 
-/* A launch geometry that does not hold one whole warp: the grid-stride loop
- * would advance by zero warps per step and spin forever, so the kernel has to
- * refuse it itself rather than trust its caller. The shipped entry point never
- * produces this geometry, which is exactly why nothing else would catch a
- * regression here. Same watchdog: a spin is reported, not waited on. */
-int RequireSubWarpLaunchTerminates(const Batch& b) {
+/* Launch geometries the kernel's chunk-to-lane mapping does not support, and
+ * that the shipped entry point never produces - which is exactly why nothing
+ * else would catch a regression here:
+ *  - <<<1, 16>>>  : the whole grid holds less than one warp, so the
+ *                   grid-stride loop advances by zero and spins forever;
+ *  - <<<2, 16>>>  : two half-warps in two blocks both map to chunk 0, and
+ *                   `lane` only ever takes 0-15 while the copy loops stride by
+ *                   32 - every output byte at i % 32 >= 16 is written by
+ *                   nobody, and the full-mask __syncwarp() is executed by half
+ *                   a warp;
+ *  - <<<2, 48>>>  : the same split, one warp deeper into the grid.
+ * The kernel must refuse all three rather than trust its caller. Verified two
+ * ways, because "it finished" is not the property that matters: the watchdog
+ * catches the spin, and the device state is checked to be untouched
+ * afterwards - a refusal writes no output and no result record. */
+struct UnsupportedGeometry {
+    const char* name;
+    unsigned blocks;
+    unsigned threads;
+};
+
+int RequireGeometryRefused(const Batch& b, const UnsupportedGeometry& g) {
     cudaStream_t stream;
     cudaEvent_t finished;
     REQUIRE_CUDA(cudaStreamCreate(&stream));
     REQUIRE_CUDA(cudaEventCreateWithFlags(&finished, cudaEventDisableTiming));
-    cudec_detail::lz4_decode_batch<false><<<1, 16, 0, stream>>>(
+    cudec_detail::lz4_decode_batch<false><<<g.blocks, g.threads, 0, stream>>>(
         b.d_srcs, b.d_sizes, b.d_dsts, b.d_caps, b.n, b.d_results);
     REQUIRE_CUDA(cudaGetLastError());
     REQUIRE_CUDA(cudaEventRecord(finished, stream));
@@ -199,13 +221,38 @@ int RequireSubWarpLaunchTerminates(const Batch& b) {
                                           start)
                 .count();
         REQUIRE_CTX(elapsed < kDeadlineSeconds,
-                    "a sub-warp launch geometry (<<<1, 16>>>) did not "
-                    "terminate within %.0f s",
-                    kDeadlineSeconds);
+                    "the unsupported launch geometry %s did not terminate "
+                    "within %.0f s",
+                    g.name, kDeadlineSeconds);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     REQUIRE_CUDA(cudaEventDestroy(finished));
     REQUIRE_CUDA(cudaStreamDestroy(stream));
+
+    /* Refused means refused: every result record still carries the 0xFF
+     * sentinel BuildBatch primed, and every destination byte is still poison.
+     * Without this the test would pass on a kernel that decoded half of each
+     * chunk and returned. */
+    std::vector<cudec_chunk_result> results(b.n);
+    REQUIRE_CUDA(cudaMemcpy(results.data(), b.d_results,
+                            b.n * sizeof(*b.d_results),
+                            cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < b.n; i++) {
+        REQUIRE_CTX(results[i].status == -1 && results[i].reserved == 0xFFFFFFFFu &&
+                        results[i].bytes_written == UINT64_MAX,
+                    "%s: chunk %zu (%s) result record was written by a "
+                    "geometry the kernel must refuse",
+                    g.name, i, b.names[i].c_str());
+    }
+    std::vector<unsigned char> arena(b.dst_arena_size, 0);
+    REQUIRE_CUDA(cudaMemcpy(arena.data(), b.d_dst_arena, b.dst_arena_size,
+                            cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < arena.size(); i++) {
+        REQUIRE_CTX(arena[i] == kDstPoison,
+                    "%s: destination byte %zu was written by a geometry the "
+                    "kernel must refuse",
+                    g.name, i);
+    }
     return 0;
 }
 
@@ -237,7 +284,8 @@ int CheckResults(const Batch& b) {
      * reject paths' termination. */
     REQUIRE(rejected != 0);
     std::printf("termination_gpu: %zu chunks decoded within the watchdog "
-                "deadline (%zu rejected, all with a defined status)\n",
+                "deadline (%zu rejected, all with a defined status); three "
+                "unsupported launch geometries refused without writing\n",
                 b.n, rejected);
     return 0;
 }
@@ -253,6 +301,18 @@ int main() {
     Batch batch;
     REQUIRE(BuildBatch(chunks, &batch) == 0);
 
+    /* The unsupported geometries FIRST, while the device state is still the
+     * pristine sentinel/poison BuildBatch primed - that is what lets the
+     * refusal be asserted as "wrote nothing" rather than merely "returned". */
+    static const UnsupportedGeometry kUnsupported[] = {
+        {"<<<1, 16>>>", 1, 16},
+        {"<<<2, 16>>>", 2, 16},
+        {"<<<2, 48>>>", 2, 48},
+    };
+    for (const UnsupportedGeometry& g : kUnsupported) {
+        REQUIRE(RequireGeometryRefused(batch, g) == 0);
+    }
+
     /* The whole corpus in one launch: a single non-terminating warp holds
      * the launch, which is exactly the failure this test must observe. */
     REQUIRE(DecodeWithWatchdog(batch, 0, batch.n) == 0);
@@ -261,9 +321,6 @@ int main() {
     for (size_t i = 0; i < batch.n; i++) {
         REQUIRE(DecodeWithWatchdog(batch, i, 1) == 0);
     }
-    /* After the real launches, so the results it must not touch are already
-     * the ones CheckResults verifies below. */
-    REQUIRE(RequireSubWarpLaunchTerminates(batch) == 0);
     REQUIRE(CheckResults(batch) == 0);
     return 0;
 }

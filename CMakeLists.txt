@@ -86,21 +86,51 @@ if(CUDEC_ENABLE_CUDA)
   # against a loaded machine and a sanitized (-O0 + ASan) build, and finite
   # against "never".
   set(CUDEC_TEST_TIMEOUT_SECONDS 300)
+  # An upper bound too: a TIMEOUT of 99999999 is finite and useless, and the
+  # point of the property is that a hang reds the run inside a human wait.
+  set(CUDEC_TEST_TIMEOUT_CEILING 3600)
 
-  # ...and the property must not be forgettable. This walks the ctest
-  # entries registered in the calling directory and reds the configure step
-  # on any entry without a finite timeout, so a test added by hand (as
-  # bench/ does) is covered exactly like one from cudec_add_test.
+  # ...and the property must not be forgettable. A test property can only be
+  # read from the directory that declared it (get_test_property is
+  # directory-scoped before CMake 3.28, and the pinned minimum here is 3.24),
+  # so this runs in two halves: each directory that registers tests calls
+  # cudec_assert_test_timeouts(), which checks and RECORDS what it verified,
+  # and the sweep below - run once, last, from the top level - walks every
+  # subdirectory and fails on any registered test that was never recorded.
+  # That closes both ways the per-directory call is forgettable: a future
+  # add_subdirectory that never calls it, and an add_test appended after the
+  # call site.
   function(cudec_assert_test_timeouts)
     get_property(_tests DIRECTORY PROPERTY TESTS)
     foreach(_test IN LISTS _tests)
       get_test_property(${_test} TIMEOUT _timeout)
-      if(NOT _timeout)
+      if(NOT _timeout OR NOT _timeout MATCHES "^[0-9]+$"
+         OR _timeout GREATER ${CUDEC_TEST_TIMEOUT_CEILING})
         message(
           FATAL_ERROR
-            "ctest entry '${_test}' has no TIMEOUT: every test must fail on "
-            "a hang rather than stall the run (issue #72)")
+            "ctest entry '${_test}' has no usable TIMEOUT (got '${_timeout}', "
+            "want 1..${CUDEC_TEST_TIMEOUT_CEILING} seconds): every test must "
+            "fail on a hang rather than stall the run (issue #72)")
       endif()
+      set_property(GLOBAL APPEND PROPERTY CUDEC_TIMEOUT_CHECKED_TESTS ${_test})
+    endforeach()
+  endfunction()
+
+  function(cudec_sweep_test_timeouts dir)
+    get_property(_checked GLOBAL PROPERTY CUDEC_TIMEOUT_CHECKED_TESTS)
+    get_property(_tests DIRECTORY ${dir} PROPERTY TESTS)
+    foreach(_test IN LISTS _tests)
+      if(NOT _test IN_LIST _checked)
+        message(
+          FATAL_ERROR
+            "ctest entry '${_test}' (registered in ${dir}) was never checked "
+            "for a TIMEOUT: call cudec_assert_test_timeouts() at the END of "
+            "that directory's CMakeLists.txt (issue #72)")
+      endif()
+    endforeach()
+    get_property(_subs DIRECTORY ${dir} PROPERTY SUBDIRECTORIES)
+    foreach(_sub IN LISTS _subs)
+      cudec_sweep_test_timeouts(${_sub})
     endforeach()
   endfunction()
 
@@ -140,4 +170,8 @@ if(CUDEC_ENABLE_CUDA)
   if(NOT CUDEC_SANITIZE)
     add_subdirectory(bench)
   endif()
+
+  # Last, so it sees every directory both subdirectories added: no ctest entry
+  # anywhere in the tree may have escaped the timeout check (issue #72).
+  cudec_sweep_test_timeouts(${CMAKE_CURRENT_SOURCE_DIR})
 endif()

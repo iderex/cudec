@@ -1,8 +1,15 @@
 # Determinism
 
 cudec's decode path is **`gpu_to_gpu` deterministic**: the same compressed
-input produces bit-identical output on any supported GPU, in any launch
-configuration, in any run.
+input produces bit-identical output on any supported GPU, in any supported
+launch configuration, in any run.
+
+"Supported launch configuration" is a real qualifier, not a hedge. The kernel's
+chunk-to-lane mapping requires a block size that is a whole number of warps and
+a grid holding at least one whole warp; the shipped entry point always launches
+`kBlockThreads`, and the kernel rejects any other geometry outright by
+returning without decoding, rather than producing output nobody wrote. See
+"What the level does not promise" below.
 
 The level names come from NVIDIA's CCCL determinism vocabulary
 (`not_guaranteed` / `run_to_run` / `gpu_to_gpu`), borrowed here so the promise
@@ -15,14 +22,14 @@ runtime, and no CCCL dependency is added.
 For one compressed chunk and one destination capacity, the decoded bytes, the
 per-chunk status, and `bytes_written` are identical:
 
-| Axis                  | Promise                                                                                                               |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Run to run            | Identical, same process or a fresh one.                                                                               |
-| Launch configuration  | Identical for any grid size, block size, chunk-to-warp mapping, or number of concurrent streams.                      |
-| Batch composition     | Identical whether the chunk is decoded alone, in a batch, or in a differently ordered batch — chunks are independent. |
-| Entry point           | Identical through the batch entry, the frame decoder, and the streaming context, fresh or reused.                     |
-| GPU to GPU            | Identical on any device the library supports (`sm_80` baseline and newer).                                            |
-| Driver / CUDA version | Identical: the arithmetic is integer and the output-byte mapping is fixed at the source level, not at the ISA level.  |
+| Axis                  | Promise                                                                                                                                                                                               |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Run to run            | Identical, same process or a fresh one.                                                                                                                                                               |
+| Launch configuration  | Identical for any grid size, any block size that is a whole number of warps, any chunk-to-warp mapping, and any number of concurrent streams. Other block sizes are refused, not decoded differently. |
+| Batch composition     | Identical whether the chunk is decoded alone, in a batch, or in a differently ordered batch — chunks are independent.                                                                                 |
+| Entry point           | Identical through the batch entry, the frame decoder, and the streaming context, fresh or reused.                                                                                                     |
+| GPU to GPU            | Identical on any device the library supports (`sm_80` baseline and newer).                                                                                                                            |
+| Driver / CUDA version | Identical: the arithmetic is integer and the output-byte mapping is fixed at the source level, not at the ISA level.                                                                                  |
 
 ## Why it holds
 
@@ -35,7 +42,10 @@ non-deterministic in it to control:
   A configure-time check in `tests/CMakeLists.txt` reds the build if any FP type
   or FP atomic appears in the sources.
 - **Every output byte is written exactly once**, by a statically determined
-  lane, as a pure function of the input and of bytes at lower addresses. An
+  lane — given a supported launch geometry, which the kernel enforces rather
+  than assumes: the copy loops stride by the warp size, so a block that is not
+  a whole number of warps would leave a fixed slice of every destination
+  written by nobody. That geometry returns without decoding instead. An
   overlapping match is not a copy that chases itself but a modular gather
   `dst[d + i] = dst[d - off + (i mod off)]`, reading only the region a
   `__syncwarp()` has already frozen (masterplan section 9). There is no
@@ -54,6 +64,18 @@ non-deterministic in it to control:
   decoder never presents partial output as success, and the bytes it happened to
   write before rejecting are not part of the contract. The _status_ for a given
   input is deterministic; the leftover bytes are not.
+- **Nothing about unsupported launch geometry.** A block size that is not a
+  whole number of warps, or a grid holding less than one whole warp, is refused
+  by the kernel: it returns without touching the destinations or the result
+  records, so the caller sees whatever it primed them with. That is a defined
+  refusal, not a decode — and it is only reachable through the internal kernel
+  header, never through the public ABI, which always launches `kBlockThreads`.
+  `tests/termination_gpu.cu` covers `<<<1, 16>>>`, `<<<2, 16>>>`, and
+  `<<<2, 48>>>`. One further geometry bound is **documented rather than
+  enforced**: the kernel's thread index is 32-bit, so it requires
+  `gridDim.x * blockDim.x <= 2^32`. Enforcing that costs an sm_86 occupancy
+  step (measured, [BENCHMARKS.md](BENCHMARKS.md)), the shipped grid is capped
+  at 8192 blocks, and no public entry point can approach it.
 - **Nothing about timing.** Throughput varies with geometry, occupancy, clocks,
   and neighbours. Determinism here is about bytes, never about duration.
 - **Nothing about memory addresses.** Allocation addresses and the pointer values
@@ -70,6 +92,8 @@ non-deterministic in it to control:
   grid/block geometries (a single warp walking the whole batch through the
   grid-stride loop, block sizes of 32/64/96/128, a grid far larger than the
   batch, and the shipped sizing) plus a three-stream split of the same batch.
+  Every geometry here is a supported one; the refused geometries are covered by
+  `tests/termination_gpu.cu` instead.
   The whole destination arena is re-poisoned before every run and compared in
   full — decoded bytes and the untouched poison beyond `bytes_written` — along
   with every per-chunk result record.
