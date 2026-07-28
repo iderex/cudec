@@ -5,19 +5,21 @@
 # three days, not to none. The weekly schedule quantises it, so real latency
 # runs up to a week beyond the nominal figure.
 #
-# Three things it does not reach, because it reads stronger than it is:
+# It reaches only what Dependabot proposes from an ecosystem listed below, and
+# only where a bump is a NEW PUBLICATION. Not an exhaustive list of gaps — the
+# ones already known here are enough to show the shape:
 #
-#   - A RE-POINTED TAG. `v4` moved to a new commit keeps the release's original
-#     publication date, so there is nothing new to hold. SHA-pinning covers it.
-#   - Dependencies Dependabot cannot see: `tests/CMakeLists.txt` fetches
-#     `lz4-1.10.0.tar.gz` by URL, outside every ecosystem listed here.
-#   - Security-update behaviour. The hold does not delay them, but whether they
-#     exist at all is a repository setting, not something this file decides.
+#   - a re-pointed tag: `v4` moved to a new commit keeps the release's original
+#     publication date, so there is nothing new to hold, and SHA-pinning is what
+#     covers it;
+#   - anything fetched outside an ecosystem, such as the `lz4-1.10.0.tar.gz`
+#     URL in `tests/CMakeLists.txt` and the digest-pinned CUDA base image;
+#   - whether security updates exist at all, which is a repository setting. The
+#     hold does not delay them; it also cannot enable them.
 #
-# No `semver-*-days` key: support is per ecosystem from a table GitHub
-# publishes, and `github-actions` is not in it. Semver is not the criterion —
-# Helm and Terraform are semver and unsupported, Pip and Maven neither and
-# supported.
+# No `semver-*-days` key: `github-actions` is listed in GitHub's cooldown table
+# with its SemVer-tier column crossed. Checked 2026-07-28 against the Dependabot
+# options reference.
 
 version: 2
 
