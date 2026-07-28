@@ -1,4 +1,25 @@
 # Dependabot — weekly maintenance for the GitHub Actions SHA pins.
+#
+# `cooldown` holds a bump until N days after the release was PUBLISHED, so the
+# advisory feeds have time to catch a compromised release before it lands here.
+# Security updates are exempt: GitHub's options reference states the cooldown
+# "does not apply to security updates", so an advisory fix is never delayed.
+#
+# WHAT IT DOES NOT COVER, stated because the setting reads stronger than it is:
+# the attack that actually hits `github-actions` is a re-pointed tag — `v4`
+# moved to a new commit — and the underlying release keeps its original
+# publication date, so a publication-date hold adds no delay to it at all. What
+# defends against that here is SHA-pinning, not this file.
+#
+# No `semver-*-days` tier key: those are supported per ecosystem by a table
+# GitHub publishes, and `github-actions` is not in it. Being semver is not the
+# criterion — Helm and Terraform are semver and unsupported, Pip and Maven are
+# not semver and supported. This repo builds with CMake and CUDA and has no
+# other Dependabot ecosystem, so a single hold is the whole of it.
+#
+# The hold compounds with the weekly schedule: a release published just after a
+# Monday tick waits out the hold and then waits for the next tick, so real
+# latency runs up to a week beyond the nominal figure.
 
 version: 2
 
@@ -11,6 +32,8 @@ updates:
       time: "05:00"
       timezone: Etc/UTC
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       actions-minor-and-patch:
         update-types:
