@@ -1,7 +1,8 @@
 # Dependabot — weekly maintenance for the GitHub Actions SHA pins.
 #
-# The 7-day cooldown raises the platform default of 3. What it does and does
-# not reach is recorded on #122.
+# The 7-day cooldown raises the platform default of 3; the weekly schedule
+# pushes the delivered hold past seven. It reaches this one ecosystem only —
+# FetchContent pins are invisible to Dependabot, per docs/MASTERPLAN.md.
 
 version: 2
 
