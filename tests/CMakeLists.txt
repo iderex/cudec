@@ -408,7 +408,10 @@ function(cudec_scan_source path check_loops out_violations)
         set(_form_line ${_for_start})
         if(_for_open LESS_EQUAL 0)
           set(_for_open 0)
-          if(_for_semis LESS 2 AND NOT _for_text MATCHES ":")
+          # '::' out first, for the reason spelled out at the single-line
+          # branch below: a qualified name is not a range-for.
+          string(REPLACE "::" "" _range_text "${_for_text}")
+          if(_for_semis LESS 2 AND NOT _range_text MATCHES ":")
             set(_form "a 'for' header without a visible condition and increment")
           endif()
         elseif(_for_lines GREATER 8)
@@ -433,13 +436,18 @@ function(cudec_scan_source path check_loops out_violations)
         # Covers both `for (;;)` and `for (init;; incr)`.
         set(_form "a 'for' loop with an empty condition")
       elseif(_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\(")
+        # The range-for test runs on the header with '::' removed: the colons
+        # of a qualified name (`cudec_detail::Foo`) carry none of the meaning
+        # the exemption rests on, and left in they would exempt any opaque
+        # header that happens to mention one.
+        string(REPLACE "::" "" _range_text "${_code}")
         if(_balance GREATER 0)
           set(_for_open ${_balance})
           set(_for_semis ${_line_semis})
           set(_for_start ${_lineno})
           set(_for_lines 1)
           set(_for_text "${_code}")
-        elseif(_line_semis LESS 2 AND NOT _code MATCHES ":")
+        elseif(_line_semis LESS 2 AND NOT _range_text MATCHES ":")
           # A balanced header with fewer than two semicolons has no visible
           # induction variable - a macro-hidden loop, say. A range-for
           # (`for (T& x : container)`) is exempt by the ':': its bound is the
@@ -596,6 +604,13 @@ file(
   "         blocks) {\n"
   "        total += wrapped.size;\n"
   "    }\n"
+  "    for (const cudec_detail::Block& scoped : blocks) {\n"
+  "        total += scoped.size;\n"
+  "    }\n"
+  "    for (const cudec_detail::Block& scoped_wrapped :\n"
+  "         blocks) {\n"
+  "        total += scoped_wrapped.size;\n"
+  "    }\n"
   "    unsigned fuel = n + 1;\n"
   "    while (fuel-- != 0) {\n"
   "        total += 1;\n"
@@ -681,6 +696,20 @@ file(WRITE ${_probe_dir}/scan_for_opaque_wrapped.cu
      "    unsigned count = 0;\n" "    for (EACH_CHUNK(chunk,\n"
      "                    src)) {\n" "        count += chunk;\n" "    }\n"
      "    return count;\n" "}\n")
+# The same opaque header carrying a qualified name. Its '::' is not a
+# range-for's ':' and must not exempt it - single-line, and wrapped with the
+# qualified name on the continuation line, where only the accumulated header
+# text can see it.
+file(WRITE ${_probe_dir}/scan_for_opaque_qualified.cu
+     "unsigned probe(const unsigned char* src) {\n"
+     "    unsigned count = 0;\n"
+     "    for (EACH_CHUNK(chunk, cudec_detail::chunks_of(src))) {\n"
+     "        count += chunk;\n" "    }\n" "    return count;\n" "}\n")
+file(WRITE ${_probe_dir}/scan_for_opaque_qualified_wrapped.cu
+     "unsigned probe(const unsigned char* src) {\n"
+     "    unsigned count = 0;\n" "    for (EACH_CHUNK(chunk,\n"
+     "                    cudec_detail::chunks_of(src))) {\n"
+     "        count += chunk;\n" "    }\n" "    return count;\n" "}\n")
 # A `for` header the scan cannot balance must be rejected, not skipped: while
 # the tracker is open the whole loop rule is off, so a silent skip would
 # disable the termination check for the rest of the file. String literals are
@@ -729,6 +758,8 @@ set(_scanner_probes
     "scan_fp_atomic|floating-point atomic"
     "scan_for_opaque|scan_for_opaque.cu:3: a 'for' header without a visible"
     "scan_for_opaque_wrapped|scan_for_opaque_wrapped.cu:3: a 'for' header without a visible"
+    "scan_for_opaque_qualified|scan_for_opaque_qualified.cu:3: a 'for' header without a visible"
+    "scan_for_opaque_qualified_wrapped|scan_for_opaque_qualified_wrapped.cu:3: a 'for' header without a visible"
     "scan_for_unbalanced|closing parenthesis was not found within 8 lines"
     "scan_for_unbalanced_eof|left unbalanced at end of file"
     "scan_wrapped_after_mask|is wrapped across lines")
