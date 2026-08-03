@@ -313,7 +313,11 @@ endforeach()
 #    `fuel` counter on its own line, the line above it, or the three below,
 #    because a text scan cannot verify a monotone-cursor argument and a
 #    non-terminating decode hangs the device (nvCOMP 5.3's release notes
-#    record shipping exactly that on malformed Snappy input);
+#    record shipping exactly that on malformed Snappy input). The one
+#    forgiven form is `do { ... } while (0)`, the wrapper that makes a macro
+#    body a single statement: its body runs once, so there is no exit
+#    condition for a cap to bound. It is forgiven as an idiom rather than
+#    per file, so a real loop in the same header is still seen;
 #  - warp collectives: the legacy non-_sync intrinsics are banned outright
 #    (since Volta's independent thread scheduling they cannot express which
 #    lanes participate at all), and a collective's mask must be a full-warp
@@ -329,8 +333,11 @@ endforeach()
 # Limits, stated as the neighbouring checks state theirs: constructs hidden
 # inside string literals are not stripped; a mask computed into a variable on
 # an earlier line is judged by its name at the call site; a `fuel` mention on
-# the line above an unrelated loop satisfies the loop rule; and a loop or
-# intrinsic introduced under a fresh spelling is code review's job.
+# the line above an unrelated loop satisfies the loop rule; a `do { ... }
+# while (0)` written out rather than wrapped in a macro is reported once its
+# body passes two lines, because its tail is then outside the three-line
+# window the `fuel` mention gets and a macro's tail is never outside it; and a
+# loop or intrinsic introduced under a fresh spelling is code review's job.
 function(cudec_scan_source path check_loops out_violations)
   set(_violations "")
   set(_in_comment FALSE)
@@ -385,7 +392,13 @@ function(cudec_scan_source path check_loops out_violations)
 
     if(check_loops)
       if(_pending_left GREATER 0)
-        if(_code MATCHES "fuel")
+        # A `while (0)` below a pending `do` is that `do`'s tail: the idiom,
+        # not a loop. Only a pending `do` is cleared this way - a `while` or a
+        # `for` above an unrelated `while (0)` keeps its requirement, so the
+        # idiom clause cannot swallow the rule it sits inside.
+        if(_code MATCHES "fuel"
+           OR (_pending_reason STREQUAL "a 'do' loop"
+               AND _code MATCHES "while[ \t]*\\([ \t]*0[ \t]*\\)"))
           set(_pending_left 0)
         else()
           math(EXPR _pending_left "${_pending_left} - 1")
@@ -426,12 +439,22 @@ function(cudec_scan_source path check_loops out_violations)
                  "parenthesis was not found within 8 lines - the scan cannot "
                  "judge it, so it is rejected rather than skipped\n")
         endif()
+      elseif(_code MATCHES "[^A-Za-z_0-9]do[ \t]*{")
+        # Before the tail branch below, not after it, because a
+        # backslash-continued macro reaches this scan as ONE line:
+        # file(STRINGS) hands back the file as a list, and a trailing '\'
+        # escapes the separator that would have ended the element, so the
+        # whole macro body is joined into one. A macro-hidden
+        # `do { ... } while (cond)` therefore carries its own tail, and the
+        # tail branch below would take it for someone else's tail and let a
+        # real loop through.
+        if(NOT _code MATCHES "while[ \t]*\\([ \t]*0[ \t]*\\)")
+          set(_form "a 'do' loop")
+        endif()
       elseif(_code MATCHES "\\}[ \t]*while")
         # The tail of a do-while; its `do {` carries the requirement.
       elseif(_code MATCHES "[^A-Za-z_0-9]while[ \t]*\\(")
         set(_form "a 'while' loop")
-      elseif(_code MATCHES "[^A-Za-z_0-9]do[ \t]*{")
-        set(_form "a 'do' loop")
       elseif(_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\([^)]*;[ \t]*;")
         # Covers both `for (;;)` and `for (init;; incr)`.
         set(_form "a 'for' loop with an empty condition")
@@ -587,6 +610,12 @@ file(
   WRITE ${_probe_dir}/scan_clean.cu
   "/* Prose naming while, do, for, float, double, __shfl( and a mask from a\n"
   " * token - the comment stripper must remove all of it. */\n"
+  "#define PROBE_CHECK(call) \\\n"
+  "    do {                  \\\n"
+  "        if ((call) != 0) {\\\n"
+  "            return 0;     \\\n"
+  "        }                 \\\n"
+  "    } while (0)\n"
   "unsigned probe_counted(unsigned n) {\n"
   "    unsigned total = 0;\n"
   "    for (unsigned i = 0; i < n; i++) {\n"
@@ -623,6 +652,9 @@ file(
   "        }\n"
   "        left = left - 1;\n"
   "    } while (left != 0);\n"
+  "    do {\n"
+  "        total += 1;\n"
+  "    } while (0);\n"
   "    return total;\n"
   "}\n"
   "__device__ int probe_collective(int v) {\n"
@@ -647,6 +679,34 @@ file(
   "    do {\n"
   "        count += src[count % n];\n"
   "    } while (count != 0);\n"
+  "    return count;\n"
+  "}\n")
+# The same loop hidden in a macro, which the scan reads as a single line
+# because the continuations join it. The line number is asserted with the
+# text: `:1:` is the whole macro, and reporting it anywhere else would mean
+# the join stopped happening and the probe stopped covering the macro case.
+file(
+  WRITE ${_probe_dir}/scan_loop_do_macro.cu
+  "#define PROBE_RETRY(src, n) \\\n"
+  "    do {                    \\\n"
+  "        count += src[count % n];\\\n"
+  "    } while (count != 0)\n"
+  "unsigned probe(const unsigned char* src, unsigned n) {\n"
+  "    unsigned count = src[0];\n"
+  "    PROBE_RETRY(src, n);\n"
+  "    return count;\n"
+  "}\n")
+# The idiom clause is for a pending `do` and nothing else. Here a `while` loop
+# with no cap is followed, inside its window, by a `do { } while (0);` that has
+# nothing to do with it. The `while` must still be reported.
+file(
+  WRITE ${_probe_dir}/scan_loop_while_zero_below.cu
+  "unsigned probe(const unsigned char* src, unsigned n) {\n"
+  "    unsigned count = src[0];\n"
+  "    while (count != 0) {\n"
+  "        count += src[count % n];\n"
+  "    }\n"
+  "    do { } while (0);\n"
   "    return count;\n"
   "}\n")
 file(WRITE ${_probe_dir}/scan_loop_forever.cu
@@ -744,6 +804,8 @@ endif()
 set(_scanner_probes
     "scan_loop_while|a 'while' loop with no explicit decrementing 'fuel' cap"
     "scan_loop_do|a 'do' loop with no explicit decrementing 'fuel' cap"
+    "scan_loop_do_macro|scan_loop_do_macro.cu:1: a 'do' loop with no explicit"
+    "scan_loop_while_zero_below|scan_loop_while_zero_below.cu:3: a 'while' loop with no explicit"
     "scan_loop_forever|a 'for' loop with an empty condition with no explicit"
     "scan_loop_empty_condition|a 'for' loop with an empty condition with no explicit"
     "scan_legacy_intrinsic|legacy warp intrinsic '__shfl'"
@@ -789,12 +851,9 @@ endforeach()
 #  - xxhash32.h: its loops walk a caller-supplied buffer at a fixed stride
 #    with no stream-derived exit condition, and it is a checksum helper rather
 #    than a decoder.
-#  - cuda_raii.h: its only `do` is the `do { ... } while (0)` wrapper that
-#    makes the CUDA-error-check macro a single statement - an idiom, not a
-#    loop.
 #
-# Both are still held to the warp-collective and floating-point rules.
-set(_loop_rule_exempt xxhash32.h cuda_raii.h)
+# It is still held to the warp-collective and floating-point rules.
+set(_loop_rule_exempt xxhash32.h)
 file(GLOB_RECURSE _all_sources RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/../src
      CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.c
