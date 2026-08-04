@@ -1,6 +1,6 @@
 # Security policy
 
-cudec decodes untrusted input by design — compressed bitstreams are classic
+cudec decodes untrusted input by design - compressed bitstreams are classic
 attack surface, and a GPU decoder that trusts its input is a vulnerability
 with a very wide blast radius. The security posture is therefore central,
 not incidental:

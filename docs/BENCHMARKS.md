@@ -1,11 +1,11 @@
 # Benchmarks
 
-The narrative write-up — how these numbers are read, reproduced, and
-positioned — is [BENCHMARK-METHODOLOGY.md](BENCHMARK-METHODOLOGY.md). This
+The narrative write-up - how these numbers are read, reproduced, and
+positioned - is [BENCHMARK-METHODOLOGY.md](BENCHMARK-METHODOLOGY.md). This
 file is the raw baseline record it is built on.
 
 The baseline record. Every entry carries the full methodology block as
-emitted by the harness (`bench/bench_lz4`, `--gpu` for the device path) — a
+emitted by the harness (`bench/bench_lz4`, `--gpu` for the device path) - a
 number without its methodology cannot be produced, by construction.
 Regressions against the recorded baselines block merges unless explicitly
 justified ([MASTERPLAN](MASTERPLAN.md) section 5). Corpora are fetched
@@ -42,7 +42,7 @@ gather is the prime suspect).
 
 The parse-only number ceilings **both** single-pass and any two-phase
 design (a two-phase phase-1 runs the identical serial parse, so it cannot
-exceed ~35 GB/s either). Two-phase's only lever is a faster phase-2 copy —
+exceed ~35 GB/s either). Two-phase's only lever is a faster phase-2 copy -
 but single-pass's copy is equally optimizable, and doing so needs no table,
 no barrier, and no extra memory traffic. **The decomposition question is
 therefore settled for single-pass.** Perf pass 1 (#16) then measured the
@@ -66,32 +66,32 @@ improvement):
 | `__syncwarp` elision on zero-literal sequences | neutral         | the barriers are not the bottleneck                                                                                                  |
 
 The empirical conclusion: the minimal-correct byte-per-lane kernel is at a
-local optimum for this workload. The bottleneck is **structural** — the
+local optimum for this workload. The bottleneck is **structural** - the
 redundant 32-lane parse sets the ~34 GB/s ceiling, and the copies are
 latency-bound on the short literal/match runs typical of real data, where
 neither a cheaper modulo nor wider copies help. Meaningful gains require
 raising the parse ceiling itself (higher occupancy via register reduction,
-or warp-specialization), which is larger than a micro-op pass — tracked as
+or warp-specialization), which is larger than a micro-op pass - tracked as
 a follow-up (issue #21).
 
 **Falsification-trigger verdict (masterplan section 9).** The shipped
 kernel is ~5× CPU (below the ~15× reopen threshold), but two-phase stays
 **ruled out**: the parse-only ceiling (~10× CPU) bounds any two-phase
 phase-1, which shares the identical serial parse, so two-phase cannot reach
-~15× either. The trigger's numeric condition is met while its purpose — does
-two-phase help? — is answered NO by the arithmetic. The path to higher
+~15× either. The trigger's numeric condition is met while its purpose - does
+two-phase help? - is answered NO by the arithmetic. The path to higher
 throughput is structural single-pass work, not a decomposition change.
 
 ### Perf pass 2 (issue #21): the occupancy lever does not help either
 
-Perf pass 1 named the remaining structural lever — raise the ~34 GB/s parse
+Perf pass 1 named the remaining structural lever - raise the ~34 GB/s parse
 ceiling through higher occupancy. This pass profiled the kernel and measured
 that lever directly; it too is rejected by measurement.
 
 **Profile (pinned container, RTX 3080 sm_86, `nvcc -Xptxas -v`).** The shipped
 `lz4_decode_batch` (Full) uses **46 registers/thread** on sm_86 (48 on sm_80).
-On sm_86 — 65536 registers/SM, 256-register warp allocation granularity,
-128-thread blocks — 46 rounds up to 1536 registers/warp, giving 10 resident
+On sm_86 - 65536 registers/SM, 256-register warp allocation granularity,
+128-thread blocks - 46 rounds up to 1536 registers/warp, giving 10 resident
 blocks → **40 warps/SM (~83% occupancy)**. Register granularity is the wall:
 41–48 registers/thread all fall in the same 1536-register/warp bucket and all
 yield 40 warps; the next occupancy step (48 warps/SM, 100%) requires
@@ -99,9 +99,9 @@ yield 40 warps; the next occupancy step (48 warps/SM, 100%) requires
 
 **The only reachable path forces a spill.** The parser's live state is
 dominated by the 64-bit stream cursors and the six-field `Lz4Sequence`. The
-anti-pattern rule (masterplan section 9) forbids narrowing any of it to 32-bit
-— the ABI's `size_t` capacities admit values above 2^32, pinned by the
-`SIZE_MAX` and beyond-convention capacity tests — so a legitimate drop to 40
+anti-pattern rule (masterplan section 9) forbids narrowing any of it to 32-bit -
+the ABI's `size_t` capacities admit values above 2^32, pinned by the
+`SIZE_MAX` and beyond-convention capacity tests - so a legitimate drop to 40
 registers is not available. `__launch_bounds__(kBlockThreads, 12)` caps ptxas
 at 40 registers only by **spilling to local memory** (sm_86: 16-byte stack
 frame, 20 bytes spill stores, 20 bytes spill loads).
@@ -117,12 +117,12 @@ state is shared):
 
 Forcing 100% occupancy **regresses** the full decode ~5%. Parse-only (still 28
 registers, no spill, so unaffected by the register cap) stays flat across the
-same runs — an internal control that attributes the regression to the spill,
+same runs - an internal control that attributes the regression to the spill,
 not to run-to-run variance; the CPU oracle baseline was in fact slightly faster
 during the variant run. The extra local-memory traffic in the already
 latency-bound parse loop costs more than the eight added warps hide. All ten
 ctest gates (`parser_twin` and `gpu_fixture` oracle parity, `stream_twin`
-determinism, and the rest) stay green on the variant — the change is
+determinism, and the rest) stay green on the variant - the change is
 measurement-rejected, not correctness-rejected. No code shipped; the kernel is
 unchanged.
 
@@ -130,8 +130,8 @@ unchanged.
 current fail-closed architecture: more warps need ≤ 40 registers/thread; ≤ 40
 registers needs either a forbidden 64-bit narrowing or a spill; and the spill
 regresses. Raising the parse ceiling therefore requires the warp-specialization
-rewrite that abandons the load-bearing redundant-lockstep-parse invariant — its
-own design panel, not a measured micro-pass — and under "formats over
+rewrite that abandons the load-bearing redundant-lockstep-parse invariant - its
+own design panel, not a measured micro-pass - and under "formats over
 percentage points" (masterplan section 2) the next format outranks it. Of the
 two levers issue #21 named, the register-reduction lever is measured and
 rejected here; the warp-specialization lever is scoped as a larger design
@@ -144,12 +144,12 @@ modular gather `dst[m+i] = dst[m-off + (i mod off)]` degenerates to a straight
 copy (`i mod off == i` for every `i < match_len <= off`, and the ranges are
 disjoint, so the copy is bit-identical, hazard-free, and the branch is
 warp-uniform). The fast path elides the per-byte 64-bit modulo on every
-non-overlapping match — the common case in real data.
+non-overlapping match - the common case in real data.
 
 Measured 2026-07-18, same pinned container and RTX 3080, baseline and patched
 binaries built from the same tree and A/B-interleaved in one session (two full
-passes, 3 warmup + 30 CUDA-event-timed runs each; all twelve ctest gates —
-oracle parity, determinism — green on the patched kernel first):
+passes, 3 warmup + 30 CUDA-event-timed runs each; all twelve ctest gates -
+oracle parity, determinism - green on the patched kernel first):
 
 The Delta column is throughput speedup (`baseline_ms / fast_path_ms − 1`,
 per-pass), one basis for all three rows so they compare on one scale:
@@ -160,13 +160,13 @@ per-pass), one basis for all three rows so they compare on one scale:
 | `--worst4b --gpu`         | 25.502 / 26.256 ms      | 27.938 / 27.654 ms       | **−8.7% / −5.1%**          |
 | `--longmatch --gpu` (new) | 1.277 / 1.278 ms        | 0.922 / 0.898 ms         | **+38.5% / +42.3%**        |
 
-The gain is real — but so is the regression, and it lands exactly where this
+The gain is real - but so is the regression, and it lands exactly where this
 project refuses to pay: the adversarial worst case. `--worst4b` is offset-1
 minmatch, always overlapping, so the fast-path arm is never taken; the cost is
 the added per-match predicate and the second copy loop's code in the hottest
 per-sequence path of the maximum-sequence-density input (one match per 4
 bytes). The plan's prediction that this would be "one free warp-uniform
-compare" is refuted by measurement — five independent patched `--worst4b`
+compare" is refuted by measurement - five independent patched `--worst4b`
 sessions all landed at 26.8–27.9 ms against a 25.1–26.3 ms baseline (a 5–9%
 throughput regression against the 25.1–26.3 ms baseline pair).
 
@@ -177,13 +177,13 @@ margin (issue #19), and trading it for average-case throughput inverts the
 project's hostile-input-first ordering. No kernel code shipped; the
 `--longmatch` harness corpus and its `bench_longmatch_selfcheck` ctest stay,
 so the regime is one flag away for any future attempt (a formulation that
-recovers the Silesia +9–10% without touching the worst case would be accepted —
+recovers the Silesia +9–10% without touching the worst case would be accepted -
 none is known under the single-loop structure, since the predicate is
 inherently per-match).
 
 ### Best case: the longmatch corpus (issue #36)
 
-The shipped kernel's baseline on the new `--longmatch` corpus — long
+The shipped kernel's baseline on the new `--longmatch` corpus - long
 non-overlapping matches (match length 255 at offset 512), the copy-dominated
 regime that maximally exposes the per-byte modular gather. Hand-constructed
 like `--worst4b` (the standard compressor emits long matches but this shape
@@ -207,7 +207,7 @@ same container and RTX 3080. `--longmatch --gpu`.
 ```
 
 At 165 GB/s the copy-dominated best case runs ~9x the Silesia average and
-within ~4.6x of the ~760 GB/s output-bandwidth ceiling — the modular gather,
+within ~4.6x of the ~760 GB/s output-bandwidth ceiling - the modular gather,
 not bandwidth, is the limiter in this regime (the rejected fast path reached
 ~228–234 GB/s here, from its 0.922 / 0.898 ms A/B passes above over the
 209.72 MB corpus), consistent with the ~250–400 GB/s redundant-parse family
@@ -217,7 +217,7 @@ ceiling published in the masterplan.
 
 A security-posture number. The Silesia rows are an average; the worst case
 for this kernel's throughput is an adversarial-but-valid block of
-back-to-back minimum matches (match length 4, offset 1) — the maximum
+back-to-back minimum matches (match length 4, offset 1) - the maximum
 sequence density a valid LZ4 block can carry, one parsed sequence per 4
 decoded bytes, which drives the redundant 32-lane lockstep parse and the
 closed-form modular gather on every match byte. The standard compressor
@@ -244,22 +244,22 @@ the device and sit at the Silesia scale for a direct comparison.
 - GPU parse-only ceiling (copies elided): p50 13.710 ms, 15.3 GB/s - ceilings this design AND any two-phase phase-1 (shared parse)
 ```
 
-**The degradation is linear and bounded — not an amplification vector.**
+**The degradation is linear and bounded - not an amplification vector.**
 
 - Every path degrades by the same ~2.2–2.3× against the Silesia average:
   CPU 3.41 → 1.49 GB/s, GPU decode 18.1 → 8.1 GB/s, GPU parse-only ceiling
   34.6 → 15.3 GB/s. The uniform factor is the sequence density (one
   sequence per 4 bytes here versus Silesia's longer average matches): the
-  cost is linear in the number of sequences — exactly the redundant parse
+  cost is linear in the number of sequences - exactly the redundant parse
   the kernel design accepts, no super-linear blow-up. This is below the
   issue's pessimistic ~4× estimate.
 - No size amplification. The block barely compresses (ratio 0.750, 157 MB →
   210 MB, ~1.33× expansion) and each chunk decodes to exactly 65536 bytes,
-  capped by the caller's destination capacity — never more. The two
+  capped by the caller's destination capacity - never more. The two
   adversarial axes are mutually exclusive for LZ4: a decompression bomb is
-  one long match — LZ4's length encoding costs ~1 input byte per 255 output
+  one long match - LZ4's length encoding costs ~1 input byte per 255 output
   bytes, so a full-64 KB single-match block is ~260 bytes (~250× expansion,
-  and single-match amplification is capped near 255×) — a single fast
+  and single-match amplification is capped near 255×) - a single fast
   sequence, the opposite of this throughput worst case, and cudec's fixed
   per-chunk output cap fail-closes the size axis regardless.
 - The GPU advantage holds under the worst input: 8.1 GB/s worst-case GPU is
@@ -289,7 +289,7 @@ so the spread is visible rather than averaged away.
 The methodology block below is **one standalone run of the "after" build**,
 pasted whole because the rule here is that a number ships with its
 methodology. Its GPU decode p50 is 12.427 ms, inside that build's observed
-run-to-run range but not identical to the paired mean in the table — the same
+run-to-run range but not identical to the paired mean in the table - the same
 build measured twice, not a discrepancy. The paired means are what the claim
 rests on.
 
@@ -318,8 +318,8 @@ rests on.
 The shipped decode path pays **+2.0% on Silesia**; on the worst case the
 difference (+1.3%) is smaller than the "after" side's own pass-to-pass spread
 (25.285 / 26.661 ms), so it is **not a measurement**, only an upper bound. The
-parse-only ceiling — a diagnostic kernel with the copies elided, never shipped
-— pays 14–17% on both corpora, tightly and reproducibly, which is where the
+parse-only ceiling - a diagnostic kernel with the copies elided, never shipped -
+pays 14–17% on both corpora, tightly and reproducibly, which is where the
 per-sequence cost shows up undiluted by memory stalls.
 
 #### Occupancy is the constraint, and it bounds what the guard may cost
@@ -342,7 +342,7 @@ on the last rung before an occupancy cliff, and that was measured, not assumed:
 The last three rows are why the kernel's 32-bit `warp_in_grid` is **left
 32-bit and documented as a limit rather than enforced**. Three spellings of the
 2^32-thread bound were measured, including one that touches no 64-bit value at
-all and compares two values already live in registers — nvcc 12.6 allocates the
+all and compares two values already live in registers - nvcc 12.6 allocates the
 same four extra registers for all three, so neither "widening is free" nor
 "there must be a cheaper spelling" survives contact with the compiler. Only the
 first was timed; the other two share its register count and therefore its
@@ -353,7 +353,7 @@ already forces `blockDim.x` to a multiple of the warp size, so a wrapped index
 stays warp-aligned: an aliased block recomputes the **same** `warp_in_grid`
 values with a full 0–31 lane range, decodes the same chunks, and writes
 byte-identical values to the same addresses. Exceeding the documented bound
-therefore costs duplicated work — not missing bytes, not a hang, and the output
+therefore costs duplicated work - not missing bytes, not a hang, and the output
 stays bit-identical. That is categorically unlike the two refused geometries,
 where bytes really do go unwritten or the kernel really does spin. Paying an
 occupancy step on every launch to prevent redundant-but-correct output, on a
@@ -376,15 +376,15 @@ taken, across sessions:
 | `while (fuel-- != 0)` at the top of the loop   | 12.744 / 12.822                                              |
 
 Only the first two rows were measured under the paired interleaved protocol,
-and only they separate by more than the shipped build's own run-to-run range
-— so the with/without-cap difference is real and the between-formulation
+and only they separate by more than the shipped build's own run-to-run range -
+so the with/without-cap difference is real and the between-formulation
 differences are **not established**. The shipped formulation was chosen on a
 structural argument, not a measured one: folding the test into the loop's
 existing exit branch adds no branch at the top of the loop. The 32-bit counter
-was dropped on correctness, not speed — keeping its budget unreachable would
+was dropped on correctness, not speed - keeping its budget unreachable would
 need a 4 GiB per-chunk limit, an accept-set change.
 
-The regression is accepted deliberately under the prime-directive ordering —
+The regression is accepted deliberately under the prime-directive ordering -
 **correctness > measured performance**. A decoder that hangs on hostile input
 has failed open in the availability direction; nvCOMP 5.3's release notes
 record shipping exactly that bug class in its Snappy decoder. Recovering the
@@ -397,7 +397,7 @@ The streaming decode path is now a reusable context
 (`cudec_stream_ctx_create` / `cudec_lz4_decompress_stream_ctx` /
 `cudec_stream_ctx_destroy`, issue #29) that owns one CUDA stream and grow-only
 pinned/device staging, created once and reused across decodes. It replaces the
-per-call N-stream ring of #24 (dropped — the overlap it provided is not worth
+per-call N-stream ring of #24 (dropped - the overlap it provided is not worth
 its complexity for LZ4; see below). The wall is CPU-clocked around the whole
 synchronous decode call (pinned staging + H2D + decode +, for host output,
 D2H). Recorded 2026-07-17, same container and RTX 3080 as the M1 rows.
@@ -419,41 +419,41 @@ NOT the dominant cost.** #24 could not account for ~233 ms of its ~249 ms
 one-shot wall, named the per-call `cudaHostAlloc`/`cudaMalloc` of the ring as
 the prime suspect, and declared a reusable context "required, not optional." A
 reusable context that allocates nothing in steady state now measures the
-allocation directly — and it is only **~8 ms** (cold − steady), not ~233 ms.
+allocation directly - and it is only **~8 ms** (cold − steady), not ~233 ms.
 The steady-state device wall is still **~230 ms**, against a ~12 ms
 device-resident decode (one launch over all 3239 chunks) and a ~4 ms compressed
 H2D (M1/#24). The ~213 ms residual is therefore neither allocation (excluded:
-steady == cold to within 8 ms) nor copy/decode (~16 ms together) — it is the
+steady == cold to within 8 ms) nor copy/decode (~16 ms together) - it is the
 **per-wave serial submission** of the batch in 64-chunk waves (~51 waves for
 Silesia), one H2D + launch + event-gated reuse + result D2H per wave on this
 WSL2/WDDM setup where each submission flush costs milliseconds. The
 device-resident path is ~12 ms precisely because it submits **once**; the
 streaming path submits ~51 times. Not separately isolated, but attributed by
 exclusion. Raising the wave granularity so the path submits once is the real
-lever, out of this change's scope — **issue #33**.
+lever, out of this change's scope - **issue #33**.
 
 **So the reusable context is a simplification, not the speedup #24
-anticipated** — and it still earns its place under correctness > measured
+anticipated** - and it still earns its place under correctness > measured
 performance > minimal code: it deletes the entire N-stream ring (the overlap
 machinery the analysis below shows LZ4 does not benefit from), removes a
 `streams` ABI parameter the #24 measurement proved only degraded throughput,
 and is the correct primitive issue #33 builds on. The `stream_twin` conformance
 property now locks the reuse guarantee: the same input decoded on a reused
-context — after any number of prior decodes, including one that grew the
-staging — is bit-identical to a fresh-context decode.
+context - after any number of prior decodes, including one that grew the
+staging - is bit-identical to a fresh-context decode.
 
-**Why dropping the N-stream overlap was right — a better compression ratio
+**Why dropping the N-stream overlap was right - a better compression ratio
 makes input-H2D overlap LESS valuable.** #24's overlap premise was that a
 caller serializes copy-then-decode; but for LZ4 the compressed H2D is only
 ~4 ms against a ~12 ms decode (LZ4's ~2:1 ratio keeps the input small), so
 perfect input-side overlap saves `16 − max(4, 12) = 4 ms` at best (~25 %
 ceiling) and was never realized. The better a format compresses, the smaller
-its input half relative to decode, and the less input-H2D overlap can ever pay
-— LZ4's ratio is exactly why it does not. The genuine overlap lever for the
+its input half relative to decode, and the less input-H2D overlap can ever pay -
+LZ4's ratio is exactly why it does not. The genuine overlap lever for the
 high-ratio M3+ formats (Zstd, GDeflate), where decode dwarfs the input
 transfer, is overlapping decode against the decoded-**output** D2H (an output
 ring on the host-output path), NOT the input H2D. That is the change that would
-reverse this simplification, and it needs its own test when it lands — the
+reverse this simplification, and it needs its own test when it lands - the
 removed `stream_overlap` test locked the input-H2D‖kernel capability LZ4 no
 longer uses, so it was removed rather than left as an orphaned lock.
 
