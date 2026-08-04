@@ -331,6 +331,15 @@ endforeach()
 # an earlier line is judged by its name at the call site; a `fuel` mention on
 # the line above an unrelated loop satisfies the loop rule; and a loop or
 # intrinsic introduced under a fresh spelling is code review's job.
+#
+# The `do { ... } while (0)` idiom is forgiven only where it is joined into one
+# element, which is the macro spelling and the only one the tree uses. Two
+# things follow, and both are the price of a line-scoped scan. A written-out
+# `do { ... } while (0);` is reported, because its tail is a separate element
+# that clears nothing - wrap it in a macro or name a `fuel` cap. And a macro
+# carrying a real loop AND the idiom in the same element is forgiven whole,
+# since the element is judged by what it contains rather than by structure the
+# scan does not parse.
 function(cudec_scan_source path check_loops out_violations)
   set(_violations "")
   set(_in_comment FALSE)
@@ -426,12 +435,25 @@ function(cudec_scan_source path check_loops out_violations)
                  "parenthesis was not found within 8 lines - the scan cannot "
                  "judge it, so it is rejected rather than skipped\n")
         endif()
+      elseif(_code MATCHES "[^A-Za-z_0-9]do[ \t]*{")
+        # Ahead of the `} while` tail branch on purpose. A backslash-continued
+        # macro reaches this scan as ONE element - the trailing backslash
+        # escapes the list separator file(STRINGS) put there - so a macro's
+        # `do {` and its own tail arrive together. Judged after the tail branch
+        # they matched it first, which forgave every `do` inside every macro
+        # whatever its condition, the file exemption this replaced being what
+        # hid that. Judged here the element is read whole: only the
+        # `do { ... } while (0)` idiom, which makes a macro a single statement,
+        # is forgiven, and a macro-hidden loop with any other condition sets
+        # the form at the macro's own line.
+        if(NOT _code MATCHES "while[ \t]*\\([ \t]*0[ \t]*\\)")
+          set(_form "a 'do' loop")
+        endif()
       elseif(_code MATCHES "\\}[ \t]*while")
-        # The tail of a do-while; its `do {` carries the requirement.
+        # The tail of a do-while written out over several lines; its `do {`
+        # carries the requirement.
       elseif(_code MATCHES "[^A-Za-z_0-9]while[ \t]*\\(")
         set(_form "a 'while' loop")
-      elseif(_code MATCHES "[^A-Za-z_0-9]do[ \t]*{")
-        set(_form "a 'do' loop")
       elseif(_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\([^)]*;[ \t]*;")
         # Covers both `for (;;)` and `for (init;; incr)`.
         set(_form "a 'for' loop with an empty condition")
@@ -731,6 +753,31 @@ file(WRITE ${_probe_dir}/scan_wrapped_after_mask.cu
      "__device__ int probe(int v, Lz4Sequence seq) {\n"
      "    return __shfl_sync(0xFFFFFFFFu, v,\n"
      "                       seq.match_len % 32);\n" "}\n")
+# The two halves of the macro case, and they are one pair rather than two
+# probes: a backslash-continued macro arrives as a single element, so the same
+# element carries the loop and its condition. The idiom must come back silent
+# and a real loop wearing the same wrapper must not, or the clause that
+# forgives the wrapper has turned the rule off for every macro in the tree -
+# which is what the file exemption on src/cuda_raii.h was doing.
+#
+# Both put the #define on line 1, and the violating one asserts that line
+# number: the report lands on the macro's own line only while the join still
+# happens, so a scan that stopped joining would move it to line 2 and stop
+# covering the case these exist for.
+file(WRITE ${_probe_dir}/scan_loop_do_macro_idiom.cu
+     "#define PROBE_CHECK(call, on_failure) \\\n"
+     "    do {                              \\\n"
+     "        if ((call) != 0) {            \\\n"
+     "            on_failure;               \\\n"
+     "        }                             \\\n"
+     "    } while (0)\n"
+     "unsigned probe(unsigned n) {\n" "    PROBE_CHECK(n, n = 0);\n"
+     "    return n;\n" "}\n")
+file(WRITE ${_probe_dir}/scan_loop_do_macro.cu
+     "#define PROBE_RETRY(call, n) \\\n" "    do {                 \\\n"
+     "        n = n + (call);  \\\n" "    } while (n != 0)\n"
+     "unsigned probe(const unsigned char* src, unsigned n) {\n"
+     "    PROBE_RETRY(src[n], n);\n" "    return n;\n" "}\n")
 
 cudec_scan_source(${_probe_dir}/scan_clean.cu TRUE _probe_clean)
 if(_probe_clean)
@@ -740,7 +787,9 @@ if(_probe_clean)
       "before trusting it:\n${_probe_clean}")
 endif()
 # "probe|the text its rule must emit" - '|' rather than ';' because CMake
-# would split a list element on the latter.
+# would split a list element on the latter. An entry whose text is empty is a
+# probe that must come back SILENT, and the loop below spells that out as its
+# own branch.
 set(_scanner_probes
     "scan_loop_while|a 'while' loop with no explicit decrementing 'fuel' cap"
     "scan_loop_do|a 'do' loop with no explicit decrementing 'fuel' cap"
@@ -762,18 +811,33 @@ set(_scanner_probes
     "scan_for_opaque_qualified_wrapped|scan_for_opaque_qualified_wrapped.cu:3: a 'for' header without a visible"
     "scan_for_unbalanced|closing parenthesis was not found within 8 lines"
     "scan_for_unbalanced_eof|left unbalanced at end of file"
-    "scan_wrapped_after_mask|is wrapped across lines")
+    "scan_wrapped_after_mask|is wrapped across lines"
+    "scan_loop_do_macro_idiom|"
+    "scan_loop_do_macro|scan_loop_do_macro.cu:1: a 'do' loop with no explicit decrementing 'fuel' cap"
+)
 foreach(_entry IN LISTS _scanner_probes)
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\2" _expected "${_entry}")
   cudec_scan_source(${_probe_dir}/${_probe}.cu TRUE _probe_result)
-  string(FIND "${_probe_result}" "${_expected}" _found_at)
-  if(_found_at EQUAL -1)
-    message(
-      FATAL_ERROR
-        "the structural scanner is dead for one rule: probe '${_probe}' did "
-        "not report \"${_expected}\" (issue #72). It reported:\n"
-        "${_probe_result}")
+  if(_expected STREQUAL "")
+    # A silent probe is checked here rather than through string(FIND): an
+    # empty needle is found at position 0 in every string, so routing it
+    # through the branch below would assert nothing at all.
+    if(_probe_result)
+      message(
+        FATAL_ERROR
+          "the structural scanner rejects a compliant probe: '${_probe}' must "
+          "come back silent (issue #72). It reported:\n${_probe_result}")
+    endif()
+  else()
+    string(FIND "${_probe_result}" "${_expected}" _found_at)
+    if(_found_at EQUAL -1)
+      message(
+        FATAL_ERROR
+          "the structural scanner is dead for one rule: probe '${_probe}' did "
+          "not report \"${_expected}\" (issue #72). It reported:\n"
+          "${_probe_result}")
+    endif()
   endif()
 endforeach()
 
@@ -789,12 +853,9 @@ endforeach()
 #  - xxhash32.h: its loops walk a caller-supplied buffer at a fixed stride
 #    with no stream-derived exit condition, and it is a checksum helper rather
 #    than a decoder.
-#  - cuda_raii.h: its only `do` is the `do { ... } while (0)` wrapper that
-#    makes the CUDA-error-check macro a single statement - an idiom, not a
-#    loop.
 #
-# Both are still held to the warp-collective and floating-point rules.
-set(_loop_rule_exempt xxhash32.h cuda_raii.h)
+# It is still held to the warp-collective and floating-point rules.
+set(_loop_rule_exempt xxhash32.h)
 file(GLOB_RECURSE _all_sources RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/../src
      CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.c
