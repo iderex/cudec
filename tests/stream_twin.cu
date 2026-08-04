@@ -106,6 +106,17 @@ int RunFreshCtx(const std::vector<SChunk>& chunks, cudec_mem_space space,
 
 }  // namespace
 
+/* The streaming host-output wave copy, declared here because it is internal to
+ * src/stream.cpp and reaching it needs no public surface. It turns a
+ * device-reported bytes_written into a host write length, and the length it has
+ * to survive is one the current kernel cannot produce, so the negative below
+ * drives it directly with an injected result record (issue #57). */
+namespace cudec_stream_detail {
+cudec_status CopyWaveToHost(cudec_chunk_result* wr, const unsigned char* d_dst,
+                            void* const* dst_ptrs, const size_t* dst_caps,
+                            size_t begin, size_t wn);
+}  // namespace cudec_stream_detail
+
 int main() {
     const auto fixtures = MakeLz4BlockFixtures();
     REQUIRE(!fixtures.empty());
@@ -436,11 +447,86 @@ int main() {
         cudec_stream_ctx_destroy(ctx); /* still frees, no crash */
     }
 
+    /* A device-reported length longer than the chunk's capacity fails closed
+     * before it becomes a host write (issue #57). The host destination and the
+     * device staging both carry slack past the capacity the copy is told about:
+     * an unbounded copy therefore lands inside real allocations and shows up as
+     * poison bytes overwritten past the capacity, which is the tripwire, rather
+     * than as a fault that would mask it. The two lengths on either side of the
+     * bound run too, so a check that rejects at the capacity instead of past it
+     * is caught here as well. */
+    {
+        constexpr size_t kCap = 256;
+        constexpr size_t kSlack = 4096;
+        constexpr unsigned char kStage = 0x5C;
+
+        unsigned char* d_stage = nullptr;
+        REQUIRE_CUDA(cudaMalloc(&d_stage, kCap + kSlack));
+        REQUIRE_CUDA(cudaMemset(d_stage, kStage, kCap + kSlack));
+
+        std::vector<unsigned char> host(kCap + kSlack, kPoison);
+        void* dsts[1] = {host.data()};
+        size_t caps[1] = {kCap};
+        cudec_chunk_result wr[1];
+        wr[0].status = CUDEC_OK;
+        wr[0].reserved = 0;
+        wr[0].bytes_written = kCap + 64;
+
+        const cudec_status over = cudec_stream_detail::CopyWaveToHost(
+            wr, d_stage, dsts, caps, 0, 1);
+        /* Past the capacity: rejected, the chunk left with a defined non-OK
+         * status and no claimed output, and NOTHING written to the caller's
+         * buffer - the bytes past its capacity first. */
+        for (size_t j = kCap; j < host.size(); j++) {
+            REQUIRE_CTX(host[j] == kPoison, "overlong bw wrote past cap at %zu",
+                        j);
+        }
+        for (size_t j = 0; j < kCap; j++) {
+            REQUIRE_CTX(host[j] == kPoison, "overlong bw wrote at %zu", j);
+        }
+        REQUIRE_CTX(over == CUDEC_ERR_CUDA, "overlong bw status %d",
+                    static_cast<int>(over));
+        REQUIRE_CTX(wr[0].status == CUDEC_ERR_CUDA, "overlong bw chunk %d",
+                    static_cast<int>(wr[0].status));
+        REQUIRE_CTX(wr[0].bytes_written == 0, "overlong bw chunk bytes %llu",
+                    static_cast<unsigned long long>(wr[0].bytes_written));
+
+        /* Exactly the capacity is a legal decode and still copies, and the
+         * bytes past it stay untouched. */
+        wr[0].status = CUDEC_OK;
+        wr[0].reserved = 0;
+        wr[0].bytes_written = kCap;
+        REQUIRE(cudec_stream_detail::CopyWaveToHost(wr, d_stage, dsts, caps, 0,
+                                                    1) == CUDEC_OK);
+        for (size_t j = 0; j < kCap; j++) {
+            REQUIRE_CTX(host[j] == kStage, "at-cap bw not copied at %zu", j);
+        }
+        for (size_t j = kCap; j < host.size(); j++) {
+            REQUIRE_CTX(host[j] == kPoison, "at-cap bw wrote past cap at %zu",
+                        j);
+        }
+
+        /* And a short decode copies exactly its own length. */
+        host.assign(kCap + kSlack, kPoison);
+        wr[0].bytes_written = 16;
+        REQUIRE(cudec_stream_detail::CopyWaveToHost(wr, d_stage, dsts, caps, 0,
+                                                    1) == CUDEC_OK);
+        for (size_t j = 0; j < 16; j++) {
+            REQUIRE_CTX(host[j] == kStage, "short bw not copied at %zu", j);
+        }
+        for (size_t j = 16; j < host.size(); j++) {
+            REQUIRE_CTX(host[j] == kPoison, "short bw wrote past bw at %zu", j);
+        }
+        REQUIRE_CUDA(cudaFree(d_stage));
+    }
+
     std::printf("PASS: reused-context decode bit-identical to fresh across "
                 "{host,device} and a grow, over %zu chunks; grow, corrupt "
                 "isolation, undersized, zero-chunk, null-dst, null-ctx "
                 "fail-closed without poisoning; one-shot wrapper matches; "
-                "defined CUDA fault poisons and destroy still frees\n",
+                "defined CUDA fault poisons and destroy still frees; a "
+                "device-reported length past the chunk capacity fails the "
+                "host-output copy closed with no host write\n",
                 n);
     return 0;
 }
