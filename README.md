@@ -3,24 +3,24 @@
 Open-source GPU decompression for the standard formats.
 
 **Goal: batch-decode LZ4, Snappy, GDeflate and Zstd on an NVIDIA GPU at
-memory-bandwidth speed — auditable, fail-closed, and fuzz-tested.**
+memory-bandwidth speed - auditable, fail-closed, and fuzz-tested.**
 
 ## Why
 
 GPU decompression matters wherever decode throughput is the bottleneck:
 asset streaming, analytics scans, ML data loading, checkpoint restore. The
 only production-grade library in this space, NVIDIA's nvCOMP, has been
-proprietary since v2.3 — there is no maintained open-source library that
+proprietary since v2.3 - there is no maintained open-source library that
 decodes the standard formats on the GPU. Meta's dietgpu is open but uses its
 own rANS format; the GDeflate reference implementation is CPU-only; the
 academic prototypes are unmaintained.
 
-cudec fills that gap. Not on price — nvCOMP is free to use — but on the
+cudec fills that gap. Not on price - nvCOMP is free to use - but on the
 properties a closed binary cannot offer:
 
 - **Auditability.** Decompressors are classic attack surface. Every bounds
   check in cudec is readable, tested, and fuzz-diffed against the reference
-  implementation — liblz4 today, with zlib and libzstd joining as the DEFLATE
+  implementation - liblz4 today, with zlib and libzstd joining as the DEFLATE
   and Zstd formats land.
 - **Portability.** CUDA first; a HIP port is a planned milestone. A
   vendor-locked binary can never follow.
@@ -31,14 +31,14 @@ properties a closed binary cannot offer:
 
 Decode-only, batch-oriented. Compression stays on the CPU where it belongs;
 the GPU wins when thousands of independent chunks decode in parallel. A
-single small file on a cold PCIe bus is not the use case — the CPU wins that
+single small file on a cold PCIe bus is not the use case - the CPU wins that
 one, and this README will never claim otherwise.
 
 ## Status
 
 **M0 and M1 are complete; M2 is in progress.** cudec decodes real LZ4 on an
-NVIDIA GPU today — batch block decode, the `.lz4` frame format
-(block-independent subset), and a pinned-host streaming path — all fail-closed
+NVIDIA GPU today - batch block decode, the `.lz4` frame format
+(block-independent subset), and a pinned-host streaming path - all fail-closed
 and fuzz-diffed against liblz4. The design record is
 [docs/MASTERPLAN.md](docs/MASTERPLAN.md); the measured LZ4 block and streaming
 baselines, each carrying its full methodology, are in
@@ -48,21 +48,21 @@ milestones:
 
 | Milestone        | Deliverable                                         | Status      |
 | ---------------- | --------------------------------------------------- | ----------- |
-| M0 — Foundation  | Toolchain, CMake+CUDA skeleton, CI, test harness    | done        |
-| M1 — LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      | done        |
-| M2 — LZ4 batch   | Frame format, batch API, streaming path, benchmarks | in progress |
-| M3 — Snappy      | Snappy decode on the same kernel family             | planned     |
-| M4 — GDeflate    | The first open GPU GDeflate decoder                 | planned     |
-| M5 — Zstd        | Zstd decode (FSE/Huffman sequences)                 | planned     |
-| M6 — Portability | HIP port                                            | planned     |
+| M0 - Foundation  | Toolchain, CMake+CUDA skeleton, CI, test harness    | done        |
+| M1 - LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      | done        |
+| M2 - LZ4 batch   | Frame format, batch API, streaming path, benchmarks | in progress |
+| M3 - Snappy      | Snappy decode on the same kernel family             | planned     |
+| M4 - GDeflate    | The first open GPU GDeflate decoder                 | planned     |
+| M5 - Zstd        | Zstd decode (FSE/Huffman sequences)                 | planned     |
+| M6 - Portability | HIP port                                            | planned     |
 
 ## Principles
 
 - **Fail-closed.** A malformed or hostile bitstream produces a defined error,
-  never an out-of-bounds access and never a guess — and never a hang: every
+  never an out-of-bounds access and never a guess - and never a hang: every
   loop driven by a value read from the stream is capped, and termination is a
   tested invariant. Every reject path has a negative test.
-- **Deterministic.** Same input, same output — bit-exact on every code path,
+- **Deterministic.** Same input, same output - bit-exact on every code path,
   in every supported launch configuration, on every supported GPU. The scope,
   the qualifiers, and the tested axes:
   [docs/DETERMINISM.md](docs/DETERMINISM.md).
@@ -76,7 +76,7 @@ milestones:
 ## Building
 
 Two builds. The host-only build needs just a C compiler and compiles the ABI
-and version surface — not the decoder — so CI has a real build gate without a
+and version surface - not the decoder - so CI has a real build gate without a
 CUDA toolchain (CMake ≥ 3.24):
 
 ```sh
@@ -84,7 +84,7 @@ cmake -B build && cmake --build build
 ```
 
 The CUDA build is the decoder (CUDA 12.x toolchain; the maintained path is the
-pinned dev container — a GPU is required only for the gpu-labeled tests, not
+pinned dev container - a GPU is required only for the gpu-labeled tests, not
 the build: without a GPU, drop `--gpus all` and add `-LE gpu` to the ctest line
 to build everything and run the host-side subset):
 
@@ -99,21 +99,21 @@ docker run --rm --gpus all -v "$PWD:/w" -w /w \
 
 ## Contributing
 
-Issue-driven: every change starts as an issue and lands as a gated PR — see
+Issue-driven: every change starts as an issue and lands as a gated PR - see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## 🤝 AI-assisted, human-owned
 
 Development here is AI-assisted. Claude (Anthropic) helps with individual
-process steps — generating and analysing code, running the adversarial
+process steps - generating and analysing code, running the adversarial
 security reviews, and translating documentation and comments into English. It
 never hands over finished, unreviewed work: each step is only a proposal. A
 human maintainer reviews, understands, edits where needed, and signs off on
-every one — the AI proposes, a person decides, and a human stays responsible
+every one - the AI proposes, a person decides, and a human stays responsible
 for every line that ships, at all times. The review discipline is modelled,
 as far as is practical for a volunteer project, on the change-control
 expected of TÜV/BSI-certified software in a critical sector such as
-healthcare — with no claim to actual certification. In short: nothing lands
+healthcare - with no claim to actual certification. In short: nothing lands
 because a tool suggested it; it lands because a person verified it.
 
 ## License

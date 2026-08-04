@@ -1,4 +1,4 @@
-# CI — the fail-closed pull-request gate.
+# CI - the fail-closed pull-request gate.
 #
 # Runs only on pull requests to `main`, so the mainline scaffolding push does
 # not trigger it. Every PR must build both configurations, pass the host-side
