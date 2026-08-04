@@ -91,6 +91,14 @@ namespace cudec_stream_detail {
  * base, and `dst_ptrs`/`dst_caps` the caller's arrays indexed from `begin`.
  * Returns CUDEC_ERR_CUDA on a fault, which fails the wave.
  *
+ * bytes_written is device-reported and it becomes a HOST write length here, so
+ * it is bounded by the chunk's own capacity before it is used, and a length
+ * past that capacity is treated as a device fault rather than trusted: the
+ * chunk is stamped non-OK with no claimed output and the wave fails, with
+ * nothing written to the caller's buffer. The frame path already bounds the
+ * same value against its internal block_max after its result readback; this is
+ * the streaming path's half of it.
+ *
  * Its own function with external linkage, rather than a block inside the wave
  * loop, so the negative test can drive it with an injected result record: the
  * lengths it acts on come from the device, and the current kernel cannot
@@ -102,6 +110,12 @@ cudec_status CopyWaveToHost(cudec_chunk_result* wr, const unsigned char* d_dst,
     for (size_t j = 0; j < wn; j++) {
         const size_t i = begin + j;
         const size_t bw = static_cast<size_t>(wr[j].bytes_written);
+        if (bw > dst_caps[i]) {
+            wr[j].status = static_cast<int32_t>(CUDEC_ERR_CUDA);
+            wr[j].reserved = 0;
+            wr[j].bytes_written = 0;
+            return CUDEC_ERR_CUDA;
+        }
         if (bw != 0 && dst_ptrs[i] != nullptr &&
             cudaMemcpy(dst_ptrs[i], d_dst + off, bw,
                        cudaMemcpyDeviceToHost) != cudaSuccess) {
