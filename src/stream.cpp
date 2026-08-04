@@ -51,6 +51,10 @@ inline bool MulOverflows(size_t a, size_t b) {
     return a != 0 && b > SIZE_MAX / a;
 }
 
+cudec_status CopyWaveToHost(cudec_chunk_result* wr, const unsigned char* d_dst,
+                            void* const* dst_ptrs, const size_t* dst_caps,
+                            size_t begin, size_t wn);
+
 }  // namespace cudec_stream_detail
 
 /* The opaque context (the header forward-declares `struct cudec_stream_ctx`).
@@ -77,6 +81,38 @@ struct cudec_stream_ctx {
     cudec_cuda::PinnedBuf p_results;
     bool poisoned = false;
 };
+
+namespace cudec_stream_detail {
+
+/* Copies one drained wave's decoded bytes out of the device staging into the
+ * caller's host destinations: exactly bytes_written per chunk, leaving the tail
+ * beyond it untouched, with the staging slots laid out at dst_caps strides.
+ * `wr` is the wave's slice of the pinned result mirror, `d_dst` its staging
+ * base, and `dst_ptrs`/`dst_caps` the caller's arrays indexed from `begin`.
+ * Returns CUDEC_ERR_CUDA on a fault, which fails the wave.
+ *
+ * Its own function with external linkage, rather than a block inside the wave
+ * loop, so the negative test can drive it with an injected result record: the
+ * lengths it acts on come from the device, and the current kernel cannot
+ * produce the ones this has to survive. */
+cudec_status CopyWaveToHost(cudec_chunk_result* wr, const unsigned char* d_dst,
+                            void* const* dst_ptrs, const size_t* dst_caps,
+                            size_t begin, size_t wn) {
+    size_t off = 0;
+    for (size_t j = 0; j < wn; j++) {
+        const size_t i = begin + j;
+        const size_t bw = static_cast<size_t>(wr[j].bytes_written);
+        if (bw != 0 && dst_ptrs[i] != nullptr &&
+            cudaMemcpy(dst_ptrs[i], d_dst + off, bw,
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return CUDEC_ERR_CUDA;
+        }
+        off += dst_caps[i];
+    }
+    return CUDEC_OK;
+}
+
+}  // namespace cudec_stream_detail
 
 namespace {
 
@@ -332,23 +368,12 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
             if (cudaStreamSynchronize(stream) != cudaSuccess) {
                 WAVE_FAIL(CUDEC_ERR_CUDA);
             }
-            const cudec_chunk_result* wr =
+            cudec_chunk_result* wr =
                 static_cast<cudec_chunk_result*>(ctx.p_results.p) + begin;
-            size_t off = 0;
-            bool copy_failed = false;
-            for (size_t j = 0; j < wn; j++) {
-                const size_t i = begin + j;
-                const size_t bw = static_cast<size_t>(wr[j].bytes_written);
-                if (bw != 0 && dst_ptrs[i] != nullptr &&
-                    cudaMemcpy(dst_ptrs[i], d_dst + off, bw,
-                               cudaMemcpyDeviceToHost) != cudaSuccess) {
-                    copy_failed = true;
-                    break;
-                }
-                off += dst_caps[i];
-            }
-            if (copy_failed) {
-                WAVE_FAIL(CUDEC_ERR_CUDA);
+            const cudec_status copied =
+                CopyWaveToHost(wr, d_dst, dst_ptrs, dst_caps, begin, wn);
+            if (copied != CUDEC_OK) {
+                WAVE_FAIL(copied);
             }
         }
     }
