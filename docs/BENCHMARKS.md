@@ -11,6 +11,12 @@ Regressions against the recorded baselines block merges unless explicitly
 justified ([MASTERPLAN](MASTERPLAN.md) section 5). Corpora are fetched
 hash-pinned via `bench/get-corpora.sh` and never committed.
 
+Every entry below is an NVIDIA measurement. The mirror of the rule above is
+that a missing number is stated rather than omitted, so the AMD side has its
+own section near the end of this file
+([Community AMD results](#community-amd-results)) whose current content is that
+there are none.
+
 ## M1: first GPU decode (Silesia)
 
 The first GPU decode numbers, recorded 2026-07-17 inside the digest-pinned
@@ -460,6 +466,64 @@ longer uses, so it was removed rather than left as an orphaned lock.
 The device-resident M1 row (~18 GB/s, H2D/D2H excluded) remains the kernel
 throughput; the streaming numbers are a different, honest metric (copy +
 per-wave submission included) and are not a regression of it.
+
+## Community AMD results
+
+**No community results yet.** Nothing in this section is a measurement; it
+exists so that the absence of AMD numbers everywhere above is a recorded fact
+rather than a silence.
+
+**What has and has not happened on AMD, as of this entry.** Every number in
+this file was taken on one NVIDIA device (RTX 3080, sm_86, CUDA 12.6). The
+maintainer hardware is NVIDIA-only, so no AMD GPU has ever executed this
+decoder for the project, and no AMD measurement exists to record. There is also
+no AMD build: the HIP port is a planned M6 milestone, `CUDEC_ENABLE_HIP` does
+not exist in `CMakeLists.txt` today, and no CI job compiles for a `gfx` target.
+So the honest state is neither measured nor compiled, which is one rung below
+where this section will sit once the HIP compile gate lands (issues #209 and
+#111) and the "compiled" half becomes a thing a workflow run can be pointed at.
+
+**What a community result is, and what it is not.** A third-party measurement
+on hardware the maintainer does not have and cannot re-run. It is recorded as
+exactly that. It is **not** promoted to a project baseline and it does **not**
+gate merges: the rule that regressions against a recorded baseline block a
+merge (MASTERPLAN section 5) applies to the CUDA baselines above, which the
+maintainer can reproduce on demand, and extending it to a number nobody here can
+reproduce would make an unreproducible figure into a merge veto. A community
+result informs; it does not gate.
+
+**The recording format, fixed before the first result rather than by it.** When
+one arrives it is appended below as its own subsection, headed exactly like
+this so the index values cannot be left out of the heading and filled in
+somewhere less visible:
+
+```
+### <GPU name> / <gfx target> / ROCm <version> / wave <32|64> (#<issue>)
+```
+
+- The reporter's `bench_lz4` report block, pasted **whole and unedited**, in a
+  fenced code block. Not summarised, not re-typed, and not trimmed to the lines
+  that seemed interesting. The block is the evidence; a paraphrase of it is not.
+- The four index values repeated in the heading above are what the entry is
+  keyed by, because they are what makes two AMD results comparable or not. The
+  wave width is load-bearing here in a way it is not on the CUDA rows: a 32-wide
+  and a 64-wide build of the same kernel family are different executions of the
+  same source, and a table that loses that distinction is a table that averages
+  across it.
+- The submitting issue linked, and the reporter credited by the name or handle
+  they used to submit. If they asked not to be credited, that is written here
+  too, in place of the name.
+- Anything the reporter's environment did that the report block does not carry
+  goes underneath in prose, marked as the reporter's statement rather than as a
+  measured field.
+
+The `bench_lz4` report block emits a `CUDA device:` line and carries no ROCm
+version and no wave width today (`bench/bench_lz4.cpp`). Until the HIP build
+lands and the harness emits them, those two index values come from the reporter
+by hand and are recorded as reported, not as read out of the device.
+
+No sentence in this section can be refuted by pointing out that no AMD GPU was
+ever run, because that is what it says.
 
 ## Baseline: CPU oracle (M0, pre-kernel)
 
