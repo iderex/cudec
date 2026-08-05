@@ -16,3 +16,9 @@ updates:
         update-types:
           - minor
           - patch
+    # A release must be seven days old before Dependabot may propose it.
+    # What the hold does not reach, why there is no semver tier key, and how
+    # the weekly schedule quantises it:
+    # https://github.com/iderex/cudec/issues/122#issuecomment-5106859665
+    cooldown:
+      default-days: 7
