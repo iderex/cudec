@@ -103,6 +103,34 @@ docker run --rm --gpus all -v "$PWD:/w" -w /w \
          ctest --test-dir build-cuda --no-tests=error --output-on-failure"
 ```
 
+The host-only build installs into a prefix that an outside project consumes
+through `find_package`:
+
+```sh
+cmake --install build --prefix /some/prefix
+```
+
+```cmake
+find_package(cudec 0.0.1 REQUIRED)
+target_link_libraries(your_target PRIVATE cudec::cudec)
+```
+
+Point the consumer's configure at the prefix with
+`-DCMAKE_PREFIX_PATH=/some/prefix`.
+
+The CUDA build installs too, and its prefix is **not** consumable yet: the
+library links the CUDA runtime privately, which still reaches the consumer's
+targets file, and the package config does not yet hand the consumer
+`find_dependency(CUDAToolkit)`. Configuring against such a prefix fails with
+`The link interface of target "cudec::cudec" contains: CUDA::cudart but the
+target was not found`. That gap is issue #137.
+
+cudec builds as a static library only, and a top-level configure with
+`BUILD_SHARED_LIBS=ON` is refused rather than producing an untested shared
+build. The version compatibility rule is `SameMinorVersion`: while the version
+is 0.x, this project treats a minor bump as the breaking one, so a consumer
+asking for 0.0 is not handed 0.1.
+
 ## Contributing
 
 Issue-driven: every change starts as an issue and lands as a gated PR - see
