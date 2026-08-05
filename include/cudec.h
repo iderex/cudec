@@ -14,6 +14,9 @@
 extern "C" {
 #endif
 
+/* The one place the version is written. The top-level CMakeLists reads these
+ * three macros to set the project version, so a bump here is the whole bump
+ * and nothing restates the number. */
 #define CUDEC_VERSION_MAJOR 0
 #define CUDEC_VERSION_MINOR 0
 #define CUDEC_VERSION_PATCH 1
