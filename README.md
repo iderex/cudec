@@ -104,7 +104,7 @@ docker run --rm --gpus all -v "$PWD:/w" -w /w \
 ```
 
 Either build installs into a prefix that an outside project consumes through
-`find_package`:
+`find_package` (`build-cuda` in place of `build` for the CUDA flavour):
 
 ```sh
 cmake --install build --prefix /some/prefix
@@ -120,6 +120,16 @@ Point the consumer's configure at the prefix with
 prefix from a CUDA build carries its own `find_dependency(CUDAToolkit)`, and a
 host-only prefix carries none, so it stays consumable on a machine that has no
 CUDA toolkit at all. Both flavours are installed and consumed in CI.
+
+Two limits on the CUDA flavour, both consumer-side. It needs the CUDA toolkit
+present on the consuming machine, not merely the runtime library: the
+dependency resolves through CMake's `FindCUDAToolkit`, which looks for `nvcc`.
+And the consuming project must enable C++ (`project(... LANGUAGES C CXX)`),
+because cudec's host orchestration is C++ and CMake picks the link driver from
+the languages the consuming project enabled, not from the archive. A C-only
+consumer links `cudec_version()` and fails on the first decode call with
+undefined C++ runtime symbols. The host-only prefix has neither limit; it is
+pure C and needs no toolkit.
 
 cudec builds as a static library only, and a top-level configure with
 `BUILD_SHARED_LIBS=ON` is refused rather than producing an untested shared

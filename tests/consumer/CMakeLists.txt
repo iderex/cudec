@@ -27,6 +27,24 @@ find_package(cudec ${CUDEC_CONSUMER_REQUEST_VERSION} REQUIRED)
 
 add_executable(consumer main.c)
 
+# Off by default, because a host-only prefix has no decode entry point to call.
+# On, the consumer calls one, which is what makes the link exercise more of the
+# archive than the single C translation unit cudec_version() lives in. See the
+# comment at the call site.
+option(CUDEC_CONSUMER_CALLS_DECODE
+       "Call a decode entry point, not only cudec_version()" OFF)
+if(CUDEC_CONSUMER_CALLS_DECODE)
+  target_compile_definitions(consumer PRIVATE CUDEC_CONSUMER_CALLS_DECODE)
+  # cudec's host orchestration is C++, so a CUDA-flavoured archive carries
+  # objects that need the C++ runtime. CMake picks the link driver from the
+  # languages the CONSUMING project enabled, so a C-only consumer links with
+  # cc and never gets that runtime - it only gets away with it while nothing
+  # pulls those objects in. Enabling C++ here is the consumer-side half of the
+  # limit the README states.
+  enable_language(CXX)
+  set_target_properties(consumer PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
 # The namespaced name only, which is what an outside consumer would write. The
 # bare `cudec` would resolve against a stray system library of that name; the
 # namespaced one is an error if the package did not define it.

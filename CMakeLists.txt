@@ -296,6 +296,19 @@ if(PROJECT_IS_TOP_LEVEL)
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMinorVersion)
 
+  # Normalised to 1 or 0 before it is substituted into the config template
+  # (issue #137). CUDEC_ENABLE_CUDA is a plain cache entry, so its text can be
+  # ON, TRUE, 1, yes or anything else CMake reads as true, and the installed
+  # config would then carry whichever spelling this configure happened to use.
+  # The gate that checks the installed config reads this line, so an assertion
+  # on the raw option would red a correct package built with a different
+  # spelling.
+  if(CUDEC_ENABLE_CUDA)
+    set(CUDEC_PACKAGE_NEEDS_CUDA 1)
+  else()
+    set(CUDEC_PACKAGE_NEEDS_CUDA 0)
+  endif()
+
   configure_package_config_file(
     "${CMAKE_CURRENT_LIST_DIR}/cmake/cudec-config.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/cudec-config.cmake"

@@ -145,35 +145,51 @@ jobs:
       # The consumer knows nothing about CUDA. That is the point of the step -
       # a consumer that called find_package(CUDAToolkit) itself would paper
       # over the missing dependency and prove nothing about the package.
-      # The assertion is on the substituted FLAG, not on the presence of the
+      # The assertion is on the substituted guard, not on the presence of the
       # find_dependency line: both flavours ship the same conditional block and
-      # only the flag differs, so grepping for the call itself would pass
-      # against a host-only prefix too and prove nothing.
+      # only the guard differs, so grepping for the call itself would pass
+      # against a host-only prefix too and prove nothing. The guard is
+      # normalised to 1/0 in CMakeLists.txt so this is not an assertion about
+      # which spelling of a boolean the configure happened to use.
+      #
+      # The consumer calls a decode entry point here, not only cudec_version().
+      # A CUDA-flavoured archive carries the C++ host orchestration alongside
+      # the one C translation unit, and a link that pulls only the latter proves
+      # the target name resolved and nothing about the rest of the link surface.
       - name: Install and consume out of tree (CUDA engine)
         run: >-
           cmake --install build-cuda --prefix "$PWD/prefix-cuda" &&
-          grep -q "set(_cudec_built_with_cuda ON)"
+          grep -q "^if(1)$"
           "$(find "$PWD/prefix-cuda" -name cudec-config.cmake -print -quit)" &&
           cmake -S tests/consumer -B build-consumer-cuda
           -DCMAKE_PREFIX_PATH="$PWD/prefix-cuda"
-          -DCUDEC_CONSUMER_REQUEST_VERSION=0.0.1 &&
+          -DCUDEC_CONSUMER_REQUEST_VERSION=0.0.1
+          -DCUDEC_CONSUMER_CALLS_DECODE=ON &&
           cmake --build build-consumer-cuda &&
           ./build-consumer-cuda/consumer
 
       # The guard is conditional, and this is the half that says so. A
       # host-only prefix must not ask its consumer for a CUDA toolkit that
-      # consumer may not have. Proven twice: the installed config carries the
-      # flag OFF, and the consumer configures against it with CUDAToolkit
-      # forced undiscoverable, which is the closest this container gets to a
-      # machine that never had a toolkit at all.
+      # consumer may not have.
+      #
+      # Two legs. The installed config carries the guard as 0, and the consumer
+      # configures against it in an environment stripped of every route to the
+      # toolkit: PATH without the CUDA bin directory, CUDAToolkit_ROOT pointed
+      # at nothing, and the CUDA prefix ignored. That is a real absent-toolkit
+      # simulation rather than CMAKE_DISABLE_FIND_PACKAGE_CUDAToolkit, which
+      # does not make anything undiscoverable - against the REQUIRED call that
+      # find_dependency emits, CMake refuses the disable request itself and the
+      # step would red on the wrong rule.
       - name: The host-only package stays CUDA-free
         run: >-
-          grep -q "set(_cudec_built_with_cuda OFF)"
+          grep -q "^if(0)$"
           "$(find "$PWD/prefix-host" -name cudec-config.cmake -print -quit)" &&
+          env -i PATH=/usr/bin:/bin HOME="$HOME"
           cmake -S tests/consumer -B build-consumer-nocuda
           -DCMAKE_PREFIX_PATH="$PWD/prefix-host"
           -DCUDEC_CONSUMER_REQUEST_VERSION=0.0.1
-          -DCMAKE_DISABLE_FIND_PACKAGE_CUDAToolkit=ON &&
+          -DCUDAToolkit_ROOT=/nonexistent
+          -DCMAKE_IGNORE_PREFIX_PATH=/usr/local/cuda &&
           cmake --build build-consumer-nocuda &&
           ./build-consumer-nocuda/consumer
 

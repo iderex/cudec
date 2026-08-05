@@ -22,12 +22,15 @@
 
 @PACKAGE_INIT@
 
-set(_cudec_built_with_cuda @CUDEC_ENABLE_CUDA@)
-if(_cudec_built_with_cuda)
+# The flag is substituted inline rather than through a variable. find_dependency
+# is a macro that return()s out of this file when the dependency is missing, so
+# a variable set above it would survive that return and leak into the consumer's
+# scope on exactly the path that reports not-found. There is nothing to clean up
+# if nothing is set.
+if(@CUDEC_PACKAGE_NEEDS_CUDA@)
   include(CMakeFindDependencyMacro)
   find_dependency(CUDAToolkit)
 endif()
-unset(_cudec_built_with_cuda)
 
 include("${CMAKE_CURRENT_LIST_DIR}/cudec-targets.cmake")
 
