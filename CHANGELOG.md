@@ -51,11 +51,11 @@ today.
   public header, the archive, and a package config, so an outside project links
   cudec through `find_package(cudec)` and the exported `cudec::cudec` target
   instead of vendoring the tree. The compatibility rule is `SameMinorVersion`,
-  which at 0.x means a consumer asking for 0.0 is not handed 0.1. CI installs
-  the host-only build and builds and runs an out-of-tree consumer against the
-  result, in both directions of that version rule. The CUDA-flavoured prefix
-  installs but is not consumable yet, because its package config does not yet
-  carry `find_dependency(CUDAToolkit)`.
+  which at 0.x means a consumer asking for 0.0 is not handed 0.1. Both build
+  flavours install and are consumed out of tree in CI: the consumer writes
+  nothing about CUDA, because a prefix from a CUDA build carries its own
+  `find_dependency(CUDAToolkit)` and a host-only prefix carries none, so it
+  stays consumable where no CUDA toolkit exists.
 
 ### Changed
 

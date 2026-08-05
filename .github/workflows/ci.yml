@@ -131,6 +131,52 @@ jobs:
           test -x build-cuda/tests/termination_gpu &&
           test -x build-cuda/tests/determinism_gpu
 
+      # The other half of the install proof (issue #137). The host-only prefix
+      # is the easy flavour: nothing reaches the exported interface. The CUDA
+      # one carries $<LINK_ONLY:CUDA::cudart>, so the consumer needs the
+      # package config to hand it find_dependency(CUDAToolkit) before the
+      # targets file is read - and the failure without it lands at the generate
+      # step, AFTER find_package(cudec) has already reported success.
+      #
+      # The runner has no GPU and does not need one: cudec_version() links and
+      # runs without touching a device, which is exactly what proves the
+      # imported target resolved.
+      #
+      # The consumer knows nothing about CUDA. That is the point of the step -
+      # a consumer that called find_package(CUDAToolkit) itself would paper
+      # over the missing dependency and prove nothing about the package.
+      # The assertion is on the substituted FLAG, not on the presence of the
+      # find_dependency line: both flavours ship the same conditional block and
+      # only the flag differs, so grepping for the call itself would pass
+      # against a host-only prefix too and prove nothing.
+      - name: Install and consume out of tree (CUDA engine)
+        run: >-
+          cmake --install build-cuda --prefix "$PWD/prefix-cuda" &&
+          grep -q "set(_cudec_built_with_cuda ON)"
+          "$(find "$PWD/prefix-cuda" -name cudec-config.cmake -print -quit)" &&
+          cmake -S tests/consumer -B build-consumer-cuda
+          -DCMAKE_PREFIX_PATH="$PWD/prefix-cuda"
+          -DCUDEC_CONSUMER_REQUEST_VERSION=0.0.1 &&
+          cmake --build build-consumer-cuda &&
+          ./build-consumer-cuda/consumer
+
+      # The guard is conditional, and this is the half that says so. A
+      # host-only prefix must not ask its consumer for a CUDA toolkit that
+      # consumer may not have. Proven twice: the installed config carries the
+      # flag OFF, and the consumer configures against it with CUDAToolkit
+      # forced undiscoverable, which is the closest this container gets to a
+      # machine that never had a toolkit at all.
+      - name: The host-only package stays CUDA-free
+        run: >-
+          grep -q "set(_cudec_built_with_cuda OFF)"
+          "$(find "$PWD/prefix-host" -name cudec-config.cmake -print -quit)" &&
+          cmake -S tests/consumer -B build-consumer-nocuda
+          -DCMAKE_PREFIX_PATH="$PWD/prefix-host"
+          -DCUDEC_CONSUMER_REQUEST_VERSION=0.0.1
+          -DCMAKE_DISABLE_FIND_PACKAGE_CUDAToolkit=ON &&
+          cmake --build build-consumer-nocuda &&
+          ./build-consumer-nocuda/consumer
+
       # The host-side subset; gpu-labeled tests run in this same container
       # on the maintainer's machine and their output is pasted into the PR.
       # Fail-closed plumbing: --no-tests=error reds a vacuous zero-test

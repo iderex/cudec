@@ -103,8 +103,8 @@ docker run --rm --gpus all -v "$PWD:/w" -w /w \
          ctest --test-dir build-cuda --no-tests=error --output-on-failure"
 ```
 
-The host-only build installs into a prefix that an outside project consumes
-through `find_package`:
+Either build installs into a prefix that an outside project consumes through
+`find_package`:
 
 ```sh
 cmake --install build --prefix /some/prefix
@@ -116,14 +116,10 @@ target_link_libraries(your_target PRIVATE cudec::cudec)
 ```
 
 Point the consumer's configure at the prefix with
-`-DCMAKE_PREFIX_PATH=/some/prefix`.
-
-The CUDA build installs too, and its prefix is **not** consumable yet: the
-library links the CUDA runtime privately, which still reaches the consumer's
-targets file, and the package config does not yet hand the consumer
-`find_dependency(CUDAToolkit)`. Configuring against such a prefix fails with
-`The link interface of target "cudec::cudec" contains: CUDA::cudart but the
-target was not found`. That gap is issue #137.
+`-DCMAKE_PREFIX_PATH=/some/prefix`. The consumer writes nothing about CUDA: a
+prefix from a CUDA build carries its own `find_dependency(CUDAToolkit)`, and a
+host-only prefix carries none, so it stays consumable on a machine that has no
+CUDA toolkit at all. Both flavours are installed and consumed in CI.
 
 cudec builds as a static library only, and a top-level configure with
 `BUILD_SHARED_LIBS=ON` is refused rather than producing an untested shared
