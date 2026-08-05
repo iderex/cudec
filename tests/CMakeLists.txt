@@ -332,6 +332,20 @@ endforeach()
 # the line above an unrelated loop satisfies the loop rule; and a loop or
 # intrinsic introduced under a fresh spelling is code review's job.
 #
+# Backslash continuations split the rules in two, and the split is where each
+# rule's reason points (issue #251). The collective, legacy-intrinsic and
+# floating-point rules run on the SOURCE line, because a construct broken
+# across lines hides the rest of itself from a line-scoped rule whether a
+# macro's backslashes join it back together or not - so a collective wrapped
+# inside a macro is reported exactly like one wrapped outside it, on the
+# source line it wrapped at. The loop rule instead judges a continued
+# construct whole, joined the way the preprocessor joins it, because that is
+# what its idiom forgiveness rests on. Both report the source line, which the
+# reader can open; the join's own separators are subtracted back out of the
+# semicolon count so that a macro-hidden `for` header is not read as a
+# counted one. A continuation left open at end of file is rejected rather
+# than dropped.
+#
 # The `do { ... } while (0)` idiom is forgiven only where it is joined into one
 # element, which is the macro spelling and the only one the tree uses. Two
 # things follow, and both are the price of a line-scoped scan. A written-out
@@ -353,9 +367,48 @@ function(cudec_scan_source path check_loops out_violations)
   set(_for_lines 0)
   set(_for_text "")
   set(_lineno 0)
-  file(STRINGS "${path}" _lines)
-  foreach(_line IN LISTS _lines)
+  set(_element "")
+  set(_element_start 0)
+  set(_element_joins 0)
+  set(_element_open FALSE)
+  # Read the bytes and do the splitting here rather than with
+  # file(STRINGS): a trailing backslash escapes the separator file(STRINGS)
+  # puts between elements, so a continued construct arrives as ONE element
+  # and every line below it is numbered short by the number of continuation
+  # lines above it (issue #251). Splitting here keeps the source line number
+  # exact, and the join the loop rule needs is rebuilt below where the
+  # element it belongs to is known.
+  #
+  # The two characters CMake's list syntax eats are protected across the
+  # split: a ';' separates elements and a '\' escapes that separator. The
+  # placeholders are control bytes, which no source in this tree carries and
+  # which therefore cannot be produced by the source being scanned.
+  string(ASCII 1 _tok_backslash)
+  string(ASCII 2 _tok_semicolon)
+  file(READ "${path}" _raw)
+  # "No source carries one" is the assumption this reader rests on, so it is
+  # stated to the file rather than trusted: a source that does carry one would
+  # have it restored below as a backslash or as a separator, which is a way to
+  # smuggle either past the split. Refuse the file instead of scanning it.
+  if(_raw MATCHES "${_tok_backslash}|${_tok_semicolon}")
+    string(APPEND _violations
+           "  ${path}:1: a control byte (0x01 or 0x02) in a source read as "
+           "text - this scan cannot tell one from its own line markers, so "
+           "the file is refused rather than scanned\n")
+  endif()
+  string(REPLACE "\\" "${_tok_backslash}" _raw "${_raw}")
+  string(REPLACE ";" "${_tok_semicolon}" _raw "${_raw}")
+  string(REPLACE "\r\n" "\n" _raw "${_raw}")
+  string(REPLACE "\r" "\n" _raw "${_raw}")
+  # A file's final newline terminates its last line rather than starting an
+  # empty one; left in, it would add a line the file does not have.
+  string(REGEX REPLACE "\n$" "" _raw "${_raw}")
+  string(REPLACE "\n" ";" _lines "${_raw}")
+  foreach(_src_line IN LISTS _lines)
     math(EXPR _lineno "${_lineno} + 1")
+    string(REPLACE "${_tok_semicolon}" ";" _src_line "${_src_line}")
+    string(REPLACE "${_tok_backslash}" "\\" _src_line "${_src_line}")
+    set(_line "${_src_line}")
     if(_in_comment)
       if(_line MATCHES "\\*/")
         string(REGEX REPLACE "^.*\\*/" " " _line "${_line}")
@@ -377,24 +430,49 @@ function(cudec_scan_source path check_loops out_violations)
     endif()
     set(_code " ${_line} ")
 
-    # Parenthesis balance and semicolon count of this line, used to follow a
-    # loop header that wrapped at the 80-column limit instead of misreading
-    # its first line as a header without a condition.
-    string(LENGTH "${_code}" _len_all)
-    string(REPLACE "(" "" _stripped "${_code}")
-    string(LENGTH "${_stripped}" _len_no_open)
-    string(REPLACE ")" "" _stripped "${_code}")
-    string(LENGTH "${_stripped}" _len_no_close)
-    string(REPLACE ";" "" _stripped "${_code}")
-    string(LENGTH "${_stripped}" _len_no_semi)
-    math(EXPR _opens "${_len_all} - ${_len_no_open}")
-    math(EXPR _closes "${_len_all} - ${_len_no_close}")
-    math(EXPR _balance "${_opens} - ${_closes}")
-    math(EXPR _line_semis "${_len_all} - ${_len_no_semi}")
+    # The loop rule judges a backslash-continued construct WHOLE, which is
+    # what its do-idiom forgiveness rests on, so the join file(STRINGS) used
+    # to perform is rebuilt here: the trailing backslash goes and a ';' takes
+    # the newline's place, byte for byte what the old reader produced. What is
+    # kept, and what the old reader had no way to keep, is the source line the
+    # element started on and how many separators the join inserted.
+    if(NOT _element_open)
+      set(_element "")
+      set(_element_start ${_lineno})
+      set(_element_joins 0)
+    endif()
+    if(_src_line MATCHES "\\\\$")
+      string(REGEX REPLACE "\\\\$" "" _joined "${_line}")
+      string(APPEND _element "${_joined};")
+      math(EXPR _element_joins "${_element_joins} + 1")
+      set(_element_open TRUE)
+      set(_element_code "")
+    else()
+      set(_element_open FALSE)
+      set(_element_code " ${_element}${_line} ")
+    endif()
 
-    if(check_loops)
+    if(check_loops AND NOT _element_open)
+      # Parenthesis balance and semicolon count of this element, used to
+      # follow a loop header that wrapped at the 80-column limit instead of
+      # misreading its first line as a header without a condition. The join's
+      # own separators come back out of the semicolon count: left in, two of
+      # them make a macro-hidden `for` header look like a counted one and the
+      # rule reads a fail-open as a pass.
+      string(LENGTH "${_element_code}" _len_all)
+      string(REPLACE "(" "" _stripped "${_element_code}")
+      string(LENGTH "${_stripped}" _len_no_open)
+      string(REPLACE ")" "" _stripped "${_element_code}")
+      string(LENGTH "${_stripped}" _len_no_close)
+      string(REPLACE ";" "" _stripped "${_element_code}")
+      string(LENGTH "${_stripped}" _len_no_semi)
+      math(EXPR _opens "${_len_all} - ${_len_no_open}")
+      math(EXPR _closes "${_len_all} - ${_len_no_close}")
+      math(EXPR _balance "${_opens} - ${_closes}")
+      math(EXPR _line_semis
+           "${_len_all} - ${_len_no_semi} - ${_element_joins}")
       if(_pending_left GREATER 0)
-        if(_code MATCHES "fuel")
+        if(_element_code MATCHES "fuel")
           set(_pending_left 0)
         else()
           math(EXPR _pending_left "${_pending_left} - 1")
@@ -406,14 +484,14 @@ function(cudec_scan_source path check_loops out_violations)
         endif()
       endif()
       set(_form "")
-      set(_form_line ${_lineno})
+      set(_form_line ${_element_start})
       if(_for_open GREATER 0)
         # Continuation of a wrapped `for` header: keep counting until the
         # parenthesis closes, then judge the whole header at once.
         math(EXPR _for_semis "${_for_semis} + ${_line_semis}")
         math(EXPR _for_open "${_for_open} + ${_balance}")
         math(EXPR _for_lines "${_for_lines} + 1")
-        string(APPEND _for_text " ${_code}")
+        string(APPEND _for_text " ${_element_code}")
         set(_form_line ${_for_start})
         if(_for_open LESS_EQUAL 0)
           set(_for_open 0)
@@ -435,10 +513,10 @@ function(cudec_scan_source path check_loops out_violations)
                  "parenthesis was not found within 8 lines - the scan cannot "
                  "judge it, so it is rejected rather than skipped\n")
         endif()
-      elseif(_code MATCHES "[^A-Za-z_0-9]do[ \t]*{")
+      elseif(_element_code MATCHES "[^A-Za-z_0-9]do[ \t]*{")
         # Ahead of the `} while` tail branch on purpose. A backslash-continued
-        # macro reaches this scan as ONE element - the trailing backslash
-        # escapes the list separator file(STRINGS) put there - so a macro's
+        # macro reaches this rule as ONE element, joined above the way the
+        # preprocessor joins it, so a macro's
         # `do {` and its own tail arrive together. Judged after the tail branch
         # they matched it first, which forgave every `do` inside every macro
         # whatever its condition, the file exemption this replaced being what
@@ -446,29 +524,29 @@ function(cudec_scan_source path check_loops out_violations)
         # `do { ... } while (0)` idiom, which makes a macro a single statement,
         # is forgiven, and a macro-hidden loop with any other condition sets
         # the form at the macro's own line.
-        if(NOT _code MATCHES "while[ \t]*\\([ \t]*0[ \t]*\\)")
+        if(NOT _element_code MATCHES "while[ \t]*\\([ \t]*0[ \t]*\\)")
           set(_form "a 'do' loop")
         endif()
-      elseif(_code MATCHES "\\}[ \t]*while")
+      elseif(_element_code MATCHES "\\}[ \t]*while")
         # The tail of a do-while written out over several lines; its `do {`
         # carries the requirement.
-      elseif(_code MATCHES "[^A-Za-z_0-9]while[ \t]*\\(")
+      elseif(_element_code MATCHES "[^A-Za-z_0-9]while[ \t]*\\(")
         set(_form "a 'while' loop")
-      elseif(_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\([^)]*;[ \t]*;")
+      elseif(_element_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\([^)]*;[ \t]*;")
         # Covers both `for (;;)` and `for (init;; incr)`.
         set(_form "a 'for' loop with an empty condition")
-      elseif(_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\(")
+      elseif(_element_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\(")
         # The range-for test runs on the header with '::' removed: the colons
         # of a qualified name (`cudec_detail::Foo`) carry none of the meaning
         # the exemption rests on, and left in they would exempt any opaque
         # header that happens to mention one.
-        string(REPLACE "::" "" _range_text "${_code}")
+        string(REPLACE "::" "" _range_text "${_element_code}")
         if(_balance GREATER 0)
           set(_for_open ${_balance})
           set(_for_semis ${_line_semis})
-          set(_for_start ${_lineno})
+          set(_for_start ${_element_start})
           set(_for_lines 1)
-          set(_for_text "${_code}")
+          set(_for_text "${_element_code}")
         elseif(_line_semis LESS 2 AND NOT _range_text MATCHES ":")
           # A balanced header with fewer than two semicolons has no visible
           # induction variable - a macro-hidden loop, say. A range-for
@@ -478,12 +556,14 @@ function(cudec_scan_source path check_loops out_violations)
           set(_form "a 'for' header without a visible condition and increment")
         endif()
       endif()
-      if(_form AND NOT _code MATCHES "fuel" AND NOT _previous MATCHES "fuel")
+      if(_form
+         AND NOT _element_code MATCHES "fuel"
+         AND NOT _previous MATCHES "fuel")
         set(_pending_reason "${_form}")
         set(_pending_line ${_form_line})
         set(_pending_left 3)
       endif()
-      set(_previous "${_code}")
+      set(_previous "${_element_code}")
     endif()
 
     # The legacy intrinsics, matched on the identifier rather than on a
@@ -577,6 +657,15 @@ function(cudec_scan_source path check_loops out_violations)
              "depends on the order the device happens to schedule\n")
     endif()
   endforeach()
+  # A file whose last line ends in a backslash leaves an element the loop rule
+  # never got to judge, so the construct inside it went unread. Reject rather
+  # than return silently, for the same reason the unbalanced `for` header
+  # below is rejected.
+  if(_element_open)
+    string(APPEND _violations
+           "  ${path}:${_element_start}: a backslash continuation left open at "
+           "end of file - the construct it carries was not judged\n")
+  endif()
   if(check_loops AND _pending_left GREATER 0)
     string(APPEND _violations
            "  ${path}:${_pending_line}: ${_pending_reason} with no explicit "
@@ -650,6 +739,11 @@ file(
   "__device__ int probe_collective(int v) {\n"
   "    __syncwarp();\n"
   "    return __shfl_sync(0xFFFFFFFFu, v, 0);\n"
+  "}\n"
+  "#define PROBE_LANE(v) \\\n"
+  "    __shfl_sync(0xFFFFFFFFu, v, 0)\n"
+  "__device__ int probe_macro_collective(int v) {\n"
+  "    return PROBE_LANE(v);\n"
   "}\n")
 
 # One probe per sub-rule, each paired with the text it must produce.
@@ -778,6 +872,47 @@ file(WRITE ${_probe_dir}/scan_loop_do_macro.cu
      "        n = n + (call);  \\\n" "    } while (n != 0)\n"
      "unsigned probe(const unsigned char* src, unsigned n) {\n"
      "    PROBE_RETRY(src[n], n);\n" "    return n;\n" "}\n")
+# The four continuation probes (issue #251). A collective wrapped inside a
+# macro is the same violation as one wrapped outside it, and it is asserted
+# with its line number: the report has to land on the line the call wrapped
+# at, which is the second, and a scan that joined the macro back together
+# before this rule saw it reported nothing at all.
+file(WRITE ${_probe_dir}/scan_macro_wrapped_collective.cu
+     "#define PROBE_LANE(v, s) \\\n"
+     "    __shfl_sync(0xFFFFFFFFu, v,\\\n" "                s.lane % 32)\n")
+# `s.lane` is neither in the parsed-field list nor under the sequence prefix,
+# so no other rule can cover for the wrapped-collective rule here.
+#
+# A violation BELOW a continuation carries the line a reader can open. Every
+# line under the macro was short by the number of continuation lines above it,
+# so this one was reported at line 4 - inside the macro, which does not
+# contain it.
+file(WRITE ${_probe_dir}/scan_line_after_continuation.cu
+     "#define PROBE_WRAP(a, b) \\\n" "    do {                 \\\n"
+     "        (a) = (b);       \\\n" "    } while (0)\n"
+     "unsigned probe(const unsigned char* src) {\n"
+     "    unsigned count = src[0];\n" "    while (count != 0) {\n"
+     "        count += src[count];\n" "    }\n" "    return count;\n" "}\n")
+# A macro-hidden `for` header, which the loop rule must judge on the joined
+# element and therefore on that element's semicolon count. The join inserts
+# one separator per continuation line, and two of them are all it takes for
+# this header to read as a counted `for` with a visible induction variable -
+# a fail-open in the termination rule reported as a pass.
+file(WRITE ${_probe_dir}/scan_macro_for_opaque.cu
+     "#define PROBE_EACH(x) \\\n" "    for (EACH_CHUNK(chunk, x)) \\\n"
+     "        use(chunk);\n" "unsigned probe(const unsigned char* src) {\n"
+     "    PROBE_EACH(src);\n" "    return 0;\n" "}\n")
+# A continuation the file never closes. The construct it carries reaches no
+# rule at all, so it is rejected rather than dropped - the same direction as
+# the unbalanced `for` header above.
+file(WRITE ${_probe_dir}/scan_continuation_at_eof.cu
+     "void probe() {\n" "    g(1);\n" "}\n" "#define PROBE_TAIL(x) \\\n")
+# The byte the reader borrows for its own bookkeeping, in the file it is
+# reading. It has to come back refused, or the borrowing is a way to write a
+# separator or a backslash the split will not see as one.
+string(ASCII 1 _probe_ctrl)
+file(WRITE ${_probe_dir}/scan_control_byte.cu
+     "void probe() {\n" "    g(1);${_probe_ctrl}\n" "}\n")
 
 cudec_scan_source(${_probe_dir}/scan_clean.cu TRUE _probe_clean)
 if(_probe_clean)
@@ -814,6 +949,11 @@ set(_scanner_probes
     "scan_wrapped_after_mask|is wrapped across lines"
     "scan_loop_do_macro_idiom|"
     "scan_loop_do_macro|scan_loop_do_macro.cu:1: a 'do' loop with no explicit decrementing 'fuel' cap"
+    "scan_macro_wrapped_collective|scan_macro_wrapped_collective.cu:2: '__shfl_sync' is wrapped across"
+    "scan_line_after_continuation|scan_line_after_continuation.cu:7: a 'while' loop with no explicit"
+    "scan_macro_for_opaque|scan_macro_for_opaque.cu:1: a 'for' header without a visible"
+    "scan_continuation_at_eof|scan_continuation_at_eof.cu:4: a backslash continuation left open at end of file"
+    "scan_control_byte|a control byte (0x01 or 0x02) in a source read as text"
 )
 foreach(_entry IN LISTS _scanner_probes)
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
