@@ -6,7 +6,10 @@ build-san/
 # produced by the install proof in ci.yml and reproducible the same way.
 build-consumer/
 build-consumer-badver/
+build-consumer-cuda/
+build-consumer-nocuda/
 prefix-host/
+prefix-cuda/
 badver.log
 
 # Downloaded benchmark corpora - hash-pinned by bench/get-corpora.sh,

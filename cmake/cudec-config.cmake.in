@@ -1,18 +1,36 @@
 # The package config find_package(cudec) loads (issue #79).
 #
-# It stays this short on purpose. cudec's public surface is one header and one
-# static library with no dependency outside the CUDA runtime, so the config has
-# nothing to search for and nothing to reconcile; anything more here would be
-# machinery describing a complexity the library does not have.
+# It stays short on purpose. cudec's public surface is one header and one static
+# library with no dependency outside the CUDA runtime, so the config has almost
+# nothing to search for and nothing to reconcile.
 #
-# The CUDA-flavoured install needs one more thing than this: a static library
-# links CUDA::cudart privately, which still reaches the consumer's targets file
-# as $<LINK_ONLY:CUDA::cudart>, so a consumer of a CUDA-enabled prefix has to
-# be handed find_dependency(CUDAToolkit) before the targets file is included.
-# That is issue #137 and it is deliberately not stubbed here: a guard written
-# before the consumer that proves it exists is a guard nobody has watched bite.
+# The one thing it does have to carry is the CUDA runtime (issue #137). cudec
+# links CUDA::cudart PRIVATE, but for a static library a private link still
+# reaches the consumer through the exported interface as
+# $<LINK_ONLY:CUDA::cudart>, so the targets file names an imported target the
+# consumer has never defined. Without the find_dependency below, a consumer of a
+# CUDA-enabled prefix dies at the generate step with "target CUDA::cudart not
+# found" - after find_package(cudec) has already reported success, which is the
+# worse half of that failure.
+#
+# Guarded, not unconditional. A host-only install must stay consumable on a
+# machine with no CUDA toolkit at all, and an unconditional find_dependency
+# would refuse exactly that consumer over a dependency their prefix does not
+# have. The flag is substituted from the build that produced the prefix, so each
+# installed config carries the answer for its own flavour rather than for the
+# flavour the reader happens to be building today.
 
 @PACKAGE_INIT@
+
+# The flag is substituted inline rather than through a variable. find_dependency
+# is a macro that return()s out of this file when the dependency is missing, so
+# a variable set above it would survive that return and leak into the consumer's
+# scope on exactly the path that reports not-found. There is nothing to clean up
+# if nothing is set.
+if(@CUDEC_PACKAGE_NEEDS_CUDA@)
+  include(CMakeFindDependencyMacro)
+  find_dependency(CUDAToolkit)
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/cudec-targets.cmake")
 
