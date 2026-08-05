@@ -3,6 +3,7 @@
  * plugs in as a second timed path in this same harness. A report cannot
  * be produced without its methodology block; that is the point
  * (docs/MASTERPLAN.md section 5, honest numbers). */
+#include "bench_stats.h"
 #include "cudec.h"
 #include "fixtures.h"
 #include "gpu_bench.h"
@@ -458,13 +459,9 @@ bool ParseCount(const char* text, size_t min, size_t max, size_t* out) {
     return true;
 }
 
-/* Nearest-rank with ceiling: never flatters - at 30 runs, p99 is the
- * slowest run, not the second-slowest a floor index would pick. */
-double Percentile(const std::vector<double>& sorted, int pct) {
-    const size_t rank =
-        (sorted.size() * static_cast<size_t>(pct) + 99) / 100;
-    return sorted[(rank == 0 ? 1 : rank) - 1];
-}
+/* The nearest-rank definition this report shares with the GPU rows, from
+ * bench/bench_stats.h. */
+using cudec_bench::Percentile;
 
 void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
                  size_t warmup, size_t runs) {
