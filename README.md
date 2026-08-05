@@ -26,8 +26,10 @@ properties a closed binary cannot offer:
   check in cudec is readable, tested, and fuzz-diffed against the reference
   implementation - liblz4 today, with zlib and libzstd joining as the DEFLATE
   and Zstd formats land.
-- **Portability.** CUDA first; a HIP port is a planned milestone. A
-  vendor-locked binary can never follow.
+- **Portability.** CUDA first; a HIP port is a planned milestone. What that
+  milestone claims is one kernel family, single-source across both vendors
+  behind the same C ABI, auditable and fail-closed on either - not a first on
+  AMD, for the reason the field table linked above gives.
 - **Hackability.** Format quirks, tuning trade-offs, and kernel design are
   documented in the tree, not behind a support contract.
 

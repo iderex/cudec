@@ -48,8 +48,9 @@ the open GPU decoders above are shaders belonging to a graphics runtime, and
 hipCOMP-core is a HIP preview downstream of a four-year-old fork point. The
 value proposition is not price (nvCOMP is free to use) but
 **auditability** (decompressors are classic attack surface; every bounds
-check here is readable, tested, and fuzzed), **portability** (a HIP port is
-a planned milestone - a vendor binary can never follow), and **hackability**.
+check here is readable, tested, and fuzzed), **portability** (a HIP port is a
+planned milestone; what that claim is and is not is section 3 item 5, and it
+is not an empty AMD field), and **hackability**.
 
 ## 2. Scope
 
