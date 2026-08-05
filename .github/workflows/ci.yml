@@ -205,3 +205,49 @@ jobs:
 
       - name: Prettier check
         run: npx --yes prettier@3 --check "**/*.{md,yml,yaml}"
+
+      # Every Action pinned to a full commit SHA, enforced rather than swept
+      # (issue #131). A tag or branch pin resolves to whatever the upstream
+      # owner points it at later, which is the supply-chain hole the pinning
+      # rule exists to close; the audit was clean and only the mechanism that
+      # keeps it clean was missing.
+      #
+      # Shell rather than a pin-audit Action, per the masterplan's preference
+      # for near-zero third-party surface in the security net itself: an Action
+      # that checks the pinning of Actions is one more pinned dependency to
+      # keep current, and this rule is one regex.
+      #
+      # Fail-closed like the rest of this file: no workflow files, or workflow
+      # files with no `uses:` at all, means the check is reading the wrong
+      # place - it reds rather than passes silently.
+      - name: Every Action pinned to a full commit SHA
+        run: |
+          set -eu
+          find .github/workflows -type f -name '*.yml' > workflow-files.txt
+          find .github/workflows -type f -name '*.yaml' >> workflow-files.txt
+          sort -o workflow-files.txt workflow-files.txt
+          if [ ! -s workflow-files.txt ]; then
+            echo "FAIL: no workflow files under .github/workflows"
+            exit 1
+          fi
+          # shellcheck disable=SC2046
+          grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:' $(cat workflow-files.txt) > action-refs.txt || true
+          if [ ! -s action-refs.txt ]; then
+            echo "FAIL: no 'uses:' line in any workflow - this check is reading the wrong files"
+            exit 1
+          fi
+          # The version comment goes first, so the 40-hex anchor sits at the end
+          # of the line. Local actions (./...) and docker:// references have no
+          # commit to pin; a reusable workflow
+          # (owner/repo/.github/workflows/x.yml@SHA) must still be pinned and
+          # matches the same pattern.
+          sed 's/#.*$//; s/[[:space:]]*$//' action-refs.txt > refs-bare.txt
+          grep -vE "uses:[[:space:]]*\./" refs-bare.txt > refs-remote.txt || true
+          grep -vE "uses:[[:space:]]*docker://" refs-remote.txt > refs-actions.txt || true
+          grep -vE "uses:[[:space:]]*[^[:space:]@]+@[0-9a-f]{40}$" refs-actions.txt > unpinned.txt || true
+          if [ -s unpinned.txt ]; then
+            echo "FAIL: Action reference not pinned to a full 40-character commit SHA:"
+            cat unpinned.txt
+            exit 1
+          fi
+          echo "PASS: $(wc -l < action-refs.txt) Action reference(s) across $(wc -l < workflow-files.txt) workflow file(s), all SHA-pinned"
