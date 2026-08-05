@@ -14,6 +14,16 @@
 #include <cstring>
 #include <vector>
 
+/* PROBE for #70 - reverted in the next commit. A deliberate unbounded write,
+ * so an alert on THIS file proves the analysed configuration extracts it.
+ * Never called from anywhere. */
+void cudec_codeql_probe_delete_me(const char* name);
+void cudec_codeql_probe_delete_me(const char* name) {
+    char narrow[4];
+    std::strcpy(narrow, name);
+    (void)narrow;
+}
+
 namespace {
 
 constexpr uint32_t kLz4FrameMagic = 0x184D2204u;
