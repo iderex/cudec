@@ -212,6 +212,11 @@ cudec_add_test(oracle_snappy SOURCES oracle_snappy.cpp LIBS
 # the answers are what the M3 fail-closed matrix is allowed to lock against.
 cudec_add_test(snappy_probes SOURCES snappy_probes.cpp LIBS
                cudec_test_fixtures)
+# The Snappy corpus proving itself (issue #157), the counterpart of oracle_lz4:
+# real pairs, a deterministic generator, and mutations that bite. Host-side, so
+# it runs on the GPU-less runner.
+cudec_add_test(snappy_corpus SOURCES snappy_corpus.cpp LIBS
+               cudec_test_fixtures)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,

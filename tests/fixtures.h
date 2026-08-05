@@ -15,7 +15,10 @@ struct Fixture {
     std::string name;
     uint64_t seed;
     std::vector<unsigned char> original;
-    std::vector<unsigned char> compressed; /* LZ4 block format */
+    /* The compressed form, in whichever format the generator that produced
+     * this fixture names: LZ4 block for MakeLz4BlockFixtures, Snappy block
+     * for MakeSnappyFixtures. */
+    std::vector<unsigned char> compressed;
 };
 
 /* Corpus chosen against the future kernel geometry: max-compressible,
@@ -68,5 +71,31 @@ bool SnappyOracleAccepts(const std::vector<unsigned char>& stream);
  * Lz4CompressBlock does. */
 std::vector<unsigned char> SnappyCompressBlock(
     const std::vector<unsigned char>& original);
+
+/* The Snappy corpus, compressed by the pinned oracle so every pair is real by
+ * construction. Sizes are chosen against the format's own boundaries - the
+ * literal-length class break at 60, the 64-byte copy cap, and the 65536-byte
+ * block the compressor splits its input into - rather than against any
+ * geometry of the decoder that will read them. Fixture::compressed carries
+ * Snappy block streams here, the format the generator names. */
+std::vector<Fixture> MakeSnappyFixtures();
+
+/* Mutations placed on the branch set read out of snappy 1.2.2's decoder: the
+ * varint preamble, the literal-length classes, all three copy tags, and the
+ * offset and length bounds that AppendFromSelf refuses on. The generic
+ * truncation and bit-flip ladder from MutateStream is included, so this is a
+ * superset of the format-agnostic mutations.
+ *
+ * The placement walks the stream's elements the way snappy does, and that walk
+ * is the harness's, not the decoder's: it decides only WHERE a mutation lands.
+ * The verdict on every mutant still comes from the oracle, so a wrong step in
+ * the walk can only make a mutation less targeted - never turn a rejected
+ * stream into an accepted one or the other way round.
+ *
+ * As with MutateStream, a mutant is NOT necessarily invalid: a non-minimal
+ * preamble is a mutation the reference accepts by design. Consumers ask the
+ * oracle. */
+std::vector<Mutant> MutateSnappyStream(const std::vector<unsigned char>& stream,
+                                       uint64_t seed);
 
 #endif /* CUDEC_TESTS_FIXTURES_H */
