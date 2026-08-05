@@ -110,6 +110,14 @@ endfunction()
 cudec_add_test(conformance_c SOURCES conformance_c.c)
 set_target_properties(conformance_c PROPERTIES C_STANDARD 99
                                                C_STANDARD_REQUIRED ON)
+# The top-level CMakeLists reads PROJECT_VERSION out of include/cudec.h; these
+# hand the result back to the C side so that derivation is tested rather than
+# only asserted (issue #80).
+target_compile_definitions(
+  conformance_c
+  PRIVATE CUDEC_CMAKE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+          CUDEC_CMAKE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+          CUDEC_CMAKE_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 cudec_add_test(oracle_lz4 SOURCES oracle_lz4.cpp LIBS cudec_test_fixtures)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the

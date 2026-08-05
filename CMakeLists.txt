@@ -1,6 +1,31 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(cudec VERSION 0.0.1 LANGUAGES C)
+# The version has ONE source: the CUDEC_VERSION_* macros in include/cudec.h.
+# CMake reads them instead of restating the number, so a release bump touches
+# one file and package metadata cannot drift from what cudec_version()
+# reports. Reading the header (rather than configuring one) keeps it
+# self-contained for consumers who never run CMake. Fail-closed: a macro that
+# is missing, renamed, or not a plain integer is a configure error, never a
+# silent empty version - and the derivation is checked against the header a
+# second time at runtime, in tests/conformance_c.c.
+file(READ "${CMAKE_CURRENT_LIST_DIR}/include/cudec.h" _cudec_public_header)
+foreach(_component MAJOR MINOR PATCH)
+  if(NOT _cudec_public_header MATCHES
+     "\n#define CUDEC_VERSION_${_component} ([0-9]+)")
+    message(
+      FATAL_ERROR
+        "include/cudec.h defines no integer CUDEC_VERSION_${_component}; "
+        "the project version is read from those three macros.")
+  endif()
+  set(_cudec_version_${_component} "${CMAKE_MATCH_1}")
+endforeach()
+unset(_cudec_public_header)
+
+project(
+  cudec
+  VERSION
+    "${_cudec_version_MAJOR}.${_cudec_version_MINOR}.${_cudec_version_PATCH}"
+  LANGUAGES C)
 
 # The CUDA engine is opt-in and fail-closed: asking for it without a CUDA
 # toolchain is a hard configure error, never a silent host-only fallback (a

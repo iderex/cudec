@@ -35,6 +35,15 @@ int main(void) {
                                    CUDEC_VERSION_MINOR * 100 +
                                    CUDEC_VERSION_PATCH);
 
+    /* The build system derives PROJECT_VERSION from the macros above and
+     * hands the three numbers back as CUDEC_CMAKE_VERSION_*. A derivation
+     * that matched the wrong line in the header would otherwise configure
+     * clean and ship package metadata disagreeing with cudec_version(). An
+     * undefined macro here is a compile error, not a zero. */
+    REQUIRE(CUDEC_CMAKE_VERSION_MAJOR == CUDEC_VERSION_MAJOR);
+    REQUIRE(CUDEC_CMAKE_VERSION_MINOR == CUDEC_VERSION_MINOR);
+    REQUIRE(CUDEC_CMAKE_VERSION_PATCH == CUDEC_VERSION_PATCH);
+
     /* Every documented reject class, one call each: null arrays, null
      * results, misaligned results, empty batch, over-limit batch. */
     REQUIRE(cudec_lz4_decompress_batch(0, sizes, dsts, caps, 1, aligned, 0) ==
