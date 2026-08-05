@@ -13,16 +13,16 @@ on the GPU.
 
 The field today:
 
-| Existing work                   | Why it does not fill the gap                                                    |
-| ------------------------------- | ------------------------------------------------------------------------------- |
-| nvCOMP / nvCOMPDx (NVIDIA)      | Proprietary since v2.3; NVIDIA-only; not auditable                              |
-| dietgpu (Meta)                  | Open, but its own rANS format - not format-compatible                           |
-| GDeflate reference (MS/NV)      | Open spec + CPU codec; its GPU decoder is the HLSL shader in the row below      |
-| DirectStorage `GDeflate.hlsl`   | Open (Apache-2.0) GPU GDeflate decoder, but a shader inside a D3D12 runtime     |
-| DirectStorage `zstd/` (dev)     | Open HLSL zstd decompression shaders, marked by Microsoft as not for production |
-| vkd3d-proton `cs_gdeflate.comp` | Open (LGPL-2.1) GLSL GDeflate decoder, bound to the vkd3d-proton runtime        |
-| hipCOMP-core (AMD/ROCm)         | MIT fork of nvCOMP branch-2.2 on HIP; early-access preview, not for production  |
-| Academic prototypes             | Unmaintained research code                                                      |
+| Existing work                   | Why it does not fill the gap                                                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| nvCOMP / nvCOMPDx (NVIDIA)      | Proprietary since v2.3; NVIDIA-only; not auditable                                                                                   |
+| dietgpu (Meta)                  | Open, but its own rANS format - not format-compatible                                                                                |
+| GDeflate reference (MS/NV)      | Open spec + CPU codec; its GPU decoder is the HLSL shader in the row below                                                           |
+| DirectStorage `GDeflate.hlsl`   | Open (Apache-2.0) GPU GDeflate decoder, but a shader inside a D3D12 runtime                                                          |
+| DirectStorage `zstd/` (dev)     | Open HLSL zstd decode shaders; the sample says not for production, and the runtime compiles versions of them in as a driver fallback |
+| vkd3d-proton `cs_gdeflate.comp` | Open (LGPL-2.1) GLSL GDeflate decoder, bound to the vkd3d-proton runtime                                                             |
+| hipCOMP-core (AMD/ROCm)         | MIT fork of nvCOMP branch-2.2 on HIP; early-access preview, not for production                                                       |
+| Academic prototypes             | Unmaintained research code                                                                                                           |
 
 Where those rows come from, so the next pass does not re-derive them from
 memory: `GDeflate/shaders/GDeflate.hlsl` and the `zstd/` tree on the
@@ -32,6 +32,18 @@ memory: `GDeflate/shaders/GDeflate.hlsl` and the `zstd/` tree on the
 [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton);
 [ROCm/hipCOMP-core](https://github.com/ROCm/hipCOMP-core). Read at those
 paths on 2026-08-05.
+
+The zstd row is worth a paragraph of its own, because the open/production
+line runs through the middle of it rather than around it. `zstd/README.md` on
+that branch calls the shaders "reference implementations ... authored in HLSL"
+and says in red that the code "is currently in development and should NOT be
+used in production environments or for released products" - and, four lines
+later, that "versions of these same shaders are also included/compiled inside
+the DirectStorage runtime to be used as a fallback for GPUs that do not have
+optimized zstd GPU decompression driver support", most game-ready drivers
+carrying their own faster implementation. So an open GPU zstd decoder exists,
+some of it ships, and the fast paths on both sides of it are closed. The
+shaders live under `zstd/zstdgpu/Shaders`.
 
 No milestone here claims a "first", and that is deliberate. A code search
 for GDeflate in CUDA sources on the same day returned a partial decoder in
@@ -85,7 +97,11 @@ is not an empty AMD field), and **hackability**.
 4. **Zstd decode** (M5) - the flagship and by far the hardest: FSE/Huffman
    entropy stages feeding an LZ77 sequence executor with long-range matches.
    Attempted only once the kernel family, the oracle net, and the benchmark
-   discipline are proven on 1–3.
+   discipline are proven on 1–3. An open GPU zstd decoder already exists, in
+   HLSL, in a graphics runtime, and partly shipped (section 1); the drivers'
+   own zstd paths are closed and so is nvCOMP. What does not exist is an open
+   CUDA zstd decoder callable as a library, which is the claim space here and
+   is not a first.
 5. **HIP port** (M6) - portability as a moat. The kernels stay on warp-level
    primitives available on both vendors to keep this tractable. AMD is not
    an empty field: hipCOMP-core carries HIP LZ4 and Snappy decode (section
