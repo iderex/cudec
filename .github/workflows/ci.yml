@@ -129,7 +129,8 @@ jobs:
           test -x build-cuda/tests/frame_twin &&
           test -x build-cuda/tests/stream_twin &&
           test -x build-cuda/tests/termination_gpu &&
-          test -x build-cuda/tests/determinism_gpu
+          test -x build-cuda/tests/determinism_gpu &&
+          test -x build-cuda/tests/snappy_block_device
 
       # The other half of the install proof (issue #137). The host-only prefix
       # is the easy flavour: nothing reaches the exported interface. The CUDA
@@ -208,6 +209,7 @@ jobs:
           grep -E ': conformance_c$' host-selected.txt &&
           grep -E ': oracle_lz4$' host-selected.txt &&
           grep -E ': parser_twin$' host-selected.txt &&
+          grep -E ': snappy_parser_twin$' host-selected.txt &&
           grep -E ': termination$' host-selected.txt &&
           grep -E ': launch_fail$' host-selected.txt &&
           grep -E ': bench_selfcheck$' host-selected.txt &&
@@ -219,7 +221,8 @@ jobs:
           grep -E ': frame_twin$' gpu-deferred.txt &&
           grep -E ': stream_twin$' gpu-deferred.txt &&
           grep -E ': termination_gpu$' gpu-deferred.txt &&
-          grep -E ': determinism_gpu$' gpu-deferred.txt
+          grep -E ': determinism_gpu$' gpu-deferred.txt &&
+          grep -E ': snappy_block_device$' gpu-deferred.txt
 
   sanitize:
     # The host-side ASan/UBSan gate over the untrusted-input decode path (issue
@@ -262,8 +265,8 @@ jobs:
 
       # Host-only subset with the sanitizers on. The GPU tests and bench are
       # skipped by the CMake gate (they are nvcc-linked), so the build is pure
-      # host. The test -x lines are fail-closed: the four sanitized binaries
-      # must exist, so a build that silently stopped producing them reds here.
+      # host. The test -x lines are fail-closed: every sanitized binary must
+      # exist, so a build that silently stopped producing one reds here.
       - name: Build the host attack surface with ASan+UBSan
         run: >-
           cmake -B build-san -DCUDEC_ENABLE_CUDA=ON
@@ -272,6 +275,7 @@ jobs:
           test -x build-san/tests/conformance_c &&
           test -x build-san/tests/oracle_lz4 &&
           test -x build-san/tests/parser_twin &&
+          test -x build-san/tests/snappy_parser_twin &&
           test -x build-san/tests/frame_host_negative &&
           test -x build-san/tests/termination
 
@@ -290,16 +294,17 @@ jobs:
       # per-name identity greps mirror the build job: --no-tests=error only
       # reds on a ZERO selection, so a single sanitized test silently losing
       # its registration (say, by gaining a gpu-matching label) would shrink
-      # the set unnoticed - the greps pin all four by name so that reds too.
+      # the set unnoticed - the greps pin every one by name so that reds too.
       - name: Run the untrusted-input decode path under ASan+UBSan
         run: >-
           ctest --test-dir build-san --no-tests=error --output-on-failure -R
-          '^(conformance_c|oracle_lz4|parser_twin|frame_host_negative|termination)$'
+          '^(conformance_c|oracle_lz4|parser_twin|snappy_parser_twin|frame_host_negative|termination)$'
           &&
           ctest --test-dir build-san -N | tee san-selected.txt &&
           grep -E ': conformance_c$' san-selected.txt &&
           grep -E ': oracle_lz4$' san-selected.txt &&
           grep -E ': parser_twin$' san-selected.txt &&
+          grep -E ': snappy_parser_twin$' san-selected.txt &&
           grep -E ': frame_host_negative$' san-selected.txt &&
           grep -E ': termination$' san-selected.txt
 

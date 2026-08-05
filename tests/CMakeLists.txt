@@ -217,6 +217,25 @@ cudec_add_test(snappy_probes SOURCES snappy_probes.cpp LIBS
 # it runs on the GPU-less runner.
 cudec_add_test(snappy_corpus SOURCES snappy_corpus.cpp LIBS
                cudec_test_fixtures)
+# The Snappy counterpart of parser_twin (issue #171): the single-source
+# ladder from src/snappy_block.h executed on the host and held to snappy's
+# verdicts. Host-side, so the GPU-less runner and the sanitizer gate both
+# reach it - which is what makes the exactly-sized stream copy inside it
+# worth having.
+cudec_add_test(snappy_parser_twin SOURCES snappy_parser_twin.cpp LIBS
+               cudec_test_fixtures)
+target_include_directories(snappy_parser_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The other half of "single-source host AND device" (issue #171): the twin
+# above compiles src/snappy_block.h with the host compiler and this one hands
+# the same header to nvcc, then requires the two to produce an identical
+# element trace. Without it the device half of the header is a comment. Not
+# the device gate set (#154) - one thread, no warp cooperation, no kernel.
+cudec_add_test(snappy_block_device SOURCES snappy_block_device.cu GPU)
+if(TARGET snappy_block_device)
+  target_include_directories(snappy_block_device
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+endif()
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
