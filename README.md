@@ -10,10 +10,14 @@ memory-bandwidth speed - auditable, fail-closed, and fuzz-tested.**
 GPU decompression matters wherever decode throughput is the bottleneck:
 asset streaming, analytics scans, ML data loading, checkpoint restore. The
 only production-grade library in this space, NVIDIA's nvCOMP, has been
-proprietary since v2.3 - there is no maintained open-source library that
+proprietary since v2.3 - there is no maintained open-source CUDA library that
 decodes the standard formats on the GPU. Meta's dietgpu is open but uses its
-own rANS format; the GDeflate reference implementation is CPU-only; the
-academic prototypes are unmaintained.
+own rANS format; the open GPU GDeflate and Zstd decoders that do exist are
+shaders owned by a graphics runtime (DirectStorage, vkd3d-proton) rather than
+libraries you can call; AMD's hipCOMP-core is an early-access HIP preview
+downstream of a frozen nvCOMP fork; the academic prototypes are unmaintained.
+[docs/MASTERPLAN.md](docs/MASTERPLAN.md) section 1 has the field table and
+the sources.
 
 cudec fills that gap. Not on price - nvCOMP is free to use - but on the
 properties a closed binary cannot offer:
@@ -52,7 +56,7 @@ milestones:
 | M1 - LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      | done        |
 | M2 - LZ4 batch   | Frame format, batch API, streaming path, benchmarks | in progress |
 | M3 - Snappy      | Snappy decode on the same kernel family             | planned     |
-| M4 - GDeflate    | The first open GPU GDeflate decoder                 | planned     |
+| M4 - GDeflate    | GDeflate decode as an auditable CUDA library        | planned     |
 | M5 - Zstd        | Zstd decode (FSE/Huffman sequences)                 | planned     |
 | M6 - Portability | HIP port                                            | planned     |
 

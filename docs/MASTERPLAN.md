@@ -13,15 +13,40 @@ on the GPU.
 
 The field today:
 
-| Existing work              | Why it does not fill the gap                              |
-| -------------------------- | --------------------------------------------------------- |
-| nvCOMP / nvCOMPDx (NVIDIA) | Proprietary since v2.3; NVIDIA-only; not auditable        |
-| dietgpu (Meta)             | Open, but its own rANS format - not format-compatible     |
-| GDeflate reference (MS/NV) | Open spec + CPU codec; the GPU decoder is Windows-runtime |
-| Academic prototypes        | Unmaintained research code                                |
+| Existing work                   | Why it does not fill the gap                                                    |
+| ------------------------------- | ------------------------------------------------------------------------------- |
+| nvCOMP / nvCOMPDx (NVIDIA)      | Proprietary since v2.3; NVIDIA-only; not auditable                              |
+| dietgpu (Meta)                  | Open, but its own rANS format - not format-compatible                           |
+| GDeflate reference (MS/NV)      | Open spec + CPU codec; its GPU decoder is the HLSL shader in the row below      |
+| DirectStorage `GDeflate.hlsl`   | Open (Apache-2.0) GPU GDeflate decoder, but a shader inside a D3D12 runtime     |
+| DirectStorage `zstd/` (dev)     | Open HLSL zstd decompression shaders, marked by Microsoft as not for production |
+| vkd3d-proton `cs_gdeflate.comp` | Open (LGPL-2.1) GLSL GDeflate decoder, bound to the vkd3d-proton runtime        |
+| hipCOMP-core (AMD/ROCm)         | MIT fork of nvCOMP branch-2.2 on HIP; early-access preview, not for production  |
+| Academic prototypes             | Unmaintained research code                                                      |
 
-There is no maintained open-source library that decodes the standard formats
-on the GPU. The value proposition is not price (nvCOMP is free to use) but
+Where those rows come from, so the next pass does not re-derive them from
+memory: `GDeflate/shaders/GDeflate.hlsl` and the `zstd/` tree on the
+`development` branch of
+[microsoft/DirectStorage](https://github.com/microsoft/DirectStorage);
+`libs/vkd3d/shaders/cs_gdeflate.comp` in
+[vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton);
+[ROCm/hipCOMP-core](https://github.com/ROCm/hipCOMP-core). Read at those
+paths on 2026-08-05.
+
+No milestone here claims a "first", and that is deliberate. A code search
+for GDeflate in CUDA sources on the same day returned a partial decoder in
+an application tree (`crush-gpu/src/shader/gdeflate_decompress.cu` in
+john-agentic-ai-tools/crush: fixed-Huffman blocks only, no declared licence),
+so a bare "the first open CUDA GDeflate decoder" is refutable and is not
+made. hipCOMP-core's `src/lowlevel/gdeflateKernels.cu` is not a
+counterexample in the other direction - it is a status-conversion shim
+around an external `gdeflate::` component, not a decoder.
+
+There is no maintained open-source CUDA library that decodes the standard
+formats on the GPU. "Maintained", "CUDA" and "library" are all load-bearing:
+the open GPU decoders above are shaders belonging to a graphics runtime, and
+hipCOMP-core is a HIP preview downstream of a four-year-old fork point. The
+value proposition is not price (nvCOMP is free to use) but
 **auditability** (decompressors are classic attack surface; every bounds
 check here is readable, tested, and fuzzed), **portability** (a HIP port is
 a planned milestone - a vendor binary can never follow), and **hackability**.
@@ -50,17 +75,22 @@ a planned milestone - a vendor binary can never follow), and **hackability**.
    family generalizes.
 3. **GDeflate** (M4) - the strategic differentiator. The format is designed
    for GPU decode (the DEFLATE bitstream is split into 32 interleaved
-   sub-streams so a full warp reads Huffman codes in parallel), the spec is
-   open, and the reference implementation is CPU-only: the only shipping GPU
-   decoder lives inside the Windows DirectStorage runtime. An open CUDA
-   GDeflate decoder - usable on Linux, in HPC, anywhere - does not exist
-   until cudec ships it.
+   sub-streams so a full warp reads Huffman codes in parallel) and the spec
+   is open. Open GPU decoders already exist, but each one is a shader owned
+   by a graphics runtime - DirectStorage's HLSL decoder and vkd3d-proton's
+   GLSL one (section 1). What does not exist is an open CUDA GDeflate
+   decoder callable as a library, on Linux, in HPC, anywhere, and that is
+   what cudec ships.
 4. **Zstd decode** (M5) - the flagship and by far the hardest: FSE/Huffman
    entropy stages feeding an LZ77 sequence executor with long-range matches.
    Attempted only once the kernel family, the oracle net, and the benchmark
    discipline are proven on 1–3.
 5. **HIP port** (M6) - portability as a moat. The kernels stay on warp-level
-   primitives available on both vendors to keep this tractable.
+   primitives available on both vendors to keep this tractable. AMD is not
+   an empty field: hipCOMP-core carries HIP LZ4 and Snappy decode (section
+   1). The claim M6 can make is one audited fail-closed kernel family,
+   single-source across vendors behind a stable C ABI - never "first on
+   AMD".
 
 ## 4. Architecture pillars
 
@@ -187,7 +217,7 @@ a planned milestone - a vendor binary can never follow), and **hackability**.
 | M1 - LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed against liblz4, first honest numbers                                          |
 | M2 - LZ4 batch   | Frame format, batch API, pinned-host streaming path, published benchmark + methodology write-up                              |
 | M3 - Snappy      | Snappy decode on the shared kernel family                                                                                    |
-| M4 - GDeflate    | The first open GPU GDeflate decoder (32-substream warp decode)                                                               |
+| M4 - GDeflate    | GDeflate decode as an auditable CUDA library (32-substream warp decode)                                                      |
 | M5 - Zstd        | Zstd decode: FSE/Huffman stages + sequence execution                                                                         |
 | M6 - Portability | HIP port of the kernel family                                                                                                |
 
