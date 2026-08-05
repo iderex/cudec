@@ -277,6 +277,57 @@ Reproduce with `bench_lz4 --worst4b --gpu`; the construction is oracle-
 validated in-harness and locked against rot by the `bench_worst4b_selfcheck`
 ctest on the GPU-less runner.
 
+### Text-heavy: the enwik8 corpus (issue #138)
+
+`bench/get-corpora.sh` has pinned enwik8 since the corpora were pinned, and
+this file carried no row for it. That is the gap #138 was opened on: a pinned
+corpus we never measure is an unkept promise in the methodology document, so
+it either gains a row or loses its pin. It gains a row.
+
+The first 100 MB of an English Wikipedia dump, so pure marked-up text rather
+than the mixture Silesia averages over. No harness work was needed:
+`bench_lz4` takes corpus files positionally and splits any file into 64 KB
+chunks, so this is the same code path the Silesia rows use, on a different
+input. Recorded 2026-08-05 inside the digest-pinned dev container
+(`nvidia/cuda:12.6.2-devel-ubuntu24.04`) on the same RTX 3080 as every row
+above, `--warmup 3 --runs 30`. Fetched and verified before the run: zip
+SHA-256 `547994d9...34bc` and extracted-file SHA-256 `2b49720e...24a8`, both
+`OK` against `bench/get-corpora.sh`'s pins.
+
+```
+## bench_lz4 report
+- decoder: CPU oracle, LZ4_decompress_safe (liblz4 1.10.0), single thread
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 12.6, runtime 12.6
+- cudec: 1 (the CPU rows time the liblz4 oracle baseline; the GPU rows below, when --gpu is set, time cudec's decoder)
+- corpus: enwik8, 1526 chunks, 100.00 MB original, 57.00 MB compressed (ratio 0.570), compressed in-harness via LZ4_compress_default
+- chunk sizes: min 57600 / median 65536 / max 65536 bytes
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is LZ4_decompress_safe only (no clears, no allocation); output byte-verified once before timing; percentiles are nearest-rank
+- wall per run: p50 33.835 ms / p90 33.999 ms / p99 34.142 ms
+- decode throughput: p50 2.956 GB/s / p90 2.941 GB/s / p99 2.929 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs): p50 8.999 ms, 11.1 GB/s
+- GPU parse-only ceiling (copies elided): p50 4.592 ms, 21.8 GB/s - ceilings this design AND any two-phase phase-1 (shared parse)
+```
+
+What the row is worth keeping for: enwik8 is **not** a restatement of the
+Silesia average. Its GPU decode lands at 11.1 GB/s against Silesia's 18.1,
+about 1.6× slower, and its parse-only ceiling at 21.8 against 34.6, about the
+same factor. The CPU oracle moves much less, 2.956 against 3.41. So the
+corpus separates the two paths rather than scaling both, and the GPU-over-CPU
+factor falls from ~5.3× on Silesia to ~3.8× here. Had the row simply
+reproduced Silesia, unpinning would have been the better answer.
+
+What the row does **not** establish is why. enwik8 compresses worse than
+Silesia (ratio 0.570 against 0.483), which under the cost model already
+recorded above - cost linear in the number of sequences, not in output bytes -
+would predict exactly this direction, since a less compressible input carries
+more sequences per decoded byte. That is consistent with the number and is not
+measured by it: the harness reports no sequence count, and nothing here
+counted one. Stated as the reading it is.
+
+Reproduce with `bench/get-corpora.sh` followed by
+`bench_lz4 bench/corpora/enwik8 --gpu --warmup 3 --runs 30`.
+
 ### Cost of the termination fuel cap (issue #72)
 
 The sequence loop in `src/lz4_decode.cuh` now carries an explicit decrementing

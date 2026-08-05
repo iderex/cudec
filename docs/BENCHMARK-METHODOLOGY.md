@@ -72,16 +72,18 @@ workload the GPU path is built for.
   extend the offset-1 run into one long match), so the harness builds the
   block directly and the oracle validates it (round-trips through
   `LZ4_decompress_safe`) before any timing. This is the throughput worst case.
-- **enwik8** - fetched and hash-pinned by the harness for completeness, but
-  **not yet recorded with a GPU row**; when an enwik8 GPU number is published
-  it will carry its own full methodology block. It is listed here so the
-  corpus set is stated honestly, not to imply a measurement that does not
-  exist.
+- **enwik8** - the first 100 MB of an English Wikipedia dump, so pure
+  marked-up text rather than a mixture. 1526 chunks, 100.00 MB original,
+  57.00 MB compressed (ratio 0.570). Chunk sizes: min 57600 / median 65536 /
+  max 65536 bytes. Recorded 2026-08-05, later than the rows above and on the
+  same platform. This is the text-heavy case, and it is kept because it does
+  not reproduce the Silesia average.
 
 ## Measured results
 
-All figures are p50 of 30 runs, recorded 2026-07-17 on the platform above.
-The full per-report methodology blocks are in
+All figures are p50 of 30 runs, recorded 2026-07-17 on the platform above,
+except the enwik8 table, which was recorded 2026-08-05 on the same platform
+and says so again where it sits. The full per-report methodology blocks are in
 [BENCHMARKS.md](BENCHMARKS.md); this is the summary.
 
 ### Silesia (average case)
@@ -126,6 +128,28 @@ an attacker who fully controls a valid input can force. The honest findings:
   per-chunk output cap fail-closes the size axis regardless.
 - **The GPU advantage holds under the worst input:** 8.1 GB/s worst-case GPU
   is still ~5.4× the CPU worst case and ~2.3× the CPU's Silesia _average_.
+
+### enwik8 (text-heavy)
+
+Recorded 2026-08-05, same platform and same container digest as the tables
+above. `bench_lz4 bench/corpora/enwik8 --gpu --warmup 3 --runs 30`.
+
+| Path                                   | Throughput | vs. its Silesia row |
+| -------------------------------------- | ---------- | ------------------- |
+| CPU oracle, liblz4 single thread       | 2.96 GB/s  | ~1.15× slower       |
+| GPU decode, device-resident (cudec)    | 11.1 GB/s  | ~1.6× slower        |
+| GPU parse-only ceiling (copies elided) | 21.8 GB/s  | ~1.6× slower        |
+
+The corpus is kept pinned because of the right-hand column: the two GPU paths
+slow by roughly 1.6× while the CPU path barely moves, so the GPU-over-CPU
+factor falls from ~5.3× on Silesia to ~3.8× here. A corpus that reproduced
+Silesia would have earned its removal instead.
+
+Why it goes that way is not established by these numbers. enwik8 compresses
+worse than Silesia (ratio 0.570 against 0.483), and the cost model recorded
+for this kernel is linear in the number of sequences rather than in output
+bytes, which predicts this direction; the harness reports no sequence count,
+so nothing here measured it.
 
 ### Streaming, end-to-end (M2 reusable context)
 
