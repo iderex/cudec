@@ -1,0 +1,66 @@
+# Dependency review - the supply-chain half of the pull-request gate.
+#
+# What it gates, plainly: this repository has no npm, pip or cargo manifest.
+# Its dependency graph is the GitHub Actions the workflows call, which is
+# exactly the surface Dependabot proposes weekly (.github/dependabot.yml,
+# package-ecosystem: github-actions). So this job's real work is Action
+# version bumps - it reds a pull request that introduces an Action version
+# carrying a published advisory, which the cooldown and the SHA pins do not
+# do.
+#
+# What it does NOT reach. The CMake FetchContent oracle pins are outside the
+# dependency graph by design: tests/CMakeLists.txt fetches lz4 by URL and
+# SHA-256, and docs/MASTERPLAN.md records that those bumps are manual pull
+# requests owned by the supply-chain sweep. Nothing here covers them, and
+# nothing here should be read as covering them.
+
+name: dependency-review
+
+on:
+  pull_request:
+    branches: [main]
+
+# One in-flight run per pull request, matching ci.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Fail closed: no ambient token scope at the top level; the job re-grants the
+# minimum it needs.
+permissions: {}
+
+jobs:
+  dependency-review:
+    # The job name is the check context; keep it stable if it is ever added to
+    # the branch ruleset.
+    name: dependency-review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Review the dependency diff
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # 'low' rather than the action's 'low' default being left implicit:
+          # the whole graph here is a handful of Actions that run with a token
+          # in a repository that publishes releases, so there is no volume
+          # argument for tolerating a severity band. Anything advisory-bearing
+          # reds.
+          fail-on-severity: low
+          # No allow-licenses / deny-licenses. The graph holds Actions only,
+          # where GitHub's licence metadata is frequently absent, so a licence
+          # gate here would red on missing metadata rather than on a licence
+          # problem. The rule that matters - test oracles are vendored under
+          # their own BSD/zlib terms and never copied into the Apache-2.0 tree
+          # - lives where the vendoring happens (CONTRIBUTING.md, and the
+          # hash-pinned FetchContent block this job cannot see anyway).
+          #
+          # No summary comment: everything about a change belongs in its body,
+          # and the job would need pull-requests: write to post one.
+          comment-summary-in-pr: never
