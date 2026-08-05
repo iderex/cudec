@@ -430,13 +430,30 @@ endforeach()
 #    so a wrapped call would hide its mask from every rule here;
 #  - determinism: no floating-point type and no floating-point atomic, which
 #    is what makes the gpu_to_gpu level in docs/DETERMINISM.md hold by
-#    construction rather than by measurement.
+#    construction rather than by measurement;
+#  - wave width: no bare 32 or 64 outside the one line that binds it to a
+#    name. The maintainer's hardware is NVIDIA, so a hardcoded 32 left in a
+#    lane-stride expression is invisible to every test that can be run here
+#    and wrong on every wave64 device (issue #211). A width must arrive as the
+#    `WaveSize` template parameter or as a constant named after it, and the
+#    only place the digits themselves may appear is a `constexpr` definition
+#    or a `#define` whose entire initializer they are. The rule already caught
+#    one: the host copy of the batch limit in src/stream.cpp multiplied
+#    INT32_MAX by a bare 32 while its device twin used kWarpSize.
 #
 # Limits, stated as the neighbouring checks state theirs: constructs hidden
 # inside string literals are not stripped; a mask computed into a variable on
 # an earlier line is judged by its name at the call site; a `fuel` mention on
 # the line above an unrelated loop satisfies the loop rule; and a loop or
 # intrinsic introduced under a fresh spelling is code review's job.
+#
+# The width rule cannot tell a lane width from any other 32 or 64, and it does
+# not try: every one of them must be named, whatever it counts, and the cost of
+# a wrong guess is one `constexpr` line rather than a wrong answer on hardware
+# nobody here owns. What it does NOT catch is a width written any other way -
+# `31 + 1`, `0x20`, `1 << 5`, a `sizeof` that happens to be 32, or a name that
+# lies about what it holds. It is a drift detector under the spelling somebody
+# will actually type, like every rule above it.
 #
 # Backslash continuations split the rules in two, and the split is where each
 # rule's reason points (issue #251). The collective, legacy-intrinsic and
@@ -802,6 +819,30 @@ function(cudec_scan_source path check_loops out_violations)
              "  ${path}:${_lineno}: floating-point atomic - its result "
              "depends on the order the device happens to schedule\n")
     endif()
+
+    # The wave width. The digits may appear on exactly one kind of line: the
+    # one that binds them to a name, as the whole initializer, where a reader
+    # looking for what the width is finds it. The dot in the exclusions keeps
+    # 1.32 and .64 out, and every identifier character keeps uint32_t,
+    # INT32_MAX and 0x64 out.
+    set(_width_bound FALSE)
+    if(_code MATCHES "constexpr[^=]*=[ \t]*(32|64)[uUlL]*[ \t]*;")
+      set(_width_bound TRUE)
+    elseif(_code MATCHES
+           "#[ \t]*define[ \t]+[A-Za-z_][A-Za-z_0-9]*[ \t]+(32|64)[uUlL]*[ \t]*$")
+      set(_width_bound TRUE)
+    endif()
+    if(NOT _width_bound AND _code MATCHES
+       "[^A-Za-z_0-9.](32|64)[uUlL]*[^A-Za-z_0-9.]")
+      string(REGEX MATCH "[^A-Za-z_0-9.](32|64)[uUlL]*[^A-Za-z_0-9.]" _unused
+                   "${_code}")
+      string(APPEND _violations
+             "  ${path}:${_lineno}: bare wave-width literal "
+             "'${CMAKE_MATCH_1}' - the width comes from the WaveSize "
+             "parameter or from a constant named after it, never from digits "
+             "in an expression; a hardcoded 32 is invisible on every device "
+             "this project can test on\n")
+    endif()
   endforeach()
   # A file whose last line ends in a backslash leaves an element the loop rule
   # never got to judge, so the construct inside it went unread. Reject rather
@@ -1072,6 +1113,45 @@ file(WRITE ${_probe_dir}/scan_macro_for_opaque.cu
 # the unbalanced `for` header above.
 file(WRITE ${_probe_dir}/scan_continuation_at_eof.cu
      "void probe() {\n" "    g(1);\n" "}\n" "#define PROBE_TAIL(x) \\\n")
+# The wave-width rule (issue #211). One violating spelling per literal, so the
+# report's own text is what the probe asserts and the alternation cannot go
+# half-dead, plus the two silent shapes the rule exists to permit: the width
+# arriving as the template parameter, and the one line that binds the digits to
+# a name - which is the shape src/lz4_decode.cuh has carried since M1.
+file(WRITE ${_probe_dir}/scan_width_literal_32.cu
+     "template <int WaveSize>
+"
+     "__device__ unsigned probe(unsigned tid) {
+"
+     "    return tid % 32;
+" "}
+")
+file(WRITE ${_probe_dir}/scan_width_literal_64.cu
+     "template <int WaveSize>
+"
+     "__device__ unsigned probe(unsigned tid) {
+"
+     "    return tid / 64;
+" "}
+")
+file(WRITE ${_probe_dir}/scan_width_from_parameter.cu
+     "template <int WaveSize>
+"
+     "__device__ unsigned probe(unsigned tid) {
+"
+     "    constexpr unsigned kLanes = WaveSize;
+"
+     "    return tid % kLanes;
+" "}
+")
+file(WRITE ${_probe_dir}/scan_width_named_constant.cu
+     "constexpr unsigned kWaveLanes = 32;
+"
+     "__device__ unsigned probe(unsigned tid) {
+"
+     "    return tid % kWaveLanes;
+" "}
+")
 # The byte the reader borrows for its own bookkeeping, in the file it is
 # reading. It has to come back refused, or the borrowing is a way to write a
 # separator or a backslash the split will not see as one.
@@ -1122,6 +1202,10 @@ set(_scanner_probes
     "scan_macro_for_opaque|scan_macro_for_opaque.cu:1: a 'for' header without a visible"
     "scan_continuation_at_eof|scan_continuation_at_eof.cu:4: a backslash continuation left open at end of file"
     "scan_control_byte|a control byte (0x01 or 0x02) in a source read as text"
+    "scan_width_literal_32|scan_width_literal_32.cu:3: bare wave-width literal '32'"
+    "scan_width_literal_64|scan_width_literal_64.cu:3: bare wave-width literal '64'"
+    "scan_width_from_parameter|"
+    "scan_width_named_constant|"
 )
 foreach(_entry IN LISTS _scanner_probes)
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")

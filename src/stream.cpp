@@ -38,8 +38,14 @@ namespace cudec_stream_detail {
 constexpr size_t kWaveChunks = 64; /* chunks per wave: amortizes launch cost */
 
 /* The batch entry's own launch limit; a stream batch cannot exceed it either.
- * Kept in sync with validate_batch_args in lz4_decode.cuh. */
-constexpr size_t kMaxChunks = static_cast<size_t>(INT32_MAX) * 32;
+ * Kept in sync with validate_batch_args in lz4_decode.cuh, which writes the
+ * same product as INT32_MAX * kWarpSize. This host translation unit does not
+ * see that header, so the lane count is named here rather than left as digits:
+ * a wave64 device makes this bound wrong, and a bare 32 is exactly what
+ * nothing would have flagged (issue #211). Single-sourcing the two is the
+ * width port's job (#241, #242). */
+constexpr size_t kWarpLanes = 32;
+constexpr size_t kMaxChunks = static_cast<size_t>(INT32_MAX) * kWarpLanes;
 
 /* Metadata layout inside p_meta/d_meta for a wave of up to kWaveChunks chunks:
  * [src_ptrs][src_sizes][dst_ptrs][dst_caps], each kWaveChunks wide, 8-byte

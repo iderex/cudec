@@ -19,7 +19,11 @@ inline uint32_t xxh_read32(const unsigned char* p) {
 }
 
 inline uint32_t xxh_rotl(uint32_t x, int r) {
-    return (x << r) | (x >> (32 - r));
+    /* The accumulator's width, named because every bare 32 in this tree has
+     * to be (issue #211): a rotation width and a wave width look identical to
+     * a text scan, and only one of them is safe to leave as digits. */
+    constexpr int kAccumulatorBits = 32;
+    return (x << r) | (x >> (kAccumulatorBits - r));
 }
 
 inline uint32_t xxh_round(uint32_t acc, uint32_t input) {

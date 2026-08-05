@@ -216,7 +216,11 @@ cudec_status DecodeFrame(const unsigned char* f, size_t frame_size,
     if (bmax < 4 || bmax > 7) {
         return CUDEC_ERR_CORRUPT_INPUT;
     }
-    const size_t block_max = (size_t{64} << 10) << ((bmax - 4) * 2);
+    /* The frame format's smallest block-max, 64 KiB, doubled twice per BD
+     * step. Named for the reason issue #211 gives: digits in an expression
+     * cannot be told from a lane count by anything that reads this tree. */
+    constexpr size_t kBlockMaxKiB = 64;
+    const size_t block_max = (kBlockMaxKiB << 10) << ((bmax - 4) * 2);
     if (!block_independent || dict_id) {
         return CUDEC_ERR_UNSUPPORTED; /* linked blocks / dictionaries */
     }
