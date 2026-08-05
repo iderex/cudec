@@ -27,6 +27,11 @@ project(
     "${_cudec_version_MAJOR}.${_cudec_version_MINOR}.${_cudec_version_PATCH}"
   LANGUAGES C)
 
+# CMAKE_INSTALL_INCLUDEDIR / _LIBDIR are read below by the install interface of
+# the library target, so this has to come before the target is defined rather
+# than beside the install() rules at the end.
+include(GNUInstallDirs)
+
 # The CUDA engine is opt-in and fail-closed: asking for it without a CUDA
 # toolchain is a hard configure error, never a silent host-only fallback (a
 # CI job that passed without compiling the kernels would be a fail-open
@@ -61,8 +66,40 @@ if(CUDEC_SANITIZE)
   set(CUDEC_SANITIZE_LINK_FLAGS -fsanitize=${CUDEC_SANITIZE})
 endif()
 
-add_library(cudec src/version.c)
-target_include_directories(cudec PUBLIC include)
+# Static only, and pinned rather than left to a global switch (issue #79). A
+# shared cudec needs SOVERSION discipline and symbol-visibility work - decide
+# what is exported, hide the rest, hold the soname to the ABI - and none of that
+# exists yet. Building one anyway would produce a library whose ABI story is
+# unmanaged while looking exactly like one whose story is managed, which is the
+# worse of the two failures. Revisit when a packager asks for it or at 1.0,
+# whichever comes first; the work is the visibility audit, not this line.
+#
+# The explicit STATIC is what enforces it, so BUILD_SHARED_LIBS=ON cannot
+# produce a shared cudec by accident. The refusal below is scoped to a top-level
+# build on purpose: a superbuild that sets BUILD_SHARED_LIBS globally and
+# vendors cudec is asking for shared *everything else*, and killing its
+# configure over a library it gets statically either way would be this project
+# reaching outside its own build.
+add_library(cudec STATIC src/version.c)
+if(BUILD_SHARED_LIBS AND PROJECT_IS_TOP_LEVEL)
+  message(
+    FATAL_ERROR
+      "cudec builds as a static library only. BUILD_SHARED_LIBS=ON would need "
+      "an SOVERSION and a symbol-visibility policy this project has not "
+      "settled (issue #79).")
+endif()
+
+# The in-tree spelling of the exported name, so a consumer inside this build
+# and a consumer of the installed package link the same string.
+add_library(cudec::cudec ALIAS cudec)
+# One include directory, two spellings, because the path differs between the
+# tree it is built in and the prefix it is installed to. The install-tree half
+# is stated here and NOT a second time via install(TARGETS ... INCLUDES
+# DESTINATION): both write the same entry, and using both ships the exported
+# INTERFACE_INCLUDE_DIRECTORIES with the directory listed twice.
+target_include_directories(
+  cudec PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 if(NOT MSVC)
   target_compile_options(cudec
@@ -203,4 +240,68 @@ if(CUDEC_ENABLE_CUDA)
   # Last, so it sees every directory both subdirectories added: no ctest entry
   # anywhere in the tree may have escaped the timeout check (issue #72).
   cudec_sweep_test_timeouts(${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
+# ---- The install surface (issue #79). A release nobody can install is not a
+# release, and until this existed every consumer had to vendor the tree.
+#
+# Placed after both configurations so the exported target is whatever this
+# configure actually built, and after tests/ so nothing here can slip a
+# property past the conformance snapshot inside it: install() rules read the
+# target, they do not modify it.
+#
+# Top-level only. A project that vendors cudec by add_subdirectory or
+# FetchContent gets the target, not the packaging: without this guard its own
+# `cmake --install` would ship cudec's header, archive and package config into
+# the parent's prefix, where find_package(cudec) would then find a config the
+# parent never meant to publish and shadow a real install.
+if(PROJECT_IS_TOP_LEVEL)
+  include(CMakePackageConfigHelpers)
+
+  # No INCLUDES DESTINATION here: the install-tree include path is already in
+  # the target's interface as $<INSTALL_INTERFACE:...>, and stating it both
+  # ways writes the same directory into the exported
+  # INTERFACE_INCLUDE_DIRECTORIES twice.
+  install(
+    TARGETS cudec
+    EXPORT cudec-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+  # The whole public surface is one header, by design: include/cudec.h needs no
+  # CUDA headers and pulls in nothing but stddef.h and stdint.h. src/ is
+  # internal and is not installed.
+  install(FILES include/cudec.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+  install(
+    EXPORT cudec-targets
+    FILE cudec-targets.cmake
+    NAMESPACE cudec::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudec)
+
+  # SameMinorVersion, and the reason is the 0.x in the version rather than a
+  # preference. SemVer itself promises nothing at 0.y.z - "anything MAY change
+  # at any time" - so this is a convention this project adopts and states,
+  # not a rule read out of the specification. The convention is the common one:
+  # at 0.x the minor bump is the breaking one, so 0.0.1 and 0.1.0 are not
+  # interchangeable and a consumer asking for 0.0 must not be handed 0.1.
+  # ExactVersion was the alternative and is too strict in the other direction:
+  # it would refuse 0.0.2 to a consumer who wrote 0.0.1 and meant the patch
+  # series, which is the axis this project intends to keep compatible.
+  #
+  # The revisit is at 1.0, where the same convention gives SameMajorVersion.
+  # That is a deliberate change of policy at a deliberate moment, not a default
+  # to drift into.
+  write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/cudec-config-version.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMinorVersion)
+
+  configure_package_config_file(
+    "${CMAKE_CURRENT_LIST_DIR}/cmake/cudec-config.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/cudec-config.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudec)
+
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cudec-config.cmake"
+                "${CMAKE_CURRENT_BINARY_DIR}/cudec-config-version.cmake"
+          DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudec)
 endif()

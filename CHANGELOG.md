@@ -47,6 +47,22 @@ today.
 - **`cudec_version()`** and the `CUDEC_VERSION_*` macros, single-sourced: the
   build system reads the version out of the public header, and a conformance
   test refuses a mismatch between the two.
+- **An install surface.** `cmake --install` produces a prefix carrying the
+  public header, the archive, and a package config, so an outside project links
+  cudec through `find_package(cudec)` and the exported `cudec::cudec` target
+  instead of vendoring the tree. The compatibility rule is `SameMinorVersion`,
+  which at 0.x means a consumer asking for 0.0 is not handed 0.1. CI installs
+  the host-only build and builds and runs an out-of-tree consumer against the
+  result, in both directions of that version rule. The CUDA-flavoured prefix
+  installs but is not consumable yet, because its package config does not yet
+  carry `find_dependency(CUDAToolkit)`.
+
+### Changed
+
+- **`BUILD_SHARED_LIBS=ON` is refused in a top-level cudec build** rather than
+  producing a shared library with no SOVERSION and no symbol-visibility policy.
+  A project that vendors cudec as a subdirectory is unaffected: it gets a static
+  cudec and keeps its own setting.
 
 ### Supported subset, stated as limits rather than implied
 

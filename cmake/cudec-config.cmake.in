@@ -1,0 +1,19 @@
+# The package config find_package(cudec) loads (issue #79).
+#
+# It stays this short on purpose. cudec's public surface is one header and one
+# static library with no dependency outside the CUDA runtime, so the config has
+# nothing to search for and nothing to reconcile; anything more here would be
+# machinery describing a complexity the library does not have.
+#
+# The CUDA-flavoured install needs one more thing than this: a static library
+# links CUDA::cudart privately, which still reaches the consumer's targets file
+# as $<LINK_ONLY:CUDA::cudart>, so a consumer of a CUDA-enabled prefix has to
+# be handed find_dependency(CUDAToolkit) before the targets file is included.
+# That is issue #137 and it is deliberately not stubbed here: a guard written
+# before the consumer that proves it exists is a guard nobody has watched bite.
+
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/cudec-targets.cmake")
+
+check_required_components(cudec)

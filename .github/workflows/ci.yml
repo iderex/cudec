@@ -66,6 +66,55 @@ jobs:
       - name: Configure and build (host-only)
         run: cmake -B build && cmake --build build
 
+      # The install surface is proven by consuming it, never by inspecting it
+      # (issue #79). Install the host-only build into a prefix, then configure,
+      # build AND RUN a project outside this tree that knows nothing but
+      # find_package(cudec) - so a broken export set, a header installed where
+      # the exported include interface does not point, or a package config that
+      # never reaches the targets file reds this gate.
+      #
+      # It runs rather than only links because an archive can carry a symbol
+      # the consumer never actually reaches; cudec_version() touches no device,
+      # so the GPU-less runner can execute it. Fail-closed on the two files the
+      # consumer would otherwise fail on with a worse message, and the config
+      # is located rather than assumed at lib/ - GNUInstallDirs is free to put
+      # it under lib64 on another distribution.
+      #
+      # The consumer is driven TWICE, and both runs pass a version, because
+      # config mode reads cudec-config-version.cmake only when the caller
+      # requests one: a no-version consumer configures happily against a prefix
+      # whose version file was never installed. 0.0.1 must be accepted, 0.1
+      # must be refused, and the refusal leg reds if that configure SUCCEEDS.
+      #
+      # What that pair does NOT prove, stated so the gate is not read as
+      # stronger than it is: at 0.0.1 no request separates SameMinorVersion
+      # from SameMajorVersion or AnyNewerVersion, because every one of them
+      # refuses a request above the installed version. Measured by swapping the
+      # mode to AnyNewerVersion and watching this step stay green. What the
+      # legs do prove is that the version file is installed and consulted -
+      # dropping it from the install reds the step - and the modes become
+      # distinguishable the first time the minor moves.
+      - name: Install and consume out of tree (host-only)
+        run: >-
+          cmake --install build --prefix "$PWD/prefix-host" &&
+          test -f "$PWD/prefix-host/include/cudec.h" &&
+          test -n "$(find "$PWD/prefix-host" -name cudec-config.cmake
+          -print -quit)" &&
+          test -n "$(find "$PWD/prefix-host" -name cudec-config-version.cmake
+          -print -quit)" &&
+          cmake -S tests/consumer -B build-consumer
+          -DCMAKE_PREFIX_PATH="$PWD/prefix-host"
+          -DCUDEC_CONSUMER_REQUEST_VERSION=0.0.1 &&
+          cmake --build build-consumer &&
+          ./build-consumer/consumer &&
+          if cmake -S tests/consumer -B build-consumer-badver
+          -DCMAKE_PREFIX_PATH="$PWD/prefix-host"
+          -DCUDEC_CONSUMER_REQUEST_VERSION=0.1 > badver.log 2>&1; then
+          echo "FAIL: find_package(cudec 0.1) was accepted against a 0.0.1
+          prefix - the version policy is not being applied"; exit 1; else
+          echo "PASS: find_package(cudec 0.1) refused against a 0.0.1 prefix";
+          fi
+
       # Unconditional AND self-verifying: the GPU-test binaries exist only
       # if the CUDA configuration actually built the device TUs, so a
       # renamed CMake option cannot quietly turn this step into a green
