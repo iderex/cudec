@@ -9,11 +9,10 @@ recorded numbers can observe. Internal refactors, test-net work and process
 changes stay in the git history and in their issues, where they are already
 readable.
 
-No version has been released yet. `include/cudec.h` reports 0.0.1 and no tag
+No version has been released yet. `include/cudec.h` reports 0.1.0 and no tag
 exists, so the entry below sits under Unreleased rather than under a number and
 a date this project has not chosen: the released heading is the release's to
-write, together with the version bump (#82). Everything in it is in the tree
-today.
+write (#82). Everything in it is in the tree today.
 
 ## [Unreleased]
 
