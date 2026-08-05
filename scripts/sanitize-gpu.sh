@@ -94,7 +94,7 @@ is not a clean sweep. Configure with -DCUDEC_ENABLE_CUDA=ON."
 # otherwise shrink this sweep and still print PASS. The names are that job's,
 # so the two gates cannot drift apart unnoticed.
 for known in smoke gpu_fixture frame_twin stream_twin termination_gpu \
-    determinism_gpu; do
+    determinism_gpu snappy_block_device; do
     printf '%s\n' "$tests" | grep -qx "$known" ||
         die "gpu test '$known' is absent from the discovered set - the sweep
 would cover less than the CI job's own cross-check demands."
