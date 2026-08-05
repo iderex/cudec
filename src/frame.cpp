@@ -14,14 +14,18 @@
 #include <cstring>
 #include <vector>
 
-/* PROBE for #70 - reverted in the next commit. A deliberate unbounded write,
- * so an alert on THIS file proves the analysed configuration extracts it.
- * Never called from anywhere. */
-void cudec_codeql_probe_delete_me(const char* name);
-void cudec_codeql_probe_delete_me(const char* name) {
+/* PROBE for #70 - reverted before merge. Two deliberate defects that need no
+ * taint source, so an alert on THIS file proves the analysed configuration
+ * extracts it. Never called from anywhere. */
+int cudec_codeql_probe_delete_me(int n);
+int cudec_codeql_probe_delete_me(int n) {
+    int value;
+    if (n > 0) {
+        value = n;
+    }
     char narrow[4];
-    std::strcpy(narrow, name);
-    (void)narrow;
+    std::memcpy(narrow, "0123456789", 10);
+    return value + narrow[0];
 }
 
 namespace {
