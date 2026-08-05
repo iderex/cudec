@@ -1,0 +1,132 @@
+# A decode bug is only actionable with the device, the toolchain and the input.
+# Every field below that is marked required is one whose absence has to be
+# asked back for before anything can be reproduced.
+name: Bug report
+description: Something cudec does is wrong, and it is not a decode divergence against a reference implementation.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If the bug is a crafted bitstream causing memory corruption, a hang, or
+        any other memory-safety failure, close this form and use
+        [private vulnerability reporting](https://github.com/iderex/cudec/security/advisories/new)
+        instead. A public issue for that is a disclosure you cannot take back.
+
+        If cudec and a reference implementation disagree about a stream, the
+        decode divergence form fits better than this one.
+
+  - type: input
+    id: version
+    attributes:
+      label: cudec version or commit
+      description: The output of `cudec_version()`, or the commit SHA you built.
+      placeholder: "0.0.1, or ab133e0"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU model
+      description: As `nvidia-smi --query-gpu=name --format=csv,noheader` prints it.
+      placeholder: NVIDIA GeForce RTX 3080
+    validations:
+      required: true
+
+  - type: input
+    id: driver
+    attributes:
+      label: Driver version
+      description: As `nvidia-smi --query-gpu=driver_version --format=csv,noheader` prints it.
+      placeholder: "581.15"
+    validations:
+      required: true
+
+  - type: input
+    id: cuda
+    attributes:
+      label: CUDA toolkit version
+      description: The last line of `nvcc --version`.
+      placeholder: "12.6.77"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Where it was built and run
+      description:
+        A container and a native toolchain can differ in driver, runtime and
+        architecture flags, so the answer changes what to reproduce on.
+      options:
+        - Container (Docker, Podman, Apptainer)
+        - Native Linux
+        - Native Windows
+        - WSL2
+        - Other, described below
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what you expected instead
+      description: Include the `cudec_status` value returned, and the per-chunk
+        `status` and `bytes_written` where a batch call is involved.
+      placeholder: |
+        Called cudec_lz4_decompress_batch with 4 chunks. Chunk 2 came back
+        CUDEC_ERR_CORRUPT_INPUT (2) with bytes_written 0. liblz4 decodes the
+        same chunk to 65536 bytes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: How to reproduce it
+      description:
+        The smallest thing that shows the failure. A complete program is
+        better than a description of one, and the exact compile and run
+        commands are part of it.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: input-availability
+    attributes:
+      label: The input that triggers it
+      description:
+        The bytes matter more than anything else in this form. If they cannot
+        be shared, say so here rather than leaving it open.
+      options:
+        - Attached to this issue
+        - Reproducible by the generator or command shown above
+        - I have it and can share it privately on request
+        - I cannot share it, and cannot produce a substitute
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: fixture-consent
+    attributes:
+      label: Test fixture
+      description:
+        A reproducer only stops a bug coming back if it can live in the test
+        suite. This is the permission to put it there, and leaving it unticked
+        is a fine answer.
+      options:
+        - label: This input is not confidential and may be checked into the
+            repository as a test fixture under Apache-2.0.
+          required: false
+
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything else
+      description:
+        Compute Sanitizer output, `dmesg`, a stack trace, or the surrounding
+        code if the call is not standalone.
+    validations:
+      required: false
