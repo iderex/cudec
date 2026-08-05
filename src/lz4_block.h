@@ -22,10 +22,17 @@
 
 #include <stdint.h>
 
+/* Guarded: src/snappy_block.h defines the same macro for the same reason,
+ * and a device translation unit that decodes both formats includes both
+ * headers. The definitions are identical, so an unguarded second one is
+ * legal rather than an error - which is exactly why it would go unnoticed
+ * if they ever stopped being identical. */
+#ifndef CUDEC_HOST_DEVICE
 #if defined(__CUDACC__)
 #define CUDEC_HOST_DEVICE __host__ __device__
 #else
 #define CUDEC_HOST_DEVICE
+#endif
 #endif
 
 namespace cudec_detail {
