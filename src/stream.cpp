@@ -23,6 +23,7 @@
  * single stream whose one reusable staging set is grown on demand and reused;
  * the amortization this context buys is real but small. See docs/BENCHMARKS.md
  * for the corrected overlap analysis and the output-D2H future lever. */
+#include "batch_limits.h"
 #include "cudec.h"
 
 #include "cuda_raii.h"
@@ -37,15 +38,10 @@ namespace cudec_stream_detail {
 
 constexpr size_t kWaveChunks = 64; /* chunks per wave: amortizes launch cost */
 
-/* The batch entry's own launch limit; a stream batch cannot exceed it either.
- * Kept in sync with validate_batch_args in lz4_decode.cuh, which writes the
- * same product as INT32_MAX * kWarpSize. This host translation unit does not
- * see that header, so the lane count is named here rather than left as digits:
- * a wave64 device makes this bound wrong, and a bare 32 is exactly what
- * nothing would have flagged (issue #211). Single-sourcing the two is the
- * width port's job (#241, #242). */
-constexpr size_t kWarpLanes = 32;
-constexpr size_t kMaxChunks = static_cast<size_t>(INT32_MAX) * kWarpLanes;
+/* The batch entry's launch limit bounds a stream batch too, and it is
+ * cudec_detail::kMaxBatchChunks in src/batch_limits.h for both of them - the
+ * duplicate that used to live here is what issue #39 was about. */
+using cudec_detail::kMaxBatchChunks;
 
 /* Metadata layout inside p_meta/d_meta for a wave of up to kWaveChunks chunks:
  * [src_ptrs][src_sizes][dst_ptrs][dst_caps], each kWaveChunks wide, 8-byte
@@ -149,7 +145,7 @@ cudec_status ValidateStreamArgs(const void* const* h_src_ptrs,
                                 const cudec_chunk_result* h_results) {
     if (h_src_ptrs == nullptr || h_src_sizes == nullptr ||
         dst_ptrs == nullptr || dst_caps == nullptr || h_results == nullptr ||
-        chunk_count == 0 || chunk_count > kMaxChunks ||
+        chunk_count == 0 || chunk_count > kMaxBatchChunks ||
         (dst_space != CUDEC_MEM_HOST && dst_space != CUDEC_MEM_DEVICE)) {
         return CUDEC_ERR_INVALID_ARGUMENT;
     }

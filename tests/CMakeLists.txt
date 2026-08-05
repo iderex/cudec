@@ -229,6 +229,13 @@ target_include_directories(parser_twin
 # sanitizer gate (issue #42), gives src/frame.cpp's hostile-input pointer
 # arithmetic ASan/UBSan coverage that the GPU-labeled frame_twin cannot get in
 # CI. It computes header checksums with the library's own xxhash32.h.
+# Both entry points against the one shared launch limit (issue #39). Host-side:
+# every call in it is an argument reject that returns before any CUDA call, so
+# it runs on the GPU-less runner. It reads the limit from src/, like the twins.
+cudec_add_test(batch_limit_parity SOURCES batch_limit_parity.cpp)
+target_include_directories(batch_limit_parity
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 cudec_add_test(frame_host_negative SOURCES frame_host_negative.cpp)
 target_include_directories(frame_host_negative
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -396,6 +403,77 @@ foreach(_tu frame.cpp stream.cpp)
                           "(issue #40)")
     endif()
   endforeach()
+endforeach()
+
+# Single-source lock for the batch launch limit (issue #39): the bound both
+# decode entry points enforce lives once, in src/batch_limits.h, and the two
+# callers read it from there. It used to be written twice and held in agreement
+# by a comment, which is a fail-open on a fail-closed boundary as soon as one
+# copy moves: a chunk_count the streaming pre-check accepts and the batch entry
+# then rejects per wave.
+#
+# The detector is the arithmetic itself. INT32_MAX is what the bound is built
+# from, so a second source writing its own bound has to name it, and this
+# refuses any source but the header doing so. Honest limit, as with the checks
+# above: a copy that computes the same number a different way is not caught -
+# a drift detector, not tamper-proofing.
+set(_limits_header ${CMAKE_CURRENT_SOURCE_DIR}/../src/batch_limits.h)
+if(NOT EXISTS ${_limits_header})
+  message(FATAL_ERROR "src/batch_limits.h is missing: the batch launch limit "
+                      "must be single-sourced there (issue #39)")
+endif()
+file(READ ${_limits_header} _limits_src)
+if(NOT _limits_src MATCHES "kMaxBatchChunks")
+  message(FATAL_ERROR "src/batch_limits.h no longer defines kMaxBatchChunks "
+                      "(issue #39)")
+endif()
+foreach(_tu lz4_decode.cuh stream.cpp)
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_tu} _tu_src)
+  if(NOT _tu_src MATCHES "#include \"batch_limits.h\"")
+    message(FATAL_ERROR "src/${_tu} no longer includes batch_limits.h: the "
+                        "batch launch limit is single-sourced there "
+                        "(issue #39)")
+  endif()
+  # The comparison itself, not merely a mention of the name: a translation unit
+  # can carry the include, keep the using-declaration and still bound
+  # chunk_count by some other constant, which is the divergence this lock
+  # exists for. Measured, not supposed - a streaming bound raised to twice the
+  # canonical one passes every behavioural check available at that magnitude,
+  # because no caller can hand the validator an array of tens of billions of
+  # entries to walk.
+  if(NOT _tu_src MATCHES "chunk_count > kMaxBatchChunks")
+    message(FATAL_ERROR "src/${_tu} no longer bounds chunk_count by "
+                        "kMaxBatchChunks: both entry points enforce the one "
+                        "shared limit (issue #39)")
+  endif()
+endforeach()
+# Every source, not a list somebody has to remember to extend: a new
+# translation unit carrying its own bound is exactly the case this is for.
+file(GLOB_RECURSE _batch_limit_sources RELATIVE
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.c
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cc
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cu
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cuh
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.hpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.inl)
+if(NOT _batch_limit_sources)
+  message(FATAL_ERROR "the batch-limit sweep found no sources under src/ - the "
+                      "glob has stopped matching (issue #39)")
+endif()
+foreach(_source IN LISTS _batch_limit_sources)
+  if(NOT _source STREQUAL "batch_limits.h")
+    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source} _source_src)
+    if(_source_src MATCHES "INT32_MAX")
+      message(
+        FATAL_ERROR
+          "src/${_source} builds its own bound from INT32_MAX - the batch "
+          "launch limit is cudec_detail::kMaxBatchChunks in "
+          "src/batch_limits.h (issue #39)")
+    endif()
+  endif()
 endforeach()
 
 # ---- Termination, warp-collective integrity, and determinism as structural
