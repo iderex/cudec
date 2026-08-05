@@ -23,9 +23,7 @@ int cudec_codeql_probe_delete_me(int n) {
     if (n > 0) {
         value = n;
     }
-    char narrow[4];
-    std::memcpy(narrow, "0123456789", 10);
-    return value + narrow[0];
+    return value;
 }
 
 namespace {
