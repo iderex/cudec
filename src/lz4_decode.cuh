@@ -7,6 +7,7 @@
 #ifndef CUDEC_LZ4_DECODE_CUH
 #define CUDEC_LZ4_DECODE_CUH
 
+#include "batch_limits.h"
 #include "cudec.h"
 #include "lz4_block.h"
 
@@ -14,7 +15,6 @@
 
 namespace cudec_detail {
 
-constexpr unsigned kWarpSize = 32;
 constexpr unsigned kBlockWarps = 4;
 constexpr unsigned kBlockThreads = kWarpSize * kBlockWarps;  /* 128 */
 
@@ -165,14 +165,11 @@ inline cudec_status validate_batch_args(const void* const* d_src_ptrs,
                                         const size_t* d_dst_capacities,
                                         size_t chunk_count,
                                         cudec_chunk_result* d_results) {
-    constexpr size_t kMaxChunks = static_cast<size_t>(INT32_MAX) * kWarpSize;
-    static_assert(kMaxChunks < SIZE_MAX,
-                  "the SIZE_MAX over-limit contract test relies on this");
     if (d_src_ptrs == nullptr || d_src_sizes == nullptr ||
         d_dst_ptrs == nullptr || d_dst_capacities == nullptr ||
         d_results == nullptr ||
         reinterpret_cast<uintptr_t>(d_results) % 16 != 0 ||
-        chunk_count == 0 || chunk_count > kMaxChunks) {
+        chunk_count == 0 || chunk_count > kMaxBatchChunks) {
         return CUDEC_ERR_INVALID_ARGUMENT;
     }
     return CUDEC_OK;
