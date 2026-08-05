@@ -1,0 +1,63 @@
+# The format ladder and the milestones are already decided in
+# docs/MASTERPLAN.md, so the useful part of a feature request is rarely the
+# format name. It is the use case, which is what says whether the ask is the
+# ladder arriving sooner or a shape the ladder does not have.
+name: Feature request
+description: A format, an API shape, or a build surface cudec does not have.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The planned formats and their milestones are in
+        [docs/MASTERPLAN.md](https://github.com/iderex/cudec/blob/main/docs/MASTERPLAN.md)
+        and the current state is the milestone table in the README. If the ask
+        is one of those arriving sooner, say so plainly and describe what is
+        waiting on it; that is useful and does not need to be dressed up as
+        something new.
+
+        cudec decodes and does not compress. That is a design decision rather
+        than a gap, so a compression ask will be closed as out of scope.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of ask
+      options:
+        - A compressed format cudec does not decode
+        - An API shape on the existing formats
+        - Build, packaging or platform support
+        - Something else, described below
+    validations:
+      required: true
+
+  - type: textarea
+    id: ask
+    attributes:
+      label: What you want cudec to do
+      description:
+        Concretely. If it is an API ask, the signature you would want to call
+        is worth more than a description of it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: The use case
+      description:
+        What you are building, what is decompressing today, and what it costs
+        you. This is the field that decides the priority, and a request without
+        it is hard to place against the milestones.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you are doing instead today
+      description:
+        A CPU library, another GPU decoder, or a workaround. Say if the
+        workaround is fine and this is only a convenience.
+    validations:
+      required: false

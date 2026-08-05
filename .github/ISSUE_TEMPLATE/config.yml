@@ -1,0 +1,20 @@
+# The New Issue chooser.
+#
+# Blank issues stay on. The maintainer files most of this tracker by hand and
+# the forms below are shaped for reports from outside; forcing every internal
+# issue through a bug-report schema would cost more than the structure buys.
+#
+# The contact link is the load-bearing part. SECURITY.md requires that a
+# crafted-bitstream report goes through private vulnerability reporting, and a
+# chooser that offers no such route invites the reporter to open a public issue
+# instead, which is a disclosure failure the reporter cannot undo. There is
+# deliberately no vulnerability *form*: any form here creates a public issue.
+blank_issues_enabled: true
+
+contact_links:
+  - name: Report a vulnerability privately
+    url: https://github.com/iderex/cudec/security/advisories/new
+    about:
+      A crafted bitstream that causes memory corruption, a hang, or any other
+      memory-safety failure goes here, not into a public issue. This opens a
+      private security advisory. See SECURITY.md.

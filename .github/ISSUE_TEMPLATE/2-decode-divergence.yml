@@ -1,0 +1,118 @@
+# The oracles decide. A report that cudec and a reference implementation
+# disagree about one stream is the highest-value thing an outside reader can
+# send, because it is the exact shape of failure the whole test net is built to
+# catch, and one that escaped it. It gets its own form so the two verdicts and
+# the stream are never the fields that went missing.
+name: Decode divergence
+description: cudec and a reference implementation disagree about the same stream, in either direction.
+labels: ["bug", "area:formats"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Both directions count and neither is the boring one.
+
+        cudec accepting a stream the reference rejects is a fail-open, which is
+        the severe direction: the oracle-parity rule is that whenever the
+        reference rejects, cudec rejects too. cudec rejecting one the reference
+        accepts is a false reject. Bytes differing on a stream both accept is a
+        correctness bug in the decode itself.
+
+        cudec carries one deliberate divergence, documented in
+        `src/lz4_block.h` and pinned by `tests/parser_twin.cpp`: a match offset
+        of 0 is refused, where liblz4 tolerates it. If that is what you found,
+        it is known and intended.
+
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Which way the disagreement goes
+      options:
+        - cudec accepts, the reference rejects
+        - cudec rejects, the reference accepts
+        - Both accept, and the output bytes differ
+    validations:
+      required: true
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: Format
+      options:
+        - LZ4 block
+        - LZ4 frame
+    validations:
+      required: true
+
+  - type: input
+    id: reference
+    attributes:
+      label: Reference implementation and version
+      description:
+        The exact version, not "latest". The suite holds liblz4 1.10.0 as the
+        authority on validity, so a different version is itself worth knowing.
+      placeholder: liblz4 1.10.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: reference-verdict
+    attributes:
+      label: What the reference did
+      description:
+        Its return value or exit status, the decoded size, and the command or
+        call that produced it.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: cudec-verdict
+    attributes:
+      label: What cudec did
+      description:
+        The `cudec_status` value, and for a batch call the per-chunk `status`
+        and `bytes_written`. Include the call as you made it.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: stream
+    attributes:
+      label: The stream
+      description: Attach the file, or paste it base64-encoded if it is small. A
+        divergence report without the bytes cannot be turned into a test.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: cudec version or commit
+      placeholder: "0.0.1, or ab133e0"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU model, driver and CUDA version
+      description:
+        Skip this only if you reproduced the divergence on the host-side parser
+        twin, in which case say that instead.
+      placeholder: RTX 3080, driver 581.15, CUDA 12.6.77
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: fixture-consent
+    attributes:
+      label: Test fixture
+      description:
+        A divergence that becomes a fixture is a divergence that cannot come
+        back. Leaving this unticked is a fine answer.
+      options:
+        - label: This stream is not confidential and may be checked into the
+            repository as a test fixture under Apache-2.0.
+          required: false
