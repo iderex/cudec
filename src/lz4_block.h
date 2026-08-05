@@ -40,6 +40,11 @@ constexpr uint64_t kLz4MinTrailingSlackDst = 12;  /* MFLIMIT */
 constexpr uint64_t kLz4MinTrailingSlackSrc = 8;   /* 2 + 1 + LASTLITERALS */
 constexpr uint64_t kLz4LastLiterals = 5;          /* LASTLITERALS */
 constexpr uint64_t kLz4RunMask = 15;              /* RUN_MASK */
+constexpr uint64_t kLz4MinMatch = 4;              /* MINMATCH */
+/* The token's two nibbles: the high one is the literal length, the low one is
+ * match_len - MINMATCH. Either nibble reading RUN_MASK means the length
+ * continues in the extension bytes that follow. */
+constexpr unsigned kLz4TokenLiteralShift = 4;
 /* liblz4 caps a length extension's byte reads at a margin before the input
  * end (read_variable_length's ilimit): iend - RUN_MASK for literals,
  * iend - (LASTLITERALS - 1) for matches. A decoder reading extension bytes
@@ -131,8 +136,8 @@ struct Lz4Parser {
         }
         const unsigned char token = src[src_pos++];
 
-        uint64_t literals_len = token >> 4;
-        if (literals_len == 15) {
+        uint64_t literals_len = token >> kLz4TokenLiteralShift;
+        if (literals_len == kLz4RunMask) {
             const cudec_status status = AccumulateLength(
                 &literals_len, kLz4LiteralReadMargin, /*initial_check=*/true);
             if (status != CUDEC_OK) {
@@ -200,9 +205,9 @@ struct Lz4Parser {
             return CUDEC_ERR_CORRUPT_INPUT; /* match source underflow */
         }
 
-        uint64_t match_len = (token & 0xF) + uint64_t{4};
-        if ((token & 0xF) == 15) {
-            /* The +4 minmatch is already in match_len; the extension
+        uint64_t match_len = (token & kLz4RunMask) + kLz4MinMatch;
+        if ((token & kLz4RunMask) == kLz4RunMask) {
+            /* MINMATCH is already in match_len; the extension
              * accumulates on top with the same in-loop bound. */
             const cudec_status status = AccumulateLength(
                 &match_len, kLz4MatchReadMargin, /*initial_check=*/false);
