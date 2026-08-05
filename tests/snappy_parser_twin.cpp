@@ -642,6 +642,51 @@ int main() {
         Bytes near_out;
         REQUIRE(!SnappyOracleDecodes(near, &near_out));
         REQUIRE(TwinDecode(near, &near_out) == CUDEC_ERR_CORRUPT_INPUT);
+        /* The wrap is not confined to an otherwise empty stream: with the
+         * zero-length literal followed by a real one, snappy decodes four
+         * bytes and cudec still refuses. Both spellings are pinned so a
+         * future change cannot silence one and leave the other. */
+        const Bytes wrapped_then_literal = {0x04, 0xFC, 0xFF, 0xFF, 0xFF,
+                                            0xFF, 0x0C, 'a',  'b',  'c',
+                                            'd'};
+        Bytes tail_out;
+        REQUIRE(SnappyOracleDecodes(wrapped_then_literal, &tail_out));
+        REQUIRE(tail_out.size() == 4);
+        Bytes tail_twin;
+        REQUIRE(TwinDecode(wrapped_then_literal, &tail_twin) ==
+                CUDEC_ERR_CORRUPT_INPUT);
+    }
+
+    /* The band above the harness bound, disclosed rather than left silent.
+     * TwinDecode and SnappyOracleDecodes both refuse a declaration above
+     * kSnappyOracleMaxOutput, so every mutant declaring more than that is
+     * in parity for the HARNESS's reason and tests nothing about either
+     * decoder - the corpus's own preamble-declares-max mutant included.
+     * What is testable without allocating gigabytes is that the parser
+     * refuses it on the capacity rung and says so, rather than letting a
+     * 4 GiB declaration reach an element. */
+    {
+        const Bytes huge = {0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x0C,
+                            'a',  'b',  'c',  'd'};
+        uint64_t declared = 0;
+        uint64_t preamble_size = 0;
+        REQUIRE(cudec_detail::SnappyDeclaredLength(huge.data(), huge.size(),
+                                                   &declared,
+                                                   &preamble_size) ==
+                CUDEC_OK);
+        REQUIRE(declared == 0xFFFFFFFFu);
+        REQUIRE(preamble_size == 5);
+        /* Driven through Begin rather than Drive: the refusal has to happen
+         * before anything is sized, and a driver that allocated the
+         * capacity first would be testing the allocator. */
+        cudec_detail::SnappyParser parser{huge.data(), huge.size(),
+                                          declared - 1};
+        REQUIRE(parser.Begin() == CUDEC_ERR_OUTPUT_TOO_SMALL);
+        REQUIRE(parser.dst_pos == 0);
+        Bytes twin_out;
+        REQUIRE(TwinDecode(huge, &twin_out) == CUDEC_ERR_OUTPUT_TOO_SMALL);
+        Bytes oracle_out;
+        REQUIRE(!SnappyOracleDecodes(huge, &oracle_out));
     }
 
     /* The accept set, held open in both directions: snappy accepts these
