@@ -118,9 +118,11 @@ a planned milestone - a vendor binary can never follow), and **hackability**.
   is `gpu_to_gpu` in NVIDIA's CCCL vocabulary, held by construction rather
   than by tuning - integer-only arithmetic, every output byte written exactly
   once by a statically determined lane as a pure function of lower addresses,
-  and no inter-chunk coupling. The scope, the reasoning, and the tested axes
-  (including launch geometry and stream count, which a same-batch-twice
-  compare cannot see) are in [DETERMINISM.md](DETERMINISM.md).
+  and no inter-chunk coupling. "Exactly once" holds for a supported launch
+  geometry, which the kernel enforces rather than assumes. The scope, the
+  reasoning, and the tested axes (including launch geometry and stream count,
+  which a same-batch-twice compare cannot see) are in
+  [DETERMINISM.md](DETERMINISM.md).
 - **The oracles decide correctness.** liblz4, zlib, and libzstd are vendored
   as test dependencies; decode output is diff-tested against them on real
   corpora (Silesia, enwik) and on fuzzed/mutated streams, including the
