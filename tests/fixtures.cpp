@@ -1,6 +1,7 @@
 #include "fixtures.h"
 
 #include <lz4.h>
+#include <snappy.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -155,4 +156,56 @@ bool OracleDecodes(const std::vector<unsigned char>& stream,
     }
     decoded->resize(static_cast<size_t>(written));
     return true;
+}
+
+bool SnappyOracleDecodes(const std::vector<unsigned char>& stream,
+                         std::vector<unsigned char>* decoded) {
+    decoded->clear();
+    if (stream.empty()) {
+        return false; /* never hand snappy a null source pointer */
+    }
+    const char* src = reinterpret_cast<const char*>(stream.data());
+    size_t declared = 0;
+    if (!snappy::GetUncompressedLength(src, stream.size(), &declared)) {
+        return false;
+    }
+    if (declared > kSnappyOracleMaxOutput) {
+        return false; /* the wrapper's bound, documented in fixtures.h */
+    }
+    decoded->assign(declared, 0);
+    if (!snappy::RawUncompress(src, stream.size(),
+                               reinterpret_cast<char*>(decoded->data()))) {
+        /* A rejected stream produces no output: a caller that reads the
+         * buffer after a false verdict must find nothing to mistake for one. */
+        decoded->clear();
+        return false;
+    }
+    return true;
+}
+
+bool SnappyOracleAccepts(const std::vector<unsigned char>& stream) {
+    if (stream.empty()) {
+        return false;
+    }
+    return snappy::IsValidCompressedBuffer(
+        reinterpret_cast<const char*>(stream.data()), stream.size());
+}
+
+std::vector<unsigned char> SnappyCompressBlock(
+    const std::vector<unsigned char>& original) {
+    std::vector<unsigned char> compressed(
+        snappy::MaxCompressedLength(original.size()));
+    size_t written = 0;
+    snappy::RawCompress(reinterpret_cast<const char*>(original.data()),
+                        original.size(),
+                        reinterpret_cast<char*>(compressed.data()), &written);
+    /* Corpus generation is infrastructure, not a test, exactly as in
+     * Lz4CompressBlock: a compressor that wrote more than the bound it
+     * promised has already overrun this buffer, so there is nothing left to
+     * report from. */
+    if (written == 0 || written > compressed.size()) {
+        std::abort();
+    }
+    compressed.resize(written);
+    return compressed;
 }

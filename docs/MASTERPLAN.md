@@ -199,8 +199,10 @@ a planned milestone - a vendor binary can never follow), and **hackability**.
   invariant working, not as noise. FetchContent pins are invisible to
   Dependabot - oracle bumps are deliberate manual PRs owned by the
   supply-chain sweep. Third-party oracle code compiles with SYSTEM includes
-  and without the project's strict flags; one translation unit per oracle,
-  never its build system.
+  and without the project's strict flags; only the translation units the
+  oracle's decode path needs, never its build system. For liblz4 that is one
+  file; the Snappy oracle needs two, because the source abstraction its
+  exact-consume decode reads through lives in a second one.
 - Fuzzing: mutation-based corpus fuzzing of the host-side parsers, plus
   GPU-vs-oracle diff loops on mutated streams for the kernels.
 - Benchmarks live in `bench/` with recorded methodology; every published
