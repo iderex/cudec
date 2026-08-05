@@ -1,0 +1,93 @@
+# CodeQL - static analysis over the C/C++/CUDA surface, into Code Scanning.
+#
+# What it analyses and why the build is manual. CodeQL's C/C++ extractor only
+# sees translation units a real compiler compiles, so the build mode decides
+# the scope. `autobuild` here would find the top-level CMakeLists and produce
+# the host-only configuration, whose whole library is src/version.c - an
+# analysis of nothing. So the build is written out, in the same digest-pinned
+# container ci.yml uses, with CUDEC_ENABLE_CUDA=ON: that compiles the frame
+# parse, the streaming path, the C-ABI boundary and the CPU twin of the block
+# parser, which is the hostile-input surface worth analysing. The runner has
+# no GPU and needs none - nothing here runs a kernel.
+#
+# What it does NOT do. It never fails a pull request. Findings land in the
+# Code Scanning tab, where the security-review sweeps read them; making a
+# CodeQL alert a merge blocker is a separate decision with its own
+# false-positive budget, and is not taken here. Nor does this replace the
+# host sanitizer gate in ci.yml or the compute-sanitizer runs: those execute
+# the code on real inputs, and this one does not execute it at all.
+
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, Tuesday 04:17 UTC. Off Monday, when the Dependabot tick already
+    # runs (.github/dependabot.yml), and off the hour, where scheduled runs
+    # queue behind everyone else's cron.
+    - cron: "17 4 * * 2"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Fail closed: no ambient token scope at the top level.
+permissions: {}
+
+jobs:
+  analyze:
+    name: analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read # to check out the source
+      security-events: write # to upload the SARIF results to Code Scanning
+    # The exact toolchain the build gate uses - same image, same digest.
+    container:
+      image: nvidia/cuda:12.6.2-devel-ubuntu24.04@sha256:738fba0fbdb225b7a2931c58a5c8f03a84d3cd2f6a84975826a157339ef750b8
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Same git-before-checkout lesson as ci.yml: git in the container keeps
+      # actions/checkout off the flakier REST-tarball fallback, and the CUDA
+      # apt repo is dropped before the update because it is a historic
+      # false-red vector.
+      - name: Install git and CMake
+        run: >-
+          rm -f /etc/apt/sources.list.d/cuda*.list &&
+          apt-get update -q -o Acquire::Retries=3 &&
+          apt-get install -yq -o Acquire::Retries=3 --no-install-recommends
+          git cmake
+
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@18420e3271f74589575af831a523c833acda327f # codeql-bundle-v2.26.2
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      # Fail-closed plumbing, borrowed from ci.yml's build job: the device
+      # binaries exist only if the CUDA configuration actually compiled, so a
+      # renamed option cannot quietly turn this into an analysis of the
+      # host-only stub. -D on an unknown CMake option is a warning, not an
+      # error.
+      - name: Build the analysed configuration
+        run: >-
+          cmake -B build-codeql -DCUDEC_ENABLE_CUDA=ON &&
+          cmake --build build-codeql -j &&
+          test -x build-codeql/tests/parser_twin &&
+          test -x build-codeql/tests/frame_host_negative &&
+          test -x build-codeql/tests/determinism_gpu
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@18420e3271f74589575af831a523c833acda327f # codeql-bundle-v2.26.2
+        with:
+          category: /language:c-cpp
