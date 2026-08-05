@@ -159,3 +159,5 @@ because a tool suggested it; it lands because a person verified it.
 ## License
 
 [Apache-2.0](LICENSE)
+
+See NOTICE.md for the intended-use notice.
