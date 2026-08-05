@@ -455,6 +455,51 @@ endforeach()
 # carrying a real loop AND the idiom in the same element is forgiven whole,
 # since the element is judged by what it contains rather than by structure the
 # scan does not parse.
+# Does this `for` header carry a RANGE-FOR's colon, or merely a colon?
+#
+# The opaque-`for` rule exempts a range-for because its bound is the
+# container's size: loop-invariant and visible on the spot, exactly like the
+# counted form's. A colon that is something else carries none of that, so
+# testing for "a colon" granted the exemption on a coincidence (issue #250).
+# A range-for's colon sits at the header's TOP parenthesis level, which is a
+# property of a range-for rather than of the character, so that is what is
+# tested. A ternary inside a macro argument - `for (EACH(x, w ? a : b))` -
+# puts its colon a level down and is caught. `::` goes first: a qualified
+# name is not a range-for either (issue #123).
+#
+# The residual, and it is inherited rather than introduced: this scan strips
+# no string literals anywhere, so a colon inside one at the top level -
+# `for (EACH(x) "a:b")` - still exempts. Stripping literals is a pass over
+# every rule in this function, not a change to this one, and the function's
+# "Limits" paragraph already names unstripped literals as a known blind spot.
+function(cudec_for_colon_at_top_level text out_result)
+  set(${out_result} FALSE PARENT_SCOPE)
+  string(REPLACE "::" "" _text "${text}")
+  # From the header's own '(' onward; what precedes it cannot hold the colon.
+  string(REGEX MATCH "for[ \t]*\\(.*" _text "${_text}")
+  string(LENGTH "${_text}" _length)
+  if(_length EQUAL 0)
+    return()
+  endif()
+  set(_depth 0)
+  math(EXPR _last "${_length} - 1")
+  foreach(_index RANGE ${_last})
+    string(SUBSTRING "${_text}" ${_index} 1 _char)
+    if(_char STREQUAL "(")
+      math(EXPR _depth "${_depth} + 1")
+    elseif(_char STREQUAL ")")
+      math(EXPR _depth "${_depth} - 1")
+      if(_depth LESS_EQUAL 0)
+        # The header's parenthesis closed; the rest of the line is the body.
+        return()
+      endif()
+    elseif(_char STREQUAL ":" AND _depth EQUAL 1)
+      set(${out_result} TRUE PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+endfunction()
+
 function(cudec_scan_source path check_loops out_violations)
   set(_violations "")
   set(_in_comment FALSE)
@@ -596,10 +641,8 @@ function(cudec_scan_source path check_loops out_violations)
         set(_form_line ${_for_start})
         if(_for_open LESS_EQUAL 0)
           set(_for_open 0)
-          # '::' out first, for the reason spelled out at the single-line
-          # branch below: a qualified name is not a range-for.
-          string(REPLACE "::" "" _range_text "${_for_text}")
-          if(_for_semis LESS 2 AND NOT _range_text MATCHES ":")
+          cudec_for_colon_at_top_level("${_for_text}" _is_range_for)
+          if(_for_semis LESS 2 AND NOT _is_range_for)
             set(_form "a 'for' header without a visible condition and increment")
           endif()
         elseif(_for_lines GREATER 8)
@@ -637,23 +680,20 @@ function(cudec_scan_source path check_loops out_violations)
         # Covers both `for (;;)` and `for (init;; incr)`.
         set(_form "a 'for' loop with an empty condition")
       elseif(_element_code MATCHES "[^A-Za-z_0-9]for[ \t]*\\(")
-        # The range-for test runs on the header with '::' removed: the colons
-        # of a qualified name (`cudec_detail::Foo`) carry none of the meaning
-        # the exemption rests on, and left in they would exempt any opaque
-        # header that happens to mention one.
-        string(REPLACE "::" "" _range_text "${_element_code}")
+        cudec_for_colon_at_top_level("${_element_code}" _is_range_for)
         if(_balance GREATER 0)
           set(_for_open ${_balance})
           set(_for_semis ${_line_semis})
           set(_for_start ${_element_start})
           set(_for_lines 1)
           set(_for_text "${_element_code}")
-        elseif(_line_semis LESS 2 AND NOT _range_text MATCHES ":")
+        elseif(_line_semis LESS 2 AND NOT _is_range_for)
           # A balanced header with fewer than two semicolons has no visible
           # induction variable - a macro-hidden loop, say. A range-for
-          # (`for (T& x : container)`) is exempt by the ':': its bound is the
-          # container's size, loop-invariant and visible on the spot, exactly
-          # like the counted form.
+          # (`for (T& x : container)`) is exempt: its bound is the container's
+          # size, loop-invariant and visible on the spot, exactly like the
+          # counted form. What counts as one is decided above, by
+          # cudec_for_colon_at_top_level.
           set(_form "a 'for' header without a visible condition and increment")
         endif()
       endif()
@@ -927,6 +967,25 @@ file(WRITE ${_probe_dir}/scan_for_opaque_qualified_wrapped.cu
      "    unsigned count = 0;\n" "    for (EACH_CHUNK(chunk,\n"
      "                    cudec_detail::chunks_of(src))) {\n"
      "        count += chunk;\n" "    }\n" "    return count;\n" "}\n")
+# The other two colons a macro-hidden header can plausibly carry, neither of
+# them a range-for's: one inside a nested call's string literal, one a
+# ternary. Both must still be reported (issue #250). The wrapped ternary
+# covers the multi-line branch, which decides the exemption separately.
+file(WRITE ${_probe_dir}/scan_for_colon_literal.cu
+     "unsigned probe(const unsigned char* src) {\n"
+     "    unsigned count = 0;\n"
+     "    for (EACH_FIELD(field, src, \"key:value\")) {\n"
+     "        count += field;\n" "    }\n" "    return count;\n" "}\n")
+file(WRITE ${_probe_dir}/scan_for_colon_ternary.cu
+     "unsigned probe(const unsigned char* src, int wide) {\n"
+     "    unsigned count = 0;\n"
+     "    for (EACH_CHUNK(chunk, wide ? src[0] : src[1])) {\n"
+     "        count += chunk;\n" "    }\n" "    return count;\n" "}\n")
+file(WRITE ${_probe_dir}/scan_for_colon_ternary_wrapped.cu
+     "unsigned probe(const unsigned char* src, int wide) {\n"
+     "    unsigned count = 0;\n" "    for (EACH_CHUNK(chunk,\n"
+     "                    wide ? src[0] : src[1])) {\n"
+     "        count += chunk;\n" "    }\n" "    return count;\n" "}\n")
 # A `for` header the scan cannot balance must be rejected, not skipped: while
 # the tracker is open the whole loop rule is off, so a silent skip would
 # disable the termination check for the rest of the file. String literals are
@@ -1045,6 +1104,9 @@ set(_scanner_probes
     "scan_for_opaque_wrapped|scan_for_opaque_wrapped.cu:3: a 'for' header without a visible"
     "scan_for_opaque_qualified|scan_for_opaque_qualified.cu:3: a 'for' header without a visible"
     "scan_for_opaque_qualified_wrapped|scan_for_opaque_qualified_wrapped.cu:3: a 'for' header without a visible"
+    "scan_for_colon_literal|scan_for_colon_literal.cu:3: a 'for' header without a visible"
+    "scan_for_colon_ternary|scan_for_colon_ternary.cu:3: a 'for' header without a visible"
+    "scan_for_colon_ternary_wrapped|scan_for_colon_ternary_wrapped.cu:3: a 'for' header without a visible"
     "scan_for_unbalanced|closing parenthesis was not found within 8 lines"
     "scan_for_unbalanced_eof|left unbalanced at end of file"
     "scan_wrapped_after_mask|is wrapped across lines"
