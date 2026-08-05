@@ -4,6 +4,7 @@
  * H2D/D2H is excluded and the number is pure kernel decode throughput. */
 #include "gpu_bench.h"
 
+#include "bench_stats.h"
 #include "cudec.h"
 #include "lz4_decode.cuh"
 
@@ -71,10 +72,9 @@ bool TimeKernel(cudec_status (*launch)(const void* const*, const size_t*,
     BG_CUDA(cudaEventDestroy(start));
     BG_CUDA(cudaEventDestroy(stop));
     std::sort(times.begin(), times.end());
-    /* Nearest-rank p50, matching the CPU path's percentile method so the
-     * two rows of the same report use one definition. */
-    const size_t rank = (times.size() * 50 + 99) / 100;
-    *p50_ms = times[(rank == 0 ? 1 : rank) - 1];
+    /* The same nearest-rank definition the CPU rows use, so the two rows of
+     * one report mean the same thing (bench/bench_stats.h). */
+    *p50_ms = cudec_bench::Percentile(times, 50);
     return true;
 }
 
@@ -86,8 +86,7 @@ cudec_status LaunchFull(const void* const* s, const size_t* ss,
 
 double Median(std::vector<double>* t) {
     std::sort(t->begin(), t->end());
-    const size_t rank = (t->size() * 50 + 99) / 100;
-    return (*t)[(rank == 0 ? 1 : rank) - 1];
+    return cudec_bench::Percentile(*t, 50);
 }
 
 /* Steady-state wall time: one reusable context, warmed (so its staging is
@@ -238,10 +237,9 @@ bool cudec_bench_gpu(const unsigned char* const* comp,
     out->output_bytes = total_out;
     out->full_ms_p50 = full_ms;
     out->parse_only_ms_p50 = parse_ms;
-    /* Guard the sub-microsecond case (a tiny corpus can event-time to
-     * 0.0 ms) so a degenerate run reports 0, never inf. */
-    out->full_gbps_p50 = full_ms > 0.0 ? gb / (full_ms / 1e3) : 0.0;
-    out->parse_only_gbps_p50 = parse_ms > 0.0 ? gb / (parse_ms / 1e3) : 0.0;
+    /* GbpsFromMs carries the sub-microsecond guard (bench/bench_stats.h). */
+    out->full_gbps_p50 = cudec_bench::GbpsFromMs(gb, full_ms);
+    out->parse_only_gbps_p50 = cudec_bench::GbpsFromMs(gb, parse_ms);
     /* Buffers are reclaimed at process exit; the bench is a short-lived
      * one-shot, like the test harness. */
     return true;
@@ -337,10 +335,10 @@ bool cudec_bench_gpu_stream_ctx(const unsigned char* const* comp,
     out->host_steady_ms = host_steady;
     out->device_cold_ms = dev_cold;
     out->host_cold_ms = host_cold;
-    out->device_steady_gbps = dev_steady > 0.0 ? gb / (dev_steady / 1e3) : 0.0;
-    out->host_steady_gbps = host_steady > 0.0 ? gb / (host_steady / 1e3) : 0.0;
-    out->device_cold_gbps = dev_cold > 0.0 ? gb / (dev_cold / 1e3) : 0.0;
-    out->host_cold_gbps = host_cold > 0.0 ? gb / (host_cold / 1e3) : 0.0;
+    out->device_steady_gbps = cudec_bench::GbpsFromMs(gb, dev_steady);
+    out->host_steady_gbps = cudec_bench::GbpsFromMs(gb, host_steady);
+    out->device_cold_gbps = cudec_bench::GbpsFromMs(gb, dev_cold);
+    out->host_cold_gbps = cudec_bench::GbpsFromMs(gb, host_cold);
     /* The output arenas (d_out) are reclaimed at process exit; the bench is a
      * short-lived one-shot called once, like cudec_bench_gpu above. */
     return true;
