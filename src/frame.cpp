@@ -14,18 +14,6 @@
 #include <cstring>
 #include <vector>
 
-/* PROBE for #70 - reverted before merge. Two deliberate defects that need no
- * taint source, so an alert on THIS file proves the analysed configuration
- * extracts it. Never called from anywhere. */
-int cudec_codeql_probe_delete_me(int n);
-int cudec_codeql_probe_delete_me(int n) {
-    int value;
-    if (n > 0) {
-        value = n;
-    }
-    return value;
-}
-
 namespace {
 
 constexpr uint32_t kLz4FrameMagic = 0x184D2204u;
