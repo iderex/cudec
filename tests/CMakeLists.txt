@@ -207,6 +207,11 @@ cudec_add_test(oracle_lz4 SOURCES oracle_lz4.cpp LIBS cudec_test_fixtures)
 # and nothing about cudec's own Snappy path, which does not exist yet.
 cudec_add_test(oracle_snappy SOURCES oracle_snappy.cpp LIBS
                cudec_test_fixtures)
+# The reference's own decode behaviours, executed rather than read (issue
+# #155). Host-side and GPU-less on purpose: it is the oracle answering, and
+# the answers are what the M3 fail-closed matrix is allowed to lock against.
+cudec_add_test(snappy_probes SOURCES snappy_probes.cpp LIBS
+               cudec_test_fixtures)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
