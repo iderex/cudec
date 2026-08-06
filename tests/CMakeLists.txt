@@ -360,6 +360,18 @@ cudec_add_test(snappy_edge_sweep SOURCES snappy_edge_sweep.cpp LIBS
                cudec_test_fixtures)
 target_include_directories(snappy_edge_sweep
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# snappy's own three negative vectors (issue #156), read out of the pinned
+# archive rather than copied into this tree: the URL_HASH above already proves
+# the bytes, and a copy would be three binary blobs restating it. The path is
+# handed in here so the test names none of its own; provenance and the licence
+# posture for everything under that directory are recorded in the test's header.
+cudec_add_test(snappy_upstream_negatives SOURCES snappy_upstream_negatives.cpp
+               LIBS cudec_test_fixtures)
+target_include_directories(snappy_upstream_negatives
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(
+  snappy_upstream_negatives
+  PRIVATE CUDEC_SNAPPY_TESTDATA_DIR="${snappy_SOURCE_DIR}/testdata")
 # The other half of "single-source host AND device" (issue #171): the twin
 # above compiles src/snappy_block.h with the host compiler and this one hands
 # the same header to nvcc, then requires the two to produce an identical
