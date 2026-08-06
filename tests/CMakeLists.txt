@@ -495,6 +495,446 @@ foreach(_source IN LISTS _batch_limit_sources)
   endif()
 endforeach()
 
+# Reads a source and hands back its lines with C comments blanked in place,
+# one list element per source line, so a rule can quote the line number a
+# reader will open. Comments go first for the reason issue #72's scanner
+# strips them: prose beside a rule must neither trip it nor mask it, and this
+# header's rejects are documented in prose sitting right on top of them.
+#
+# FOUR characters CMake's list syntax eats are protected across the split and
+# left protected in the result. A ';' would separate elements and a trailing
+# '\' would escape the separator, which is what once numbered every line under
+# a continuation short (issue #251). A '[' opens a bracket that swallows every
+# separator until its ']', so ONE unbalanced bracket in a source - `src[from`
+# wrapped across a line, or a lone one in a comment - joins the whole rest of
+# the file into a single element and every line below it stops being a line.
+# That is not hypothetical: it is measured on this very header, and issue #294
+# carries it for the scanner that has the same reader.
+#
+# The placeholders are control bytes, and a source that carries one of those
+# itself is refused rather than scanned - restoring it afterwards would be a
+# way to smuggle a separator in.
+function(cudec_code_lines path out_lines)
+  string(ASCII 1 _tok_backslash)
+  string(ASCII 2 _tok_semicolon)
+  string(ASCII 3 _tok_open)
+  string(ASCII 4 _tok_close)
+  file(READ "${path}" _raw)
+  if(_raw MATCHES "${_tok_backslash}|${_tok_semicolon}|${_tok_open}|${_tok_close}")
+    message(FATAL_ERROR "${path} carries a control byte (0x01 to 0x04) and "
+                        "cannot be read as text by this scan (issue #173)")
+  endif()
+  string(REPLACE "\\" "${_tok_backslash}" _raw "${_raw}")
+  string(REPLACE ";" "${_tok_semicolon}" _raw "${_raw}")
+  string(REPLACE "[" "${_tok_open}" _raw "${_raw}")
+  string(REPLACE "]" "${_tok_close}" _raw "${_raw}")
+  string(REPLACE "\r\n" "\n" _raw "${_raw}")
+  string(REPLACE "\r" "\n" _raw "${_raw}")
+  string(REGEX REPLACE "\n$" "" _raw "${_raw}")
+  # What a whole read must produce, counted before the split rather than
+  # inferred from it: one line per remaining newline, plus the last line,
+  # which the strip above left without one.
+  string(REGEX MATCHALL "\n" _newlines "${_raw}")
+  list(LENGTH _newlines _expected)
+  math(EXPR _expected "${_expected} + 1")
+  if(_raw STREQUAL "")
+    message(FATAL_ERROR "${path} is empty: a source this scan is asked to "
+                        "read whole has at least one line (issue #173)")
+  endif()
+  string(REPLACE "\n" ";" _raw_lines "${_raw}")
+  set(_out "")
+  set(_in_comment FALSE)
+  foreach(_line IN LISTS _raw_lines)
+    if(_in_comment)
+      if(_line MATCHES "\\*/")
+        string(REGEX REPLACE "^.*\\*/" " " _line "${_line}")
+        set(_in_comment FALSE)
+      else()
+        set(_line " ")
+      endif()
+    endif()
+    string(REGEX REPLACE "//.*$" " " _line "${_line}")
+    if(_line MATCHES "/\\*")
+      string(REGEX REPLACE "/\\*.*$" " " _head "${_line}")
+      if(_line MATCHES "/\\*.*\\*/")
+        string(REGEX REPLACE "^.*\\*/" " " _tail "${_line}")
+        set(_line "${_head} ${_tail}")
+      else()
+        set(_line "${_head}")
+        set(_in_comment TRUE)
+      endif()
+    endif()
+    # An empty element would vanish from the list and shift every line number
+    # below it; a space holds the slot.
+    if(_line STREQUAL "")
+      set(_line " ")
+    endif()
+    list(APPEND _out "${_line}")
+  endforeach()
+  # A partial read must not look like a clean one. The protections above are
+  # what make the counts agree, so this is the check that says they still do -
+  # and the one that will red if a fifth character with list meaning turns up.
+  list(LENGTH _out _produced)
+  if(NOT _produced EQUAL _expected)
+    message(FATAL_ERROR
+            "${path} was read as ${_produced} lines and carries ${_expected}: "
+            "this scan cannot read it whole, and a partial read reports the "
+            "same silence as a clean one (issue #173)")
+  endif()
+  set(${out_lines} "${_out}" PARENT_SCOPE)
+endfunction()
+
+# ---- The Snappy parser core, locked (issue #173). Two rules over one source
+# set, applied by ONE function so they can be run against planted probes
+# before they are trusted against the tree - the discipline issue #72's
+# scanner established, applied here because these two rules are the only
+# thing standing between a second copy of the ladder and nobody noticing.
+#
+# Honest scope, the same as every check above: these are drift detectors
+# under the KNOWN SPELLINGS, not tamper-proofing. A ladder re-copied under
+# fresh type names, or a refusal spelled through a local variable instead of
+# a `return`, is out of reach of a text scan and is what review is for.
+#
+# Rule 1, single source. src/snappy_block.h exists and defines the parser
+# types; no other source under src/ defines them, and a source that names
+# SnappyParser includes the header rather than restating the ladder. This is
+# the cuda_raii.h lock (issue #40) applied to the format core: the M3 kernel
+# instantiates this parser, and a kernel-local copy of a validation ladder is
+# a fail-open the moment the two stop agreeing.
+#
+# Rule 2, the branch count. Every refusal in the header returns through
+# SnappyRefuse naming a branch the enumeration declares, and each declared
+# branch is named by EXACTLY ONE site. That makes the ladder's branch set
+# derived from the code rather than restated beside it, and it is the static
+# half of a pair: tests/snappy_parser_twin.cpp holds the other half at run
+# time, requiring a negative to reach every declared branch. Adding a rung
+# therefore costs a new enumerator here and a new negative there, and a rung
+# that quietly reuses a neighbour's enumerator to avoid both is what the
+# exactly-one count refuses.
+function(cudec_check_snappy_locks src_dir out_violations)
+  set(_violations "")
+  set(_header ${src_dir}/snappy_block.h)
+  if(NOT EXISTS ${_header})
+    string(APPEND _violations
+           "  ${src_dir}/snappy_block.h is missing: the Snappy validation "
+           "ladder must be single-sourced there (issue #173)\n")
+    set(${out_violations} "${_violations}" PARENT_SCOPE)
+    return()
+  endif()
+
+  # Comments are stripped before any rule reads a line, so the prose above a
+  # refusal can neither trip a rule nor mask one - and the line numbers stay
+  # exact, because the stripping replaces comment text in place instead of
+  # dropping lines.
+  cudec_code_lines(${_header} _header_lines)
+  foreach(_type SnappyParser SnappyElement)
+    set(_defines FALSE)
+    foreach(_line IN LISTS _header_lines)
+      if(_line MATCHES "struct ${_type}")
+        set(_defines TRUE)
+      endif()
+    endforeach()
+    if(NOT _defines)
+      string(APPEND _violations
+             "  snappy_block.h no longer defines 'struct ${_type}': the "
+             "Snappy parser core is single-sourced there (issue #173)\n")
+    endif()
+  endforeach()
+
+  # Every other source under src/ - a glob rather than a list somebody has to
+  # remember to extend, for the same reason the batch-limit sweep is one.
+  file(GLOB_RECURSE _sources RELATIVE ${src_dir} CONFIGURE_DEPENDS
+       ${src_dir}/*.c ${src_dir}/*.cc ${src_dir}/*.cpp ${src_dir}/*.cu
+       ${src_dir}/*.cuh ${src_dir}/*.h ${src_dir}/*.hpp ${src_dir}/*.inl)
+  foreach(_source IN LISTS _sources)
+    if(_source STREQUAL "snappy_block.h")
+      continue()
+    endif()
+    cudec_code_lines(${src_dir}/${_source} _source_lines)
+    set(_names_parser FALSE)
+    set(_includes_header FALSE)
+    foreach(_line IN LISTS _source_lines)
+      foreach(_type SnappyParser SnappyElement)
+        if(_line MATCHES "struct ${_type}[ \t]*[{:]")
+          string(APPEND _violations
+                 "  ${_source} defines a local 'struct ${_type}': the Snappy "
+                 "parser core is single-sourced in snappy_block.h "
+                 "(issue #173)\n")
+        endif()
+      endforeach()
+      if(_line MATCHES "SnappyParser|SnappyElement|SnappyDeclaredLength")
+        set(_names_parser TRUE)
+      endif()
+      if(_line MATCHES "#include[ \t]+\"snappy_block.h\"")
+        set(_includes_header TRUE)
+      endif()
+    endforeach()
+    if(_names_parser AND NOT _includes_header)
+      string(APPEND _violations
+             "  ${_source} names the Snappy parser without including "
+             "snappy_block.h: it must reuse the single-sourced ladder rather "
+             "than restate it (issue #173)\n")
+    endif()
+  endforeach()
+
+  # Rule 2. The declared branches first, read out of the enumeration between
+  # its None and Count sentinels; then the refusal sites.
+  set(_declared "")
+  set(_in_enum FALSE)
+  foreach(_line IN LISTS _header_lines)
+    if(_line MATCHES "enum SnappyReject[ \t]*{")
+      set(_in_enum TRUE)
+      continue()
+    endif()
+    if(_in_enum)
+      if(_line MATCHES "kSnappyRejectCount")
+        set(_in_enum FALSE)
+        continue()
+      endif()
+      if(_line MATCHES "^[ \t]*(kSnappyReject[A-Za-z0-9_]*)")
+        if(NOT CMAKE_MATCH_1 STREQUAL "kSnappyRejectNone")
+          list(APPEND _declared ${CMAKE_MATCH_1})
+        endif()
+      endif()
+    endif()
+  endforeach()
+  if(NOT _declared)
+    string(APPEND _violations
+           "  snappy_block.h declares no reject ladder: 'enum SnappyReject' "
+           "must enumerate one branch per reject reason (issue #173)\n")
+  endif()
+
+  set(_named "")
+  set(_lineno 0)
+  foreach(_line IN LISTS _header_lines)
+    math(EXPR _lineno "${_lineno} + 1")
+    # The choke point, refused first: a refusal that never reaches
+    # SnappyRefuse is invisible to every count below, so it is the one shape
+    # that could add a rung and leave both halves of this pair green.
+    if(_line MATCHES "return[ \t]+CUDEC_ERR_")
+      string(APPEND _violations
+             "  snappy_block.h:${_lineno}: refuses without going through "
+             "SnappyRefuse - every refusal names its ladder branch "
+             "(issue #173)\n")
+    endif()
+    if(_line MATCHES "return[ \t]+SnappyRefuse\\(")
+      # The branch has to be on the line the call opens on. A wrapped first
+      # argument would hide the name from this scan exactly as a wrapped mask
+      # hides from the collective rule.
+      if(_line MATCHES "return[ \t]+SnappyRefuse\\((kSnappyReject[A-Za-z0-9_]*)")
+        list(APPEND _named ${CMAKE_MATCH_1})
+      else()
+        string(APPEND _violations
+               "  snappy_block.h:${_lineno}: a SnappyRefuse call with no "
+               "ladder branch on its own line (issue #173)\n")
+      endif()
+    endif()
+  endforeach()
+
+  foreach(_branch IN LISTS _declared)
+    set(_count 0)
+    foreach(_site IN LISTS _named)
+      if(_site STREQUAL _branch)
+        math(EXPR _count "${_count} + 1")
+      endif()
+    endforeach()
+    if(_count EQUAL 0)
+      string(APPEND _violations
+             "  ladder branch '${_branch}' is declared and no refusal site "
+             "names it (issue #173)\n")
+    elseif(NOT _count EQUAL 1)
+      string(APPEND _violations
+             "  ladder branch '${_branch}' is named by ${_count} refusal "
+             "sites: a new rung takes a new branch, so that the twin's "
+             "negative for it cannot be satisfied by its neighbour "
+             "(issue #173)\n")
+    endif()
+  endforeach()
+  foreach(_site IN LISTS _named)
+    if(NOT _site IN_LIST _declared)
+      string(APPEND _violations
+             "  a refusal site names '${_site}', which 'enum SnappyReject' "
+             "does not declare (issue #173)\n")
+    endif()
+  endforeach()
+
+  set(${out_violations} "${_violations}" PARENT_SCOPE)
+endfunction()
+
+# The rules above are run against planted source trees before they are
+# trusted against the real one, and every violating probe is matched against
+# the TEXT its own rule emits rather than against a non-empty result - so one
+# rule cannot cover for another that has quietly stopped matching. The probe
+# headers are read, never compiled, which is why they are this terse.
+set(_snappy_probe_root ${CMAKE_CURRENT_BINARY_DIR}/snappy-lock-probes)
+file(REMOVE_RECURSE ${_snappy_probe_root})
+
+# A compliant header: two rungs, two sites, one choke point. Each block is
+# ONE string rather than a list of lines, because the variants below are cut
+# from it with string(REPLACE) and a list would come back joined on
+# semicolons - which is a stray separator written into a C header.
+#
+# The head is 21 lines, so an injected rung starts at line 22, which is the
+# number the two line-scoped rules are asserted on below.
+set(_probe_header_head "#ifndef PROBE_SNAPPY_H
+#define PROBE_SNAPPY_H
+namespace cudec_detail {
+enum SnappyReject {
+    kSnappyRejectNone = 0,
+    kSnappyRejectAlpha,
+    kSnappyRejectBeta,
+    kSnappyRejectCount
+};
+inline cudec_status SnappyRefuse(SnappyReject branch,
+                                 cudec_status status,
+                                 SnappyReject* out) {
+    return status;
+}
+struct SnappyElement {
+    uint64_t from;
+};
+struct SnappyParser {
+    SnappyReject reject;
+    cudec_status Next(bool first) {
+        if (first) {
+")
+set(_probe_header_tail "        }
+        return SnappyRefuse(kSnappyRejectBeta, CUDEC_ERR_CORRUPT_INPUT,
+                            &reject);
+    }
+};
+}  // namespace cudec_detail
+#endif
+")
+set(_probe_alpha_site "            return SnappyRefuse(kSnappyRejectAlpha,
+                                CUDEC_ERR_CORRUPT_INPUT, &reject);
+")
+
+file(WRITE ${_snappy_probe_root}/clean/snappy_block.h ${_probe_header_head}
+     ${_probe_alpha_site} ${_probe_header_tail})
+# The tree with no core at all.
+file(WRITE ${_snappy_probe_root}/missing_header/other.cu "void probe() {}\n")
+# A header that stopped defining the parser type it exists to own.
+string(REPLACE "struct SnappyParser {" "struct SomethingElse {"
+               _probe_no_parser "${_probe_header_head}")
+file(WRITE ${_snappy_probe_root}/no_parser/snappy_block.h ${_probe_no_parser}
+     ${_probe_alpha_site} ${_probe_header_tail})
+# A second source carrying its own copy of the parser type.
+file(WRITE ${_snappy_probe_root}/local_copy/snappy_block.h
+     ${_probe_header_head} ${_probe_alpha_site} ${_probe_header_tail})
+file(WRITE ${_snappy_probe_root}/local_copy/kernel.cu
+     "#include \"snappy_block.h\"\n" "struct SnappyParser {\n"
+     "    uint64_t src_pos;\n" "};\n")
+# A source driving the parser without reaching for the single source.
+file(WRITE ${_snappy_probe_root}/no_include/snappy_block.h
+     ${_probe_header_head} ${_probe_alpha_site} ${_probe_header_tail})
+file(WRITE ${_snappy_probe_root}/no_include/kernel.cu
+     "void probe(cudec_detail::SnappyParser* p) {\n" "    (void)p;\n" "}\n")
+# The same source with the include: the permitted shape, which must stay
+# silent, or the rule above would refuse the kernel this lock exists to admit.
+file(WRITE ${_snappy_probe_root}/with_include/snappy_block.h
+     ${_probe_header_head} ${_probe_alpha_site} ${_probe_header_tail})
+file(WRITE ${_snappy_probe_root}/with_include/kernel.cu
+     "#include \"snappy_block.h\"\n"
+     "void probe(cudec_detail::SnappyParser* p) {\n" "    (void)p;\n" "}\n")
+# A rung that refuses without naming itself.
+file(WRITE ${_snappy_probe_root}/bare_return/snappy_block.h
+     ${_probe_header_head} "            return CUDEC_ERR_CORRUPT_INPUT;\n"
+     ${_probe_header_tail})
+# A rung whose branch is wrapped onto the next line, out of a line-scoped
+# scan's sight.
+file(WRITE ${_snappy_probe_root}/wrapped_refuse/snappy_block.h
+     ${_probe_header_head} "            return SnappyRefuse(\n"
+     "                kSnappyRejectAlpha, CUDEC_ERR_CORRUPT_INPUT, &reject);\n"
+     ${_probe_header_tail})
+# A branch nothing refuses through: the shape a deleted rung leaves behind.
+string(REPLACE "    kSnappyRejectBeta,
+" "    kSnappyRejectBeta,
+    kSnappyRejectGamma,
+" _probe_extra_branch "${_probe_header_head}")
+file(WRITE ${_snappy_probe_root}/branch_unused/snappy_block.h
+     ${_probe_extra_branch} ${_probe_alpha_site} ${_probe_header_tail})
+# A site naming a branch the enumeration does not carry: the shape a rung
+# added without an enumerator leaves behind.
+file(WRITE ${_snappy_probe_root}/site_undeclared/snappy_block.h
+     ${_probe_header_head}
+     "            return SnappyRefuse(kSnappyRejectGamma,\n"
+     "                                CUDEC_ERR_CORRUPT_INPUT, &reject);\n"
+     ${_probe_header_tail})
+# Two rungs behind one branch - a new rung borrowing its neighbour's
+# enumerator, which would let the twin's negative for the old rung stand in
+# for the new one.
+file(WRITE ${_snappy_probe_root}/branch_shared/snappy_block.h
+     ${_probe_header_head} ${_probe_alpha_site}
+     "        if (!first) {\n"
+     "            return SnappyRefuse(kSnappyRejectAlpha,\n"
+     "                                CUDEC_ERR_CORRUPT_INPUT, &reject);\n"
+     "        }\n" ${_probe_header_tail})
+# No enumeration at all.
+string(REGEX REPLACE "enum SnappyReject" "enum SomethingElse" _probe_no_enum
+                     "${_probe_header_head}")
+file(WRITE ${_snappy_probe_root}/no_enum/snappy_block.h ${_probe_no_enum}
+     ${_probe_alpha_site} ${_probe_header_tail})
+# An unbalanced bracket above a violation - the shape that reads only the top
+# of a file (issue #294). The rule below the bracket must still report, and at
+# the line it is on.
+file(WRITE ${_snappy_probe_root}/bracket_above/snappy_block.h
+     ${_probe_header_head}
+     "            /* Reading from src[from .. as the real header does. */\n"
+     "            return CUDEC_ERR_CORRUPT_INPUT;\n" ${_probe_header_tail})
+# Prose is not code. This header is compliant and its comments spell out both
+# a bare refusal and a second parser definition; a scan that read comments
+# would refuse the file that documents itself best.
+file(WRITE ${_snappy_probe_root}/prose/snappy_block.h ${_probe_header_head}
+     "            /* Not: return CUDEC_ERR_CORRUPT_INPUT; and not a second\n"
+     "             * struct SnappyParser { either. */\n" ${_probe_alpha_site}
+     ${_probe_header_tail})
+
+set(_snappy_lock_probes
+    "clean|"
+    "with_include|"
+    "prose|"
+    "missing_header|snappy_block.h is missing"
+    "no_parser|no longer defines 'struct SnappyParser'"
+    "local_copy|kernel.cu defines a local 'struct SnappyParser'"
+    "no_include|kernel.cu names the Snappy parser without including"
+    "bare_return|snappy_block.h:22: refuses without going through SnappyRefuse"
+    "wrapped_refuse|snappy_block.h:22: a SnappyRefuse call with no ladder branch"
+    "branch_unused|ladder branch 'kSnappyRejectGamma' is declared and no refusal"
+    "site_undeclared|a refusal site names 'kSnappyRejectGamma', which"
+    "branch_shared|ladder branch 'kSnappyRejectAlpha' is named by 2 refusal"
+    "no_enum|declares no reject ladder"
+    "bracket_above|snappy_block.h:23: refuses without going through")
+foreach(_entry IN LISTS _snappy_lock_probes)
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\2" _expected "${_entry}")
+  cudec_check_snappy_locks(${_snappy_probe_root}/${_probe} _probe_result)
+  if(_expected STREQUAL "")
+    # Checked here rather than through string(FIND): an empty needle is found
+    # at position 0 in every string, so the branch below would assert nothing.
+    if(_probe_result)
+      message(FATAL_ERROR "the Snappy lock refuses a compliant probe: "
+                          "'${_probe}' must come back silent (issue #173). It "
+                          "reported:\n${_probe_result}")
+    endif()
+  else()
+    string(FIND "${_probe_result}" "${_expected}" _found_at)
+    if(_found_at EQUAL -1)
+      message(FATAL_ERROR "the Snappy lock is dead for one rule: probe "
+                          "'${_probe}' did not report \"${_expected}\" "
+                          "(issue #173). It reported:\n${_probe_result}")
+    endif()
+  endif()
+endforeach()
+
+# And now against the tree the rules are for.
+cudec_check_snappy_locks(${CMAKE_CURRENT_SOURCE_DIR}/../src _snappy_violations)
+if(_snappy_violations)
+  message(FATAL_ERROR "the Snappy parser core is not single-sourced, or its "
+                      "reject ladder and its refusal sites have drifted "
+                      "apart (issue #173):\n${_snappy_violations}")
+endif()
+
 # ---- Termination, warp-collective integrity, and determinism as structural
 # rules (issue #72). Same honest scope as the checks above: drift detectors
 # under the known spellings, not tamper-proofing. Every rule below is applied
