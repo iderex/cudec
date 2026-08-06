@@ -351,6 +351,15 @@ cudec_add_test(snappy_parser_twin SOURCES snappy_parser_twin.cpp LIBS
                cudec_test_fixtures)
 target_include_directories(snappy_parser_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The classes a mutation corpus cannot structurally build (issue #172): the
+# literal length's extra bytes and the varint preamble's edge encodings, swept
+# by hand against both reference calls. Its own binary rather than a section of
+# the twin, because it is breadth over the same rungs the twin covers one
+# stream each - and because a sweep that reds says which class moved.
+cudec_add_test(snappy_edge_sweep SOURCES snappy_edge_sweep.cpp LIBS
+               cudec_test_fixtures)
+target_include_directories(snappy_edge_sweep
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # snappy's own three negative vectors (issue #156), read out of the pinned
 # archive rather than copied into this tree: the URL_HASH above already proves
 # the bytes, and a copy would be three binary blobs restating it. The path is
