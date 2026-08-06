@@ -2,6 +2,8 @@
 
 #include <lz4.h>
 #include <snappy.h>
+#include <zstd.h>
+#include <zstd_errors.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -448,4 +450,93 @@ std::vector<unsigned char> SnappyCompressBlock(
     }
     compressed.resize(written);
     return compressed;
+}
+
+bool ZstdOracleContentSize(const std::vector<unsigned char>& stream,
+                           uint64_t* size, bool* unknown) {
+    *size = 0;
+    *unknown = false;
+    if (stream.empty()) {
+        return false; /* never hand zstd a null source pointer */
+    }
+    const unsigned long long declared =
+        ZSTD_getFrameContentSize(stream.data(), stream.size());
+    if (declared == ZSTD_CONTENTSIZE_ERROR) {
+        return false;
+    }
+    if (declared == ZSTD_CONTENTSIZE_UNKNOWN) {
+        *unknown = true;
+        return true;
+    }
+    *size = static_cast<uint64_t>(declared);
+    return true;
+}
+
+bool ZstdOracleDecodes(const std::vector<unsigned char>& stream,
+                       std::vector<unsigned char>* decoded) {
+    decoded->clear();
+    uint64_t declared = 0;
+    bool unknown = false;
+    if (!ZstdOracleContentSize(stream, &declared, &unknown)) {
+        return false;
+    }
+    if (unknown) {
+        /* A frame that declares no content size needs a caller-owned bound,
+         * and this wrapper is the exact-produce parity call - it has none to
+         * offer. Refusing is not a verdict on the frame, so no test may read
+         * it as one; the size-taking surface above is where that case is
+         * driven from. */
+        return false;
+    }
+    if (declared > kZstdOracleMaxOutput) {
+        return false; /* the wrapper's bound, documented in fixtures.h */
+    }
+    decoded->assign(static_cast<size_t>(declared), 0);
+    const size_t produced = ZSTD_decompress(
+        decoded->data(), decoded->size(), stream.data(), stream.size());
+    if (ZSTD_isError(produced) || produced != declared) {
+        /* A rejected stream produces no output, the same contract the lz4 and
+         * snappy wrappers hold their callers to. The produced-equals-declared
+         * arm is not redundant: it is the exact-produce half of parity, and a
+         * frame whose header promises more than its blocks deliver has to
+         * fail here rather than leave a short buffer looking decoded. */
+        decoded->clear();
+        return false;
+    }
+    return true;
+}
+
+int ZstdOracleErrorCode(const std::vector<unsigned char>& stream) {
+    if (stream.empty()) {
+        /* The one value here zstd did not produce, and it is negative so it
+         * cannot be mistaken for a ZSTD_ErrorCode. An empty buffer is not a
+         * frame and zstd is never handed a null source pointer, so there is
+         * no verdict of its to report. */
+        return kZstdOracleNotAFrame;
+    }
+    /* Size the destination from the frame where the frame says so, and from
+     * nothing where it does not: an unknown or malformed content size leaves
+     * a small probe buffer, and zstd answers on the bytes anyway. Where that
+     * answer is ZSTD_error_dstSize_tooSmall it is a verdict on THIS CALL's
+     * buffer rather than on the frame, which is why the size-taking surface
+     * exists beside this one.
+     *
+     * Nothing is synthesized. Every non-negative value returned here came out
+     * of ZSTD_getErrorCode, and 0 means zstd's own decode succeeded. Whether
+     * the frame also produced exactly what it declared is ZstdOracleDecodes's
+     * question, not this one's. */
+    uint64_t declared = 0;
+    bool unknown = false;
+    size_t room = 64;
+    if (ZstdOracleContentSize(stream, &declared, &unknown) && !unknown &&
+        declared != 0 && declared <= kZstdOracleMaxOutput) {
+        room = static_cast<size_t>(declared);
+    }
+    std::vector<unsigned char> out(room, 0);
+    const size_t produced =
+        ZSTD_decompress(out.data(), out.size(), stream.data(), stream.size());
+    if (ZSTD_isError(produced)) {
+        return static_cast<int>(ZSTD_getErrorCode(produced));
+    }
+    return 0;
 }

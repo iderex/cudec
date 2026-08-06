@@ -98,4 +98,52 @@ std::vector<Fixture> MakeSnappyFixtures();
 std::vector<Mutant> MutateSnappyStream(const std::vector<unsigned char>& stream,
                                        uint64_t seed);
 
+/* The Zstd oracle (facebook/zstd, pinned in tests/CMakeLists.txt), the same
+ * authority over stream validity that liblz4 holds for LZ4 and snappy for
+ * Snappy. Decode only: the wrapper links the decode-only archive, so nothing
+ * reachable from here can compress.
+ *
+ * A zstd frame carries its own content size when the compressor wrote one, so
+ * the parity call needs no size argument in the common case. Two values it can
+ * return instead are NOT sizes and are refused here rather than passed on as
+ * one: ZSTD_CONTENTSIZE_UNKNOWN, which a streaming-produced frame legitimately
+ * carries, and ZSTD_CONTENTSIZE_ERROR, which is the header itself being
+ * malformed. A caller that wants the first case decoded must say how large a
+ * buffer it is willing to own, which is what the size argument below is for.
+ *
+ * kZstdOracleMaxOutput is this wrapper's bound and not zstd's, for the same
+ * reason kSnappyOracleMaxOutput is: a mutated frame will declare a content
+ * size no corpus here produces, and the harness refuses to allocate on it. */
+const size_t kZstdOracleMaxOutput = 256u * 1024u * 1024u;
+bool ZstdOracleDecodes(const std::vector<unsigned char>& stream,
+                       std::vector<unsigned char>* decoded);
+
+/* The declared-size surface on its own, for the tests that are about the
+ * frame header rather than about the payload. Returns false when zstd calls
+ * the header malformed; sets *unknown when the frame declares no content
+ * size, which is a valid frame and not a rejection. */
+bool ZstdOracleContentSize(const std::vector<unsigned char>& stream,
+                           uint64_t* size, bool* unknown);
+
+/* zstd's own error CLASS for a stream it refuses, so a fail-closed matrix row
+ * can name the rejection reason instead of settling for a bare non-zero.
+ * Returns 0 when zstd's decode succeeded. The values are ZSTD_ErrorCode from
+ * zstd_errors.h, kept as an int here so no test translation unit needs the
+ * oracle header - the include paths are PRIVATE to the fixtures archive by
+ * design.
+ *
+ * MEASURED, and it bounds what a matrix row may claim: on zstd 1.5.7's simple
+ * API the code alone does NOT separate the refusal shapes. An unrecognised
+ * prefix, a pre-v0.8 legacy magic with the legacy decoders compiled out, and a
+ * valid frame with its last four bytes removed all come back
+ * ZSTD_error_srcSize_wrong (72). What separates them is the pair of this value
+ * and the content-size verdict above: the truncated frame's header still
+ * parses and yields its real size, the other two do not parse at all.
+ * tests/zstd_oracle_smoke.cpp pins all three. */
+int ZstdOracleErrorCode(const std::vector<unsigned char>& stream);
+
+/* Returned when this wrapper refused before zstd was reached. Negative, so it
+ * cannot collide with a ZSTD_ErrorCode, which is an unsigned enumeration. */
+const int kZstdOracleNotAFrame = -1;
+
 #endif /* CUDEC_TESTS_FIXTURES_H */
