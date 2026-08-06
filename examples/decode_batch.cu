@@ -100,10 +100,11 @@ static int cuda_failed(cudaError_t error, const char* what) {
 }
 
 int main(void) {
-    /* Everything is declared and null-initialised up front so the single
-     * cleanup path at the bottom can free whatever was reached. cudaFree on
-     * a null pointer is a no-op, so a failure halfway through frees exactly
-     * the allocations that exist. */
+    /* Every pointer the cleanup path frees is declared and null-initialised
+     * up front, so a failure anywhere below can jump straight to it and free
+     * exactly the allocations that exist - cudaFree on a null pointer is a
+     * no-op. The plain arrays below carry no initialiser because each is
+     * filled before it is read. */
     const unsigned char* host_sources[CHUNK_COUNT];
     size_t host_source_sizes[CHUNK_COUNT];
     const void* device_sources[CHUNK_COUNT] = {NULL, NULL, NULL, NULL};
