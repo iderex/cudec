@@ -1224,35 +1224,56 @@ function(cudec_scan_source path check_loops out_violations)
   # exact, and the join the loop rule needs is rebuilt below where the
   # element it belongs to is known.
   #
-  # The two characters CMake's list syntax eats are protected across the
-  # split: a ';' separates elements and a '\' escapes that separator. The
-  # placeholders are control bytes, which no source in this tree carries and
-  # which therefore cannot be produced by the source being scanned.
+  # The FOUR characters CMake's list syntax eats are protected across the
+  # split: a ';' separates elements, a '\' escapes that separator, and a '['
+  # opens a bracket that swallows every separator until its ']'. One
+  # unbalanced bracket - `src[from` wrapped across a line, or a lone one in a
+  # comment - therefore joins the whole rest of the file into a single
+  # element, and every line below it stops reaching a rule. Measured on
+  # src/snappy_block.h, where 290 of 440 lines went unread (issue #294); the
+  # reader in cudec_code_lines carries the same protection for the same
+  # reason. The placeholders are control bytes, which no source in this tree
+  # carries and which therefore cannot be produced by the source being
+  # scanned.
   string(ASCII 1 _tok_backslash)
   string(ASCII 2 _tok_semicolon)
+  string(ASCII 3 _tok_open)
+  string(ASCII 4 _tok_close)
   file(READ "${path}" _raw)
   # "No source carries one" is the assumption this reader rests on, so it is
   # stated to the file rather than trusted: a source that does carry one would
   # have it restored below as a backslash or as a separator, which is a way to
   # smuggle either past the split. Refuse the file instead of scanning it.
-  if(_raw MATCHES "${_tok_backslash}|${_tok_semicolon}")
+  if(_raw MATCHES
+     "${_tok_backslash}|${_tok_semicolon}|${_tok_open}|${_tok_close}")
     string(APPEND _violations
-           "  ${path}:1: a control byte (0x01 or 0x02) in a source read as "
+           "  ${path}:1: a control byte (0x01 to 0x04) in a source read as "
            "text - this scan cannot tell one from its own line markers, so "
            "the file is refused rather than scanned\n")
   endif()
   string(REPLACE "\\" "${_tok_backslash}" _raw "${_raw}")
   string(REPLACE ";" "${_tok_semicolon}" _raw "${_raw}")
+  string(REPLACE "[" "${_tok_open}" _raw "${_raw}")
+  string(REPLACE "]" "${_tok_close}" _raw "${_raw}")
   string(REPLACE "\r\n" "\n" _raw "${_raw}")
   string(REPLACE "\r" "\n" _raw "${_raw}")
   # A file's final newline terminates its last line rather than starting an
   # empty one; left in, it would add a line the file does not have.
   string(REGEX REPLACE "\n$" "" _raw "${_raw}")
+  # What a whole read must produce, counted from the bytes before the split
+  # rather than inferred from what the split returned: one line per remaining
+  # newline, plus the last line, which the strip above left without one. The
+  # comparison is at the bottom of the loop.
+  string(REGEX MATCHALL "\n" _newlines "${_raw}")
+  list(LENGTH _newlines _expected_lines)
+  math(EXPR _expected_lines "${_expected_lines} + 1")
   string(REPLACE "\n" ";" _lines "${_raw}")
   foreach(_src_line IN LISTS _lines)
     math(EXPR _lineno "${_lineno} + 1")
     string(REPLACE "${_tok_semicolon}" ";" _src_line "${_src_line}")
     string(REPLACE "${_tok_backslash}" "\\" _src_line "${_src_line}")
+    string(REPLACE "${_tok_open}" "[" _src_line "${_src_line}")
+    string(REPLACE "${_tok_close}" "]" _src_line "${_src_line}")
     set(_line "${_src_line}")
     if(_in_comment)
       if(_line MATCHES "\\*/")
@@ -1521,6 +1542,20 @@ function(cudec_scan_source path check_loops out_violations)
              "this project can test on\n")
     endif()
   endforeach()
+  # A partial read must never look like a clean scan: a source that reached no
+  # rule and one that reached every rule and satisfied them all leave the same
+  # trace, which is nothing. The protections above are what make the two counts
+  # agree, so this is the check that says they still do - and the one that
+  # reds if a fifth character with list meaning turns up (issue #294). A hard
+  # error rather than a violation: a reader that cannot read is not a finding
+  # about the source it was pointed at.
+  if(NOT _lineno EQUAL _expected_lines)
+    message(
+      FATAL_ERROR
+        "${path} was read as ${_lineno} lines and carries ${_expected_lines}: "
+        "this scan cannot read it whole, and a partial read reports the same "
+        "silence as a clean one (issue #294)")
+  endif()
   # A file whose last line ends in a backslash leaves an element the loop rule
   # never got to judge, so the construct inside it went unread. Reject rather
   # than return silently, for the same reason the unbalanced `for` header
@@ -1829,12 +1864,37 @@ file(WRITE ${_probe_dir}/scan_width_named_constant.cu
      "    return tid % kWaveLanes;
 " "}
 ")
-# The byte the reader borrows for its own bookkeeping, in the file it is
-# reading. It has to come back refused, or the borrowing is a way to write a
-# separator or a backslash the split will not see as one.
+# The bytes the reader borrows for its own bookkeeping, in the file it is
+# reading. They have to come back refused, or the borrowing is a way to write a
+# separator or a backslash the split will not see as one. One probe per end of
+# the borrowed range: 0x01 is the backslash marker and 0x04 the bracket marker
+# the bracket protection added (issue #294).
 string(ASCII 1 _probe_ctrl)
 file(WRITE ${_probe_dir}/scan_control_byte.cu
      "void probe() {\n" "    g(1);${_probe_ctrl}\n" "}\n")
+string(ASCII 4 _probe_ctrl_close)
+file(WRITE ${_probe_dir}/scan_control_byte_close.cu
+     "void probe() {\n" "    g(1);${_probe_ctrl_close}\n" "}\n")
+
+# An unbalanced bracket above a violation. Before the bracket protection, the
+# '[' on the first line swallowed every line separator after it, the whole file
+# arrived as one element numbered line 1, and the loop rule below it reached
+# nothing: a source that violates a fail-closed rule left exactly the trace of
+# one that satisfies it. The shape is copied from src/snappy_block.h, where a
+# bracket in a comment ended the scan 290 lines early (issue #294). The
+# expectation carries the LINE NUMBER, because a reader that swallows a
+# separator and still reports the rule would report it against the wrong line.
+file(
+  WRITE ${_probe_dir}/scan_bracket_partial.cu
+  "/* A LITERAL copies length bytes from src[from ..\n"
+  " * and the bracket this comment opened never closes.\n"
+  " */\n"
+  "unsigned probe(unsigned n) {\n"
+  "    while (n != 0) {\n"
+  "        n = n - 1;\n"
+  "    }\n"
+  "    return n;\n"
+  "}\n")
 
 cudec_scan_source(${_probe_dir}/scan_clean.cu TRUE _probe_clean)
 if(_probe_clean)
@@ -1878,7 +1938,9 @@ set(_scanner_probes
     "scan_line_after_continuation|scan_line_after_continuation.cu:7: a 'while' loop with no explicit"
     "scan_macro_for_opaque|scan_macro_for_opaque.cu:1: a 'for' header without a visible"
     "scan_continuation_at_eof|scan_continuation_at_eof.cu:4: a backslash continuation left open at end of file"
-    "scan_control_byte|a control byte (0x01 or 0x02) in a source read as text"
+    "scan_control_byte|a control byte (0x01 to 0x04) in a source read as text"
+    "scan_control_byte_close|a control byte (0x01 to 0x04) in a source read"
+    "scan_bracket_partial|scan_bracket_partial.cu:5: a 'while' loop with no explicit"
     "scan_width_literal_32|scan_width_literal_32.cu:3: bare wave-width literal '32'"
     "scan_width_literal_64|scan_width_literal_64.cu:3: bare wave-width literal '64'"
     "scan_width_from_parameter|"
