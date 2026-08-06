@@ -137,6 +137,12 @@ build. The version compatibility rule is `SameMinorVersion`: while the version
 is 0.x, this project treats a minor bump as the breaking one, so a consumer
 asking for 0.0 is not handed 0.1.
 
+## Usage
+
+[examples/decode_frame.c](examples/decode_frame.c) decodes a `.lz4` frame using
+the public header and libc, and nothing else. Both builds compile it, and the
+CUDA build links it into `build-cuda/examples/example_decode_frame`.
+
 ## Contributing
 
 Issue-driven: every change starts as an issue and lands as a gated PR - see

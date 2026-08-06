@@ -337,6 +337,21 @@ if(CUDEC_ENABLE_HIP)
       "build.")
 endif()
 
+# ---- The examples (issue #158). Built in BOTH configurations, which is the
+# point: they include nothing but the public header, so they compile wherever
+# the header is usable and link wherever the decoder is built. Top-level only,
+# for the reason the install surface below is - a project that vendors cudec
+# asked for the library, not for its example binaries.
+#
+# After the CUDA block rather than inside it: the host-only configuration needs
+# them too, and in the CUDA configuration this is the first point where CXX is
+# enabled and the cudec target is complete. examples/CMakeLists.txt holds
+# itself to registering no ctest entry, since the timeout sweep above has
+# already run by the time this line is read.
+if(PROJECT_IS_TOP_LEVEL)
+  add_subdirectory(examples)
+endif()
+
 # ---- The install surface (issue #79). A release nobody can install is not a
 # release, and until this existed every consumer had to vendor the tree.
 #
