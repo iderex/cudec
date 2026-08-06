@@ -369,6 +369,13 @@ endif()
 # reaching for both would be refused by the linker. Host-side and GPU-less;
 # nothing here is about cudec's own Zstd path, which does not exist yet.
 cudec_add_test(zstd_oracle_smoke SOURCES zstd_oracle_smoke.cpp LIBS zstd_full)
+# The Zstd backward bitstream reader, executed on the host before any FSE or
+# Huffman code exists to run over it (issue #215). Every serial core in M5
+# reads through this one unit, so it is proven alone: hand-written bit strings
+# for expectations, one negative per reject rung. No oracle and no device.
+cudec_add_test(zstd_bitstream_twin SOURCES zstd_bitstream_twin.cpp)
+target_include_directories(zstd_bitstream_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
