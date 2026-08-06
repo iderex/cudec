@@ -682,3 +682,221 @@ rule on the worst case from its first baseline.
 
 **No open maintainer decision.** Every fork above was settled at the panel;
 none of them is a call that needs the release gate.
+
+## 11. M4 GDeflate format dossier
+
+What GDeflate is, sourced, so that the kernel design panel and the
+table/parse core work from one record instead of each re-reading a draft.
+This section states facts and provenance only. It takes no design decision,
+and it does not settle the legal posture, which is its own maintainer-gated
+issue.
+
+### 11.1 Provenance: three artifacts, no single specification
+
+There is no canonical GDeflate specification. Three artifacts together
+stand in for one, and they do not carry equal weight.
+
+**The IETF draft.** `draft-uralsky-gdeflate-00`, "GDEFLATE bitstream
+specification", Y. Uralsky, NVIDIA Corporation, 7 July 2024, intended
+status Informational.
+<https://www.ietf.org/archive/id/draft-uralsky-gdeflate-00.txt>. The
+datatracker record
+(<https://datatracker.ietf.org/doc/draft-uralsky-gdeflate/>) reports it as
+an expired individual Internet-Draft with no stream and no working group,
+one version only, last updated 2025-01-08. It is the most precise prose
+anywhere and it is not a standard, was never adopted, and will not be
+revised unless somebody refiles it. Archived and citable; BCP 78 and the
+IETF Trust Legal Provisions apply, so it is implementable freely with
+standard attribution.
+
+**The reference implementation**, and the de-facto normative artifact:
+`GDeflate/` in `microsoft/DirectStorage`
+(<https://github.com/microsoft/DirectStorage>). Two licence facts that are
+easy to get backwards, both read from the tree rather than from the
+repository's landing page: the repository root is MIT, and the GDeflate
+subtree carries its own Apache-2.0 `LICENSE` with SPDX headers naming both
+NVIDIA CORPORATION & AFFILIATES and Microsoft Corporation. Apache-2.0 is
+what the M4 oracle work has to satisfy, and it is the subtree's licence,
+not the repository's. Beside the codec sits `GDeflateTest`, which validates
+against the shipping runtime, so bit-exact interop with DirectStorage is
+the contract that is actually tested. **Where the draft and the reference
+disagree, cudec follows the reference**, because the reference is what real
+data was produced by.
+
+**The Vulkan extension**, which exposes the format without defining it.
+`VK_EXT_memory_decompression` is extension 551 in the registry, marked
+`ratified="vulkan"`, promoted from `VK_NV_memory_decompression`
+(extension 428). Its method bitmask carries exactly one method bit,
+`VK_MEMORY_DECOMPRESSION_METHOD_GDEFLATE_1_0_BIT_EXT`. Its valid usage is
+where the 64 KiB decode unit shows up independently of the draft: when the
+method is that bit, `decompressedSize` must be at most 65536 bytes
+(`VUID-VkDecompressMemoryInfoEXT-decompressionMethod-11762`, and the same
+bound again on the region structure). Khronos defines none of the
+bitstream; it standardizes a way to ask a driver for it. Read from
+`xml/vk.xml` and `chapters/memory_decompression.adoc` in
+`KhronosGroup/Vulkan-Docs`.
+
+### 11.2 The decode unit and the substream machine
+
+Every fact in this subsection is the draft's, with its section number.
+
+- **Pages.** Data is split into 64 KB pages that are "completely
+  independent, enabling compression and decompression to operate on
+  multiple pages in parallel" (section 4). The page is the unit of random
+  access and the unit of parallelism.
+- **Substreams.** The sequence of variable-length codes is split into 32
+  independent substreams, "each sub-stream is assigned to a fixed SIMD
+  lane" (section 5.1). Thirty-two is not a tuning parameter; it is in the
+  bitstream.
+- **The bit buffer.** The draft expects per-lane state in a pair of 32-bit
+  registers plus a counter of valid bits, and sets the read threshold at 32
+  bits so at least one symbol per lane is decodable every round (section
+  5.2). The threshold is sized by the longest possible code, which the
+  draft states as 31 bits: 15 bits of worst-case Huffman code plus at most
+  16 extra bits.
+- **The refill schedule is the interleaving.** The first round always loads
+  32 consecutive words, which initializes all 32 lane states, "as a result,
+  any valid GDeflate bit stream cannot be smaller than 4 \* 32 = 128 bytes"
+  (section 5.3). Later rounds load a variable number of words depending on
+  how fast each lane consumed. The stream is then "words from the 32
+  sub-stream interleaved in the order in which they are read during
+  decoding", and that reordering "applies end-to-end across all blocks in
+  the bit stream, disregarding block boundaries" (section 5.3).
+
+  **This is the load-bearing consequence for a decoder, and it is worth
+  stating as a threat rather than as a mechanism: there are no substream
+  markers, and substream boundaries are not self-delimiting.** Where the
+  next word belongs is derived entirely from the decode that has happened
+  so far. A decoder that mis-decodes one symbol does not resynchronize; it
+  reads a different word next, for every lane, for the rest of the page. So
+  there is no cheap structural check that a walk stayed on the rails, and
+  every bound has to be enforced at the point of use.
+
+- **Block headers.** "All block headers are always assigned to sub-stream 0
+  and require one dedicated SIMD round of processing per header, where only
+  1 SIMD lane is active"; non-compressed and dynamic-Huffman blocks take
+  two rounds, one generic and one block-specific (section 6).
+- **Copies.** A copy is a length symbol followed by a distance symbol, so
+  it is "always split across two SIMD rounds", and the two symbols "are
+  always assigned to the same sub-stream so that they get processed by the
+  same SIMD lane during two back-to-back SIMD rounds" (section 11).
+- **End of block.** Code 256 is monitored per round, and when a lane
+  decodes it, "all SIMD lanes following the lane that has decoded the
+  end-of-block symbol should not attempt to perform symbol decode and
+  consume any bits from their state variables" (section 10). A decoder that
+  lets a later lane consume bits there has silently desynchronized every
+  subsequent round.
+- **Table description.** The code-length alphabet is up to 19 three-bit
+  values, one per substream, decoded in a single round with `HCLEN + 4`
+  lanes active (section 8.1). The literal/length and distance code lengths
+  follow as up to 318 symbols (up to 286 plus up to 32), "evenly
+  distributed across 32 sub-streams" and needing up to 10 rounds, each
+  round taking a group of 32 consecutive symbols (section 8.2). Static
+  blocks have no block-specific header and use RFC 1951's predefined tables
+  with the same distribution (section 9).
+
+### 11.3 Divergences from RFC 1951, enumerated
+
+Each item is testable on its own and is numbered so the table and parse
+core can pin them one at a time.
+
+**D1. Length code 285 is not a fixed 258.** It is "re-purposed to represent
+an LZ copy of length in the range between 3 and 65538 bytes", with 16 extra
+bits following the code (section 2.1).
+
+**D2. Distance codes 30 and 31 exist.** Previously unused, they now
+"represent look back distances of up to 65536 bytes", each followed by 14
+extra bits, covering 32769 to 49152 and 49153 to 65536 respectively
+(section 2.1). The reachable window is therefore 65536 bytes, exactly the
+page size, which is what makes pages self-contained.
+
+**D3. Non-compressed blocks lose the length complement and the byte
+alignment.** "In GDeflate, the one's complement of length is dropped from
+the header and the header is no longer required to be byte-aligned. As a
+result, data across all blocks, compressed or non-compressed, forms one
+contiguous bit stream" (section 2.2). Dropping the complement removes
+RFC 1951's one redundancy check on a stored block's length, so the declared
+length reaches the decoder unchecked by the format.
+
+**D4. A non-compressed block's body is entropy-shaped anyway.** Its bytes
+are distributed across the 32 substreams as "fixed-size 8 bit atoms", each
+lane writing one byte and consuming 8 bits per round, so a round moves 32
+bytes and consumes eight 32-bit words; the block takes
+`floor(block_size_in_bytes / 32)` full rounds and a final round with
+`block_size_in_bytes % 32` lanes active (section 7). There is no memcpy
+path.
+
+**D5. Block headers are lane-serial, not stream-serial.** Per D3 the
+bitstream is contiguous, and per section 6 the header still rides substream
+0 alone. The header is therefore not findable by scanning; it is reached
+only by decoding to it.
+
+**D6. One table set per block, read by all 32 lanes.** Sections 8.1 and 8.2
+describe one code-length alphabet and one literal/length-plus-distance
+description per dynamic block, and section 9 the shared predefined tables
+for static blocks. Every lane in the group decodes against the same tables.
+
+### 11.4 What the format does not carry
+
+- **No uncompressed size.** The page bitstream does not state how much
+  output it produces. Enveloping is external, whether an array of sizes or
+  the DirectStorage TileStream container, and the 65536 ceiling comes from
+  the consumer rather than from the bits.
+- **No checksum, anywhere.** The draft's security considerations say only
+  that "any corruption of the data is likely to have severe effects and be
+  difficult to correct" and recommend that systems "provide some means of
+  validating the integrity of the compressed data" (section 13). **Every M4
+  guarantee is therefore structural.** There is no CRC backstop of the kind
+  the LZ4 frame's xxHash32 provides, so a bitstream that decodes without
+  tripping a bound is accepted, and the bounds are the entire defence.
+- **No self-delimiting substreams**, per 11.2. Repeated here because it is
+  the same class of absence: nothing in the encoding lets a decoder confirm
+  it is where it thinks it is.
+
+### 11.5 What the draft does not say
+
+Three things this project should not read into the source, recorded because
+each was believed at some point in the M4 planning and only one of them
+survived reading the text.
+
+- **The draft recommends no trailing padding.** Section 5.3 says only that
+  words at the very end "may not be fully packed with variable-length
+  codes, which means leaving some available bits unused". The 128-byte
+  figure that circulates alongside this is section 5.3's **minimum valid
+  stream size** (`4 * 32`), not a recommended pad. The practical conclusion
+  is unchanged and is now better founded: **cudec cannot rely on any
+  padding after the stream, and the validation ladder must bound-check the
+  tail round rather than assume readable bytes past the end.**
+- **The draft does not say a lane that decoded a copy sits out the next
+  round.** Section 11 says the length and distance symbols occupy two
+  back-to-back rounds on the same lane. What the lane is doing on the
+  second round is a decoder-side question; the only quiesce rule the draft
+  states is section 10's, after end-of-block.
+- **The draft states no bit width for a non-compressed block's length
+  field.** It says what was removed, in D3, and no more.
+
+### 11.6 Open questions for the kernel design panel
+
+Written here so the panel starts from an agenda rather than rediscovering
+it. None of these is answered above, and answering them is not this
+section's job.
+
+1. **Table residency.** One table set per block is read by all 32 lanes
+   every round (D6). Shared memory, registers, or a hybrid, and what that
+   costs in occupancy against section 9's measured register budget for the
+   LZ4 family.
+2. **Enforcing the end-of-block quiesce without divergence.** Section 10
+   forbids lanes after the end-of-block lane from consuming bits. Doing
+   that with a predicate that stays warp-uniform, rather than with a
+   branch, is the difference between a correct decoder and a fast one.
+3. **Bounding the tail round.** With no padding guaranteed (11.5) and a
+   refill that loads whole words, the last round of a page can want bytes
+   the page does not have. Where that check lives, and what it costs on
+   every round rather than only the last, is open.
+4. **The desynchronization threat has no cheap detector** (11.2). Whether
+   anything short of full per-use bounds checking is worth having, and
+   whether a page-level structural invariant exists at all, is worth one
+   deliberate look before the ladder is designed around its absence.
+5. **The stored-block path is not a fast path** (D4). Whether it is worth
+   any specialization at all is a measurement question and belongs to the
+   perf pass, not to the first kernel.
