@@ -430,6 +430,20 @@ jobs:
       - name: Prettier check
         run: npx --yes prettier@3 --check "**/*.{md,yml,yaml}"
 
+      # A Dependabot config the platform rejects is refused here rather than
+      # failing silently (issue #232). GitHub parses .github/dependabot.yml on
+      # its own schedule and reports a rejection nowhere this repository can
+      # read, so a misspelled key looks configured while the setting it names
+      # is not in force. The step above already reds an unparseable file - it
+      # is the YAML parser in this job - and passes a well-formed file whose
+      # keys the platform does not know.
+      #
+      # The route, the schema pin, the exact validator versions and the
+      # self-test that keeps the check from passing vacuously are argued in
+      # the script's own header, next to the constants they are about.
+      - name: Dependabot config validates against the published schema
+        run: scripts/check-dependabot-config.sh
+
       # Every Action pinned to a full commit SHA, enforced rather than swept
       # (issue #131). A tag or branch pin resolves to whatever the upstream
       # owner points it at later, which is the supply-chain hole the pinning
