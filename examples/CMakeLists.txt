@@ -38,6 +38,24 @@ if(CUDEC_SANITIZE)
                       ${CUDEC_SANITIZE_LINK_FLAGS})
 endif()
 
+# The batch consumer (issue #159) has only one shape, unlike the frame one:
+# it drives the device entry point and includes the CUDA runtime, so there is
+# no host-only configuration of it to compile. It is also kept out of the
+# sanitizer configuration for the reason the top-level CMakeLists gives for
+# omitting bench/ there - an nvcc-linked binary cannot link the instrumented
+# archive without dragging the sanitizer onto the device link, so the
+# alternative would be to instrument the device build rather than to skip a
+# consumer. It is compiled and linked, never run: the CI runner has no GPU.
+if(CUDEC_ENABLE_CUDA AND NOT CUDEC_SANITIZE)
+  find_package(CUDAToolkit REQUIRED)
+  add_executable(example_decode_batch decode_batch.cu)
+  target_link_libraries(example_decode_batch PRIVATE cudec CUDA::cudart)
+  set_target_properties(
+    example_decode_batch
+    PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_ARCHITECTURES
+               "${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+
 # This directory registers no ctest entries, and it is added after the sweep
 # that makes a missing TIMEOUT unforgettable (the top-level
 # cudec_sweep_test_timeouts call), so a test added here would escape the sweep
