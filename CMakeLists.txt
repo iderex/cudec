@@ -38,6 +38,23 @@ include(GNUInstallDirs)
 # gate). CI flips this on together with the CUDA toolchain (issue #3).
 option(CUDEC_ENABLE_CUDA "Build the CUDA decode engine and its tests" OFF)
 
+# The HIP engine is opt-in and fail-closed for the same reason and in the same
+# shape (issue #209): asking for it without a HIP toolchain is a hard configure
+# error, never a silent host-only fallback. A ROCm CI job that went green
+# because it quietly built the host-only library would be a gate that proves
+# nothing while reading exactly like one that proves the port compiles.
+option(CUDEC_ENABLE_HIP "Build the HIP decode engine and its tests" OFF)
+
+# One device backend per build tree. Both languages in one tree would give two
+# definitions of the same decode symbols and a link whose winner depends on
+# ordering, so the answer is refusal rather than a documented precedence.
+if(CUDEC_ENABLE_CUDA AND CUDEC_ENABLE_HIP)
+  message(
+    FATAL_ERROR
+      "CUDEC_ENABLE_CUDA and CUDEC_ENABLE_HIP are mutually exclusive: one "
+      "device backend per build tree. Configure two build directories.")
+endif()
+
 # Host-side sanitizer gate (issue #42): opt-in, default OFF. When set (e.g.
 # -DCUDEC_SANITIZE=address,undefined) it instruments the HOST untrusted-input
 # attack surface - the frame parse (src/frame.cpp), the single-sourced block
@@ -240,6 +257,60 @@ if(CUDEC_ENABLE_CUDA)
   # Last, so it sees every directory both subdirectories added: no ctest entry
   # anywhere in the tree may have escaped the timeout check (issue #72).
   cudec_sweep_test_timeouts(${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
+# ---- The HIP language path (issue #209).
+#
+# Two refusals, and the order matters: the toolchain first, because that is the
+# one a CI runner without ROCm exercises on every PR, and the device sources
+# second, because that is the one that keeps this option from ever going green
+# on a machine that HAS ROCm while compiling no decoder at all.
+if(CUDEC_ENABLE_HIP)
+  # check_language probes for a HIP compiler without enabling the language, so
+  # the refusal below is this project's message rather than CMake's generic
+  # one, and it names what is missing. enable_language(HIP) would also fail
+  # here, later and less legibly.
+  include(CheckLanguage)
+  check_language(HIP)
+  if(NOT CMAKE_HIP_COMPILER)
+    message(
+      FATAL_ERROR
+        "CUDEC_ENABLE_HIP requires a HIP toolchain (ROCm's hipcc, or a clang "
+        "that accepts --offload-arch) and none was found. This never falls "
+        "back to a host-only build: a configuration that dropped the device "
+        "engine and still succeeded would be a fail-open gate.")
+  endif()
+
+  # gfx90a is wave64 (CDNA2) and gfx1030 is wave32 (RDNA2), so the default
+  # spans both wave widths the kernel family is parameterized over rather than
+  # picking one and leaving the other uncompiled. The CI job owns the real
+  # list; this only has to accept and forward one, so it is overridable from
+  # the command line exactly as CMAKE_CUDA_ARCHITECTURES is.
+  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx90a gfx1030)
+  endif()
+  enable_language(HIP)
+  # Same reason as the CUDA path: the test net and the bench harness add .cpp
+  # translation units, and a language enabled inside one subdirectory is
+  # invisible to its siblings.
+  enable_language(CXX)
+  enable_testing()
+
+  # The second refusal, and the one this file cannot drop until the port
+  # lands. cudec has no HIP device sources and no vendor shim yet, so
+  # everything above could succeed on a ROCm machine and produce a cudec
+  # containing no decoder - a build that reports success while compiling
+  # nothing is the exact failure the option exists to prevent, and it would
+  # read identically to a working port. When the shim and the
+  # width-parameterized kernels land, this refusal is replaced by the
+  # target_sources and hip::device link that compile them.
+  message(
+    FATAL_ERROR
+      "CUDEC_ENABLE_HIP found a HIP toolchain (${CMAKE_HIP_COMPILER}) but "
+      "cudec carries no HIP device sources yet, so this configuration would "
+      "build a library with no decoder in it and report success. The port "
+      "lands them; until then this option holds the fail-closed contract "
+      "rather than producing a build.")
 endif()
 
 # ---- The install surface (issue #79). A release nobody can install is not a

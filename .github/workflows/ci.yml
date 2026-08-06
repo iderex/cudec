@@ -66,6 +66,48 @@ jobs:
       - name: Configure and build (host-only)
         run: cmake -B build && cmake --build build
 
+      # The fail-closed half of CUDEC_ENABLE_HIP (issue #209), gated on every
+      # PR without a ROCm runner: this image has no HIP toolchain, so asking
+      # for the HIP engine must refuse rather than quietly hand back the
+      # host-only library. Three legs, because "it exited non-zero" is not the
+      # claim - the claim is that it refused FOR THE REASON IT NAMES, and a
+      # configure that died on an unrelated typo would satisfy a bare exit-code
+      # check while proving nothing. The build directory is separate from
+      # `build` above so a refused configure cannot poison the one the rest of
+      # the job uses.
+      - name: CUDEC_ENABLE_HIP refuses without a HIP toolchain
+        run: |
+          if cmake -B build-hip-negative -DCUDEC_ENABLE_HIP=ON > hip.log 2>&1; then
+            echo "FAIL: configure succeeded with no HIP toolchain present"
+            cat hip.log
+            exit 1
+          fi
+          grep -q "CUDEC_ENABLE_HIP requires a HIP toolchain" hip.log || {
+            echo "FAIL: configure failed, but not on the toolchain refusal"
+            cat hip.log
+            exit 1
+          }
+          cat hip.log
+
+      # The mutual exclusion, same shape: two device backends in one build tree
+      # would give two definitions of the decode symbols and a link whose
+      # winner depends on ordering. It refuses before either language is
+      # enabled, so this leg needs neither toolchain.
+      - name: CUDEC_ENABLE_CUDA and CUDEC_ENABLE_HIP refuse each other
+        run: |
+          if cmake -B build-both-negative -DCUDEC_ENABLE_CUDA=ON \
+               -DCUDEC_ENABLE_HIP=ON > both.log 2>&1; then
+            echo "FAIL: configure accepted both device backends at once"
+            cat both.log
+            exit 1
+          fi
+          grep -q "mutually exclusive" both.log || {
+            echo "FAIL: configure failed, but not on the mutual exclusion"
+            cat both.log
+            exit 1
+          }
+          cat both.log
+
       # The install surface is proven by consuming it, never by inspecting it
       # (issue #79). Install the host-only build into a prefix, then configure,
       # build AND RUN a project outside this tree that knows nothing but
