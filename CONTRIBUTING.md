@@ -71,5 +71,10 @@ and need a CUDA 12.x toolchain plus a GPU for the tests - see the README's
 container command for the maintained path (build directory `build-cuda`,
 `ctest --test-dir build-cuda`).
 
+`-DCUDEC_ENABLE_HIP=ON` exists and currently refuses on every machine: there
+are no HIP device sources yet, so the option fails the configure rather than
+handing back a host-only library that looks like a working port. The two
+options are mutually exclusive in one build tree.
+
 All repo artifacts - code, comments, commits, PRs, issues - are written in
 English.

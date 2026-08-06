@@ -60,6 +60,14 @@ today.
   prefix does require the toolkit on the consuming machine and a project that
   enables C++, both stated in [README.md](README.md).
 
+- **`CUDEC_ENABLE_HIP`, a build option that currently refuses.** It is here so
+  the HIP port has a fail-closed contract to land against, and it fails the
+  configure on every machine: without a HIP toolchain it says so, and with one
+  it says that cudec carries no HIP device sources yet. Neither case falls back
+  to a host-only build, because a build that quietly dropped the device engine
+  and reported success would read exactly like a working port. It is also
+  mutually exclusive with `CUDEC_ENABLE_CUDA` in one build tree.
+
 ### Changed
 
 - **`BUILD_SHARED_LIBS=ON` is refused in a top-level cudec build** rather than

@@ -66,6 +66,111 @@ jobs:
       - name: Configure and build (host-only)
         run: cmake -B build && cmake --build build
 
+      # The fail-closed half of CUDEC_ENABLE_HIP (issue #209), gated on every
+      # PR without a ROCm runner. Exiting non-zero is not the claim: the claim
+      # is that each configure refused FOR THE REASON IT NAMES, and a configure
+      # that died on an unrelated typo satisfies a bare exit-code check while
+      # proving nothing. So every leg matches the message text.
+      #
+      # Three legs, and the third is the one that costs something. This image
+      # has no HIP toolchain, so legs 1 and 2 only ever exercise the toolchain
+      # refusal; the SECOND refusal - the one that stops a decoder-less HIP
+      # build on a machine that does have ROCm - would then be gated by
+      # nothing. Leg 3 reaches it by handing the configure a compiler, which is
+      # why the block probes CMAKE_HIP_COMPILER itself instead of using
+      # check_language (that module skips its probe when the variable is
+      # already set, and the refusal would be skipped with it).
+      #
+      # Messages are matched after collapsing whitespace: CMake re-wraps
+      # FATAL_ERROR text to its own width, so a phrase can arrive split across
+      # lines and a plain grep would pass or fail on where the wrap fell.
+      #
+      # Everything is written under the runner temp directory, not the
+      # checkout: a refused configure leaves a build tree behind, and .gitignore
+      # covers the build directories this repo produces on purpose, not these.
+      - name: CUDEC_ENABLE_HIP refuses, and names which half is missing
+        run: |
+          flat() { tr -s '[:space:]' ' ' < "$1"; }
+          out="$RUNNER_TEMP/hip-negative"
+          mkdir -p "$out"
+
+          # Leg 1: no toolchain anywhere -> the toolchain refusal.
+          if cmake -B "$out/no-toolchain" -DCUDEC_ENABLE_HIP=ON \
+               > "$out/1.log" 2>&1; then
+            echo "FAIL: configure succeeded with no HIP toolchain present"
+            cat "$out/1.log"
+            exit 1
+          fi
+          flat "$out/1.log" | grep -q \
+            "CUDEC_ENABLE_HIP requires a HIP toolchain" || {
+            echo "FAIL: configure failed, but not on the toolchain refusal"
+            cat "$out/1.log"
+            exit 1
+          }
+
+          # Leg 2: the refusal must be re-derived, not remembered. A refused
+          # tree may not carry a cached HIP-compiler verdict, or a build
+          # directory configured before ROCm was installed would keep saying
+          # "none was found" without looking again. check_language(HIP) caches
+          # exactly that, which is why the block probes for itself.
+          if grep -q "CMAKE_HIP_COMPILER" "$out/no-toolchain/CMakeCache.txt"; then
+            echo "FAIL: a HIP compiler verdict was cached in a refused tree"
+            grep "CMAKE_HIP_COMPILER" "$out/no-toolchain/CMakeCache.txt"
+            exit 1
+          fi
+          if cmake -B "$out/no-toolchain" -S . > "$out/2.log" 2>&1; then
+            echo "FAIL: re-configure of a refused tree succeeded"
+            cat "$out/2.log"
+            exit 1
+          fi
+          flat "$out/2.log" | grep -q \
+            "CUDEC_ENABLE_HIP requires a HIP toolchain" || {
+            echo "FAIL: the re-configure refused for a different reason"
+            cat "$out/2.log"
+            exit 1
+          }
+
+          # Leg 3: a caller-supplied compiler passes the toolchain arm, so the
+          # device-sources refusal is the one that must fire. /bin/sh is not a
+          # HIP compiler and is not asked to be one - nothing here compiles.
+          if cmake -B "$out/no-sources" -DCUDEC_ENABLE_HIP=ON \
+               -DCMAKE_HIP_COMPILER=/bin/sh > "$out/3.log" 2>&1; then
+            echo "FAIL: configure succeeded with no HIP device sources"
+            cat "$out/3.log"
+            exit 1
+          fi
+          flat "$out/3.log" | grep -q \
+            "cudec carries no HIP device sources yet" || {
+            echo "FAIL: a supplied compiler did not reach the sources refusal"
+            cat "$out/3.log"
+            exit 1
+          }
+
+          cat "$out/1.log" "$out/2.log" "$out/3.log"
+
+      # The mutual exclusion, same shape: two device backends in one build tree
+      # would give two definitions of the decode symbols and a link whose
+      # winner depends on ordering. It refuses before either language is
+      # enabled, so this leg needs neither toolchain. The matched phrase is the
+      # long one rather than "mutually exclusive": the short phrase would also
+      # match a future unrelated refusal and would stop distinguishing.
+      - name: CUDEC_ENABLE_CUDA and CUDEC_ENABLE_HIP refuse each other
+        run: |
+          out="$RUNNER_TEMP/both-negative"
+          if cmake -B "$out" -DCUDEC_ENABLE_CUDA=ON -DCUDEC_ENABLE_HIP=ON \
+               > "$out.log" 2>&1; then
+            echo "FAIL: configure accepted both device backends at once"
+            cat "$out.log"
+            exit 1
+          fi
+          tr -s '[:space:]' ' ' < "$out.log" | grep -q \
+            "mutually exclusive: one device backend per build tree" || {
+            echo "FAIL: configure failed, but not on the mutual exclusion"
+            cat "$out.log"
+            exit 1
+          }
+          cat "$out.log"
+
       # The install surface is proven by consuming it, never by inspecting it
       # (issue #79). Install the host-only build into a prefix, then configure,
       # build AND RUN a project outside this tree that knows nothing but
