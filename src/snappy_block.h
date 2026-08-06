@@ -101,6 +101,50 @@ constexpr uint64_t kSnappyCopy1OffsetBytes = 1;
 constexpr uint64_t kSnappyCopy2OffsetBytes = 2;
 constexpr uint64_t kSnappyCopy4OffsetBytes = 4;
 
+/* The reject ladder, enumerated once (issue #173).
+ *
+ * Every refusal in this header names its branch here and returns through
+ * SnappyRefuse, so the branch set is DERIVED from the code rather than
+ * restated beside it. Two gates read that: tests/CMakeLists.txt refuses a
+ * refusal that does not go through the choke point, an enumerator with no
+ * site, and a site with no enumerator; tests/snappy_parser_twin.cpp refuses
+ * a branch no negative reaches. Adding a branch without a negative therefore
+ * reds the suite, and deleting a negative reds it too.
+ *
+ * kSnappyRejectPreambleUnreachable is the compiler-required exit of the
+ * varint loop, argued unreachable where it sits. It is declared unreachable
+ * in the twin instead of carrying a negative, and that declaration is
+ * fail-closed in both directions: the twin reds if it is ever reached. */
+enum SnappyReject {
+    kSnappyRejectNone = 0,
+    kSnappyRejectPreambleByteMissing,
+    kSnappyRejectPreambleFinalGroup,
+    kSnappyRejectPreambleUnreachable,
+    kSnappyRejectDeclaredOverCapacity,
+    kSnappyRejectPastTerminal,
+    kSnappyRejectUnderProduction,
+    kSnappyRejectLiteralHeaderTruncated,
+    kSnappyRejectLiteralPayloadTruncated,
+    kSnappyRejectLiteralOverProduction,
+    kSnappyRejectCopyHeaderTruncated,
+    kSnappyRejectCopyOffsetZero,
+    kSnappyRejectCopyOffsetBeforeStart,
+    kSnappyRejectCopyOverProduction,
+    kSnappyRejectCount
+};
+
+/* The one choke point. It records which branch refused and returns that
+ * branch's status; `out` is null only where a caller has no interest in the
+ * reason, and the ladder itself always supplies one. */
+CUDEC_HOST_DEVICE inline cudec_status SnappyRefuse(SnappyReject branch,
+                                                   cudec_status status,
+                                                   SnappyReject* out) {
+    if (out != 0) {
+        *out = branch;
+    }
+    return status;
+}
+
 /* One parsed element, in absolute offsets.
  *
  * A LITERAL (is_copy false) copies `length` bytes from src[from ..
@@ -145,11 +189,12 @@ struct SnappyElement {
  * occupied. */
 CUDEC_HOST_DEVICE inline cudec_status SnappyDeclaredLength(
     const unsigned char* src, uint64_t src_size, uint64_t* declared,
-    uint64_t* preamble_size) {
+    uint64_t* preamble_size, SnappyReject* reject = 0) {
     uint64_t result = 0;
     for (uint64_t group = 0; group < kSnappyVarintGroups; group++) {
         if (group >= src_size) {
-            return CUDEC_ERR_CORRUPT_INPUT; /* preamble byte missing */
+            return SnappyRefuse(kSnappyRejectPreambleByteMissing,
+                                CUDEC_ERR_CORRUPT_INPUT, reject);
         }
         const unsigned char byte = src[group];
         /* The final group is refused above 15 rather than truncated: a
@@ -157,7 +202,8 @@ CUDEC_HOST_DEVICE inline cudec_status SnappyDeclaredLength(
          * length the reference rejects outright. */
         if (group + 1 == kSnappyVarintGroups &&
             byte >= kSnappyVarintFinalMax) {
-            return CUDEC_ERR_CORRUPT_INPUT;
+            return SnappyRefuse(kSnappyRejectPreambleFinalGroup,
+                                CUDEC_ERR_CORRUPT_INPUT, reject);
         }
         result |= static_cast<uint64_t>(byte & kSnappyVarintPayload)
                   << (kSnappyVarintBits * group);
@@ -170,8 +216,10 @@ CUDEC_HOST_DEVICE inline cudec_status SnappyDeclaredLength(
     /* Unreachable: a fifth byte below 16 has its continuation bit clear and
      * returned above, and one at or above 16 was refused. The exit exists
      * because the compiler requires one, and it is the reason this branch
-     * carries no crafted negative. */
-    return CUDEC_ERR_CORRUPT_INPUT;
+     * carries no crafted negative - it is declared unreachable in the twin
+     * instead, which reds if it is ever reached. */
+    return SnappyRefuse(kSnappyRejectPreambleUnreachable,
+                        CUDEC_ERR_CORRUPT_INPUT, reject);
 }
 
 struct SnappyParser {
@@ -184,6 +232,10 @@ struct SnappyParser {
     uint64_t declared = 0;
     bool begun = false;
     bool finished = false;
+    /* Which ladder branch refused, valid after any call that returned a
+     * reject status. Diagnostic only: no decode decision reads it, and the
+     * verdict a caller acts on stays the returned cudec_status. */
+    SnappyReject reject = kSnappyRejectNone;
 
     /* Reads the preamble and checks the declaration against the caller's
      * capacity. Idempotent, and Next calls it, so a caller that needs the
@@ -193,8 +245,8 @@ struct SnappyParser {
             return CUDEC_OK;
         }
         uint64_t preamble_size = 0;
-        const cudec_status status =
-            SnappyDeclaredLength(src, src_size, &declared, &preamble_size);
+        const cudec_status status = SnappyDeclaredLength(
+            src, src_size, &declared, &preamble_size, &reject);
         if (status != CUDEC_OK) {
             return status;
         }
@@ -202,7 +254,8 @@ struct SnappyParser {
          * the one place a hostile 4 GiB declaration is stopped from sizing
          * anything. */
         if (declared > dst_capacity) {
-            return CUDEC_ERR_OUTPUT_TOO_SMALL;
+            return SnappyRefuse(kSnappyRejectDeclaredOverCapacity,
+                                CUDEC_ERR_OUTPUT_TOO_SMALL, &reject);
         }
         src_pos = preamble_size;
         begun = true;
@@ -235,7 +288,9 @@ struct SnappyParser {
     CUDEC_HOST_DEVICE cudec_status Next(SnappyElement* element, bool* done) {
         *done = false;
         if (finished) {
-            return CUDEC_ERR_CORRUPT_INPUT; /* called past the terminal element */
+            /* Called past the terminal element. */
+            return SnappyRefuse(kSnappyRejectPastTerminal,
+                                CUDEC_ERR_CORRUPT_INPUT, &reject);
         }
         const cudec_status started = Begin();
         if (started != CUDEC_OK) {
@@ -250,7 +305,8 @@ struct SnappyParser {
              * element finds zero output remaining and every element
              * produces at least one byte. */
             if (dst_pos != declared) {
-                return CUDEC_ERR_CORRUPT_INPUT;
+                return SnappyRefuse(kSnappyRejectUnderProduction,
+                                    CUDEC_ERR_CORRUPT_INPUT, &reject);
             }
             element->from = 0;
             element->to = dst_pos;
@@ -275,7 +331,9 @@ struct SnappyParser {
                 const uint64_t extra = length - kSnappyLiteralInlineMax;
                 header += extra;
                 if (header > src_size - src_pos) {
-                    return CUDEC_ERR_CORRUPT_INPUT; /* header past the end */
+                    /* Header past the end. */
+                    return SnappyRefuse(kSnappyRejectLiteralHeaderTruncated,
+                                        CUDEC_ERR_CORRUPT_INPUT, &reject);
                 }
                 length = 0;
                 for (uint64_t i = 0; i < extra; i++) {
@@ -300,10 +358,14 @@ struct SnappyParser {
             length += 1;
             src_pos += header;
             if (length > src_size - src_pos) {
-                return CUDEC_ERR_CORRUPT_INPUT; /* literal bytes missing */
+                /* Literal bytes missing. */
+                return SnappyRefuse(kSnappyRejectLiteralPayloadTruncated,
+                                    CUDEC_ERR_CORRUPT_INPUT, &reject);
             }
             if (length > declared - dst_pos) {
-                return CUDEC_ERR_CORRUPT_INPUT; /* over-production */
+                /* Over-production. */
+                return SnappyRefuse(kSnappyRejectLiteralOverProduction,
+                                    CUDEC_ERR_CORRUPT_INPUT, &reject);
             }
             element->from = src_pos;
             element->to = dst_pos;
@@ -322,7 +384,9 @@ struct SnappyParser {
         }
         const uint64_t header = kSnappyTagBytes + offset_bytes;
         if (header > src_size - src_pos) {
-            return CUDEC_ERR_CORRUPT_INPUT; /* header past the end */
+            /* Header past the end. */
+            return SnappyRefuse(kSnappyRejectCopyHeaderTruncated,
+                                CUDEC_ERR_CORRUPT_INPUT, &reject);
         }
         uint64_t offset = 0;
         for (uint64_t i = 0; i < offset_bytes; i++) {
@@ -349,13 +413,18 @@ struct SnappyParser {
          * closed-form gather reduces by offset, so a zero reaching the
          * device copy engine would be a modulo by zero. */
         if (offset == 0) {
-            return CUDEC_ERR_CORRUPT_INPUT;
+            return SnappyRefuse(kSnappyRejectCopyOffsetZero,
+                                CUDEC_ERR_CORRUPT_INPUT, &reject);
         }
         if (offset > dst_pos) {
-            return CUDEC_ERR_CORRUPT_INPUT; /* reads before the output start */
+            /* Reads before the output start. */
+            return SnappyRefuse(kSnappyRejectCopyOffsetBeforeStart,
+                                CUDEC_ERR_CORRUPT_INPUT, &reject);
         }
         if (length > declared - dst_pos) {
-            return CUDEC_ERR_CORRUPT_INPUT; /* over-production */
+            /* Over-production. */
+            return SnappyRefuse(kSnappyRejectCopyOverProduction,
+                                CUDEC_ERR_CORRUPT_INPUT, &reject);
         }
         element->from = dst_pos - offset;
         element->to = dst_pos;

@@ -43,6 +43,24 @@ using Bytes = std::vector<unsigned char>;
  * those removals left a verdict-only suite green. */
 size_t g_bounds_violations = 0;
 
+/* Which ladder branches this run reached (issue #173). The enumeration lives
+ * once, in src/snappy_block.h, and main() requires the set below to be the
+ * whole of it apart from the one branch declared unreachable there - so a
+ * branch that gains no negative reds this test, and a negative whose deletion
+ * leaves a branch unreached reds it too. Every observation point that can see
+ * a reject records it, because the branches are not all reachable through one
+ * driver: the capacity rung refuses before any element exists, and the
+ * past-terminal rung is only reached by a driver that ignores *done. */
+bool g_reject_seen[cudec_detail::kSnappyRejectCount] = {false};
+cudec_detail::SnappyReject g_last_reject = cudec_detail::kSnappyRejectNone;
+
+void NoteReject(cudec_detail::SnappyReject branch) {
+    g_last_reject = branch;
+    if (branch != cudec_detail::kSnappyRejectNone) {
+        g_reject_seen[branch] = true;
+    }
+}
+
 /* Sequential reference execution of the parsed elements. A copy is the
  * chasing byte copy - reads may land on just-written bytes, which is the
  * pattern-repeating semantics an overlapping Snappy copy has. */
@@ -70,6 +88,7 @@ cudec_status Drive(const unsigned char* src, uint64_t src_size,
         if (status != CUDEC_OK) {
             /* A rejected stream produces nothing, the same contract
              * SnappyOracleDecodes holds its caller to. */
+            NoteReject(parser.reject);
             out->clear();
             return status;
         }
@@ -145,6 +164,7 @@ cudec_status TwinDecode(const Bytes& stream, Bytes* out) {
                                      kSnappyOracleMaxOutput};
     const cudec_status header = probe.Begin();
     if (header != CUDEC_OK) {
+        NoteReject(probe.reject);
         return header;
     }
     return Drive(tight.get(), stream_size, probe.declared, out);
@@ -175,6 +195,7 @@ bool LivenessHolds(const Bytes& stream, const char** why) {
         const uint64_t before = parser.src_pos;
         const cudec_status status = parser.Next(&element, &done);
         if (status != CUDEC_OK) {
+            NoteReject(parser.reject);
             return true; /* a reject ends any driver loop */
         }
         if (done) {
@@ -185,6 +206,7 @@ bool LivenessHolds(const Bytes& stream, const char** why) {
                 *why = "a call after the terminal element succeeded";
                 return false;
             }
+            NoteReject(parser.reject);
             return true;
         }
         if (parser.src_pos <= before) {
@@ -271,6 +293,13 @@ struct CraftedNegative {
     const char* name;
     Bytes stream;
     cudec_status expected;
+    /* The ladder branch this stream must reach, named from the enumeration
+     * in src/snappy_block.h. Pinned per entry rather than only in aggregate:
+     * a negative that keeps rejecting for a DIFFERENT reason than the one it
+     * was written for still leaves its own branch unproven, and the coverage
+     * count alone would not notice as long as some other entry happened to
+     * reach it. */
+    cudec_detail::SnappyReject branch;
 };
 
 /* One crafted stream per validation-ladder branch. Each pins the twin's
@@ -282,29 +311,39 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
     std::vector<CraftedNegative> out;
 
     /* Preamble: no byte at all. */
-    out.push_back({"preamble-absent", {}, CUDEC_ERR_CORRUPT_INPUT});
+    out.push_back({"preamble-absent",
+                   {},
+                   CUDEC_ERR_CORRUPT_INPUT,
+                   cudec_detail::kSnappyRejectPreambleByteMissing});
     /* Preamble: a continuation bit with nothing behind it. */
-    out.push_back({"preamble-truncated", {0x80}, CUDEC_ERR_CORRUPT_INPUT});
+    out.push_back({"preamble-truncated",
+                   {0x80},
+                   CUDEC_ERR_CORRUPT_INPUT,
+                   cudec_detail::kSnappyRejectPreambleByteMissing});
     /* Preamble: a sixth group. The fifth byte still carries the
      * continuation bit, which the reference refuses outright. */
     out.push_back({"preamble-six-groups",
                    {0x80, 0x80, 0x80, 0x80, 0x80, 0x00},
-                   CUDEC_ERR_CORRUPT_INPUT});
+                   CUDEC_ERR_CORRUPT_INPUT,
+                   cudec_detail::kSnappyRejectPreambleFinalGroup});
     /* Preamble: five groups whose value needs a 33rd bit. */
     out.push_back({"preamble-overflows-32-bit",
                    {0x80, 0x80, 0x80, 0x80, 0x10},
-                   CUDEC_ERR_CORRUPT_INPUT});
+                   CUDEC_ERR_CORRUPT_INPUT,
+                   cudec_detail::kSnappyRejectPreambleFinalGroup});
 
     /* Elements: a declaration with no elements behind it. */
     {
         Bytes s = Preamble(4);
-        out.push_back({"under-production-empty", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"under-production-empty", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectUnderProduction});
     }
     /* Elements: production stops short of the declaration. */
     {
         Bytes s = Preamble(8);
         Append(&s, Literal(abcd));
-        out.push_back({"under-production-short", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"under-production-short", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectUnderProduction});
     }
     /* A long-form literal whose length bytes run past the source end. The
      * declaration is deliberately larger than any length those missing
@@ -317,13 +356,15 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
         Bytes s = Preamble(300);
         s.push_back(0xF0); /* class 60: one length byte follows, and none does */
         out.push_back({"literal-header-truncated", s,
-                       CUDEC_ERR_CORRUPT_INPUT});
+                       CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectLiteralHeaderTruncated});
     }
     {
         Bytes s = Preamble(70000);
         s.push_back(0xF4); /* class 61: two length bytes follow, and none do */
         out.push_back({"literal-header-truncated-wide", s,
-                       CUDEC_ERR_CORRUPT_INPUT});
+                       CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectLiteralHeaderTruncated});
     }
     /* A literal whose payload runs past the source end. */
     {
@@ -331,21 +372,24 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
         Append(&s, Literal(abcd));
         s.resize(s.size() - 2);
         out.push_back({"literal-payload-truncated", s,
-                       CUDEC_ERR_CORRUPT_INPUT});
+                       CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectLiteralPayloadTruncated});
     }
     /* A literal longer than the declaration leaves room for. */
     {
         Bytes s = Preamble(2);
         Append(&s, Literal(abcd));
         out.push_back({"literal-over-production", s,
-                       CUDEC_ERR_CORRUPT_INPUT});
+                       CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectLiteralOverProduction});
     }
     /* A copy whose offset bytes run past the source end. */
     {
         Bytes s = Preamble(8);
         Append(&s, Literal(abcd));
         s.push_back(0x0E); /* a two-byte-offset copy tag, with no offset */
-        out.push_back({"copy-header-truncated", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"copy-header-truncated", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyHeaderTruncated});
     }
     /* The same for the narrow form, whose header is one byte shorter and
      * whose guard is therefore a separate branch. */
@@ -353,7 +397,8 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
         Bytes s = Preamble(8);
         Append(&s, Literal(abcd));
         s.push_back(0x01); /* a one-byte-offset copy tag, with no offset */
-        out.push_back({"copy1-header-truncated", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"copy1-header-truncated", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyHeaderTruncated});
     }
     /* And for the four-byte-offset form, which is missing three of them. */
     {
@@ -361,7 +406,8 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
         Append(&s, Literal(abcd));
         Append(&s, Copy4(4, 4));
         s.resize(s.size() - 3);
-        out.push_back({"copy4-header-truncated", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"copy4-header-truncated", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyHeaderTruncated});
     }
     /* A copy with no byte to replicate, in each of the three forms, both
      * with output behind it and with none. */
@@ -369,25 +415,29 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
         Bytes s = Preamble(8);
         Append(&s, Literal(abcd));
         Append(&s, Copy2(4, 0));
-        out.push_back({"copy-offset-zero-tag-10", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"copy-offset-zero-tag-10", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyOffsetZero});
     }
     {
         Bytes s = Preamble(8);
         Append(&s, Literal(abcd));
         Append(&s, Copy4(4, 0));
-        out.push_back({"copy-offset-zero-tag-11", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"copy-offset-zero-tag-11", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyOffsetZero});
     }
     {
         Bytes s = Preamble(8);
         Append(&s, Literal(abcd));
         Append(&s, Copy1(4, 0));
-        out.push_back({"copy-offset-zero-tag-01", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"copy-offset-zero-tag-01", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyOffsetZero});
     }
     {
         Bytes s = Preamble(4);
         Append(&s, Copy2(4, 0));
         out.push_back({"copy-offset-zero-at-start", s,
-                       CUDEC_ERR_CORRUPT_INPUT});
+                       CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyOffsetZero});
     }
     /* A copy reaching before the start of the produced output. */
     {
@@ -395,7 +445,8 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
         Append(&s, Literal(abcd));
         Append(&s, Copy2(4, 5));
         out.push_back({"copy-offset-before-start", s,
-                       CUDEC_ERR_CORRUPT_INPUT});
+                       CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyOffsetBeforeStart});
     }
     /* The same, through the four-byte-offset form, where the offset is
      * wide enough to be a pointer-sized mistake rather than a small one. */
@@ -403,14 +454,16 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
         Bytes s = Preamble(8);
         Append(&s, Literal(abcd));
         Append(&s, Copy4(4, 0xFFFFFFFFu));
-        out.push_back({"copy-offset-huge", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"copy-offset-huge", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyOffsetBeforeStart});
     }
     /* A copy longer than the declaration leaves room for. */
     {
         Bytes s = Preamble(6);
         Append(&s, Literal(abcd));
         Append(&s, Copy2(4, 1));
-        out.push_back({"copy-over-production", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"copy-over-production", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectCopyOverProduction});
     }
     /* A complete stream with one more element behind it: the declared
      * length is already produced, so the trailing element over-produces. */
@@ -418,7 +471,8 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
         Bytes s = Preamble(4);
         Append(&s, Literal(abcd));
         Append(&s, Literal(Ascii("x")));
-        out.push_back({"trailing-element", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"trailing-element", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectLiteralOverProduction});
     }
     /* A complete stream with one dangling tag byte: the source is not
      * consumed exactly, and the tag's own payload is missing too. */
@@ -426,7 +480,8 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
         Bytes s = Preamble(4);
         Append(&s, Literal(abcd));
         s.push_back(0x00);
-        out.push_back({"trailing-tag", s, CUDEC_ERR_CORRUPT_INPUT});
+        out.push_back({"trailing-tag", s, CUDEC_ERR_CORRUPT_INPUT,
+                       cudec_detail::kSnappyRejectLiteralPayloadTruncated});
     }
     return out;
 }
@@ -605,8 +660,16 @@ int main() {
     const auto crafted = MakeCraftedNegatives();
     for (const auto& c : crafted) {
         Bytes twin_out;
+        g_last_reject = cudec_detail::kSnappyRejectNone;
         REQUIRE_CTX(TwinDecode(c.stream, &twin_out) == c.expected,
                     "crafted %s", c.name);
+        /* The branch, not merely the status: eight of these entries share
+         * CUDEC_ERR_CORRUPT_INPUT with some other entry, so a status
+         * comparison cannot tell which rung refused. */
+        REQUIRE_CTX(g_last_reject == c.branch,
+                    "crafted %s: reached ladder branch %d, not %d", c.name,
+                    static_cast<int>(g_last_reject),
+                    static_cast<int>(c.branch));
         REQUIRE_CTX(twin_out.empty(),
                     "crafted %s: a rejected stream produced output", c.name);
         Bytes oracle_out;
@@ -822,13 +885,52 @@ int main() {
      * could execute it in, on any stream above. */
     REQUIRE(g_bounds_violations == 0);
 
+    /* The branch-count lock (issue #173): every rung of the ladder in
+     * src/snappy_block.h was reached by something above, and the one rung
+     * declared unreachable there was not.
+     *
+     * The enumeration is not restated here - it is walked. A branch added to
+     * the header with no negative behind it leaves a hole this loop names,
+     * and deleting the only negative that reached a branch opens the same
+     * hole; tests/CMakeLists.txt holds the other end, refusing a refusal that
+     * does not pass through the enumerated choke point at all.
+     *
+     * The unreachable rung is fail-closed in BOTH directions. It carries no
+     * negative because the argument for it is that no input reaches it - so
+     * if one ever does, the argument was wrong and that has to red rather
+     * than pass as extra coverage. */
+    {
+        size_t branches_reached = 0;
+        for (int branch = cudec_detail::kSnappyRejectNone + 1;
+             branch < cudec_detail::kSnappyRejectCount; branch++) {
+            const bool seen = g_reject_seen[branch];
+            if (branch == cudec_detail::kSnappyRejectPreambleUnreachable) {
+                REQUIRE_CTX(!seen,
+                            "ladder branch %d is declared unreachable in "
+                            "src/snappy_block.h and was reached",
+                            branch);
+                continue;
+            }
+            REQUIRE_CTX(seen,
+                        "ladder branch %d has no negative that reaches it - "
+                        "add one, or the branch is untested (issue #173)",
+                        branch);
+            branches_reached++;
+        }
+        REQUIRE(branches_reached ==
+                static_cast<size_t>(cudec_detail::kSnappyRejectCount) - 2);
+    }
+
     std::printf("PASS: %zu snappy fixtures + %zu mutants in oracle parity "
                 "(%zu oracle-rejected, %zu stricter-than-snappy); %zu crafted "
                 "negatives; %zu accept cases held open; wide-offset sweep and "
                 "the capacity axis pinned; the 32-bit literal-length wrap "
-                "pinned as the one divergence; liveness on %zu streams\n",
+                "pinned as the one divergence; liveness on %zu streams; %d of "
+                "%d ladder branches reached, 1 declared unreachable\n",
                 fixtures.size(), mutant_total, rejected_total,
                 stricter_than_oracle, crafted.size(), accepted.size(),
-                liveness_streams);
+                liveness_streams,
+                static_cast<int>(cudec_detail::kSnappyRejectCount) - 2,
+                static_cast<int>(cudec_detail::kSnappyRejectCount) - 1);
     return 0;
 }
