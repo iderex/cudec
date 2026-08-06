@@ -23,6 +23,21 @@ endif()
 # configuration) its objects. PRIVATE: an example is consumed by nobody.
 target_link_libraries(example_decode_frame PRIVATE cudec)
 
+# In the sanitizer configuration the archive this links is instrumented, so an
+# uninstrumented consumer of it does not link at all: the sanitizer runtime
+# calls compiled into src/frame.cpp resolve nowhere. Measured, on the first CI
+# run of this change - `undefined reference to __asan_report_load1` out of
+# frame.cpp while linking this target. The example takes the same flags the
+# tests do rather than being excluded from that configuration, because a
+# consumer that is not built there is a consumer nothing checks.
+if(CUDEC_SANITIZE)
+  target_compile_options(
+    example_decode_frame
+    PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:${CUDEC_SANITIZE_COMPILE_FLAGS}>)
+  target_link_options(example_decode_frame PRIVATE
+                      ${CUDEC_SANITIZE_LINK_FLAGS})
+endif()
+
 # This directory registers no ctest entries, and it is added after the sweep
 # that makes a missing TIMEOUT unforgettable (the top-level
 # cudec_sweep_test_timeouts call), so a test added here would escape the sweep
