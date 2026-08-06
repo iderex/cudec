@@ -43,21 +43,33 @@ using Bytes = std::vector<unsigned char>;
  * those removals left a verdict-only suite green. */
 size_t g_bounds_violations = 0;
 
-/* Which ladder branches this run reached (issue #173). The enumeration lives
- * once, in src/snappy_block.h, and main() requires the set below to be the
- * whole of it apart from the one branch declared unreachable there - so a
- * branch that gains no negative reds this test, and a negative whose deletion
- * leaves a branch unreached reds it too. Every observation point that can see
- * a reject records it, because the branches are not all reachable through one
- * driver: the capacity rung refuses before any element exists, and the
- * past-terminal rung is only reached by a driver that ignores *done. */
-bool g_reject_seen[cudec_detail::kSnappyRejectCount] = {false};
+/* Which ladder branch refused last, recorded wherever a driver sees a reject.
+ * Diagnostic: it says which rung, where the returned status only says that
+ * some rung refused, and eight of the crafted negatives share one status. */
 cudec_detail::SnappyReject g_last_reject = cudec_detail::kSnappyRejectNone;
 
-void NoteReject(cudec_detail::SnappyReject branch) {
+void ObserveReject(cudec_detail::SnappyReject branch) {
     g_last_reject = branch;
+}
+
+/* Which ladder rungs a DECLARED NEGATIVE reached (issue #173). The
+ * enumeration lives once, in src/snappy_block.h, and main() requires this set
+ * to be the whole of it apart from the one rung declared unreachable there.
+ * So a rung added to the ladder with no negative behind it reds this test,
+ * and deleting the negative that reached a rung reds it too.
+ *
+ * ONLY the declared negative sets mark coverage - never the fixtures, never
+ * the mutation corpus. That is the difference between this check biting and
+ * merely looking as if it does, and it is MEASURED: with the corpus counted,
+ * deleting the copy-over-production negative left this test green, because a
+ * mutant that happened to trip the same rung stood in for it. A rung is
+ * tested when a stream written to reach it reaches it, not when some stream
+ * does. */
+bool g_reject_covered[cudec_detail::kSnappyRejectCount] = {false};
+
+void CoverBranch(cudec_detail::SnappyReject branch) {
     if (branch != cudec_detail::kSnappyRejectNone) {
-        g_reject_seen[branch] = true;
+        g_reject_covered[branch] = true;
     }
 }
 
@@ -88,7 +100,7 @@ cudec_status Drive(const unsigned char* src, uint64_t src_size,
         if (status != CUDEC_OK) {
             /* A rejected stream produces nothing, the same contract
              * SnappyOracleDecodes holds its caller to. */
-            NoteReject(parser.reject);
+            ObserveReject(parser.reject);
             out->clear();
             return status;
         }
@@ -164,7 +176,7 @@ cudec_status TwinDecode(const Bytes& stream, Bytes* out) {
                                      kSnappyOracleMaxOutput};
     const cudec_status header = probe.Begin();
     if (header != CUDEC_OK) {
-        NoteReject(probe.reject);
+        ObserveReject(probe.reject);
         return header;
     }
     return Drive(tight.get(), stream_size, probe.declared, out);
@@ -195,7 +207,7 @@ bool LivenessHolds(const Bytes& stream, const char** why) {
         const uint64_t before = parser.src_pos;
         const cudec_status status = parser.Next(&element, &done);
         if (status != CUDEC_OK) {
-            NoteReject(parser.reject);
+            ObserveReject(parser.reject);
             return true; /* a reject ends any driver loop */
         }
         if (done) {
@@ -206,7 +218,7 @@ bool LivenessHolds(const Bytes& stream, const char** why) {
                 *why = "a call after the terminal element succeeded";
                 return false;
             }
-            NoteReject(parser.reject);
+            ObserveReject(parser.reject);
             return true;
         }
         if (parser.src_pos <= before) {
@@ -486,6 +498,31 @@ std::vector<CraftedNegative> MakeCraftedNegatives() {
     return out;
 }
 
+/* The rung no malformed stream can reach, and the reason it needs its own set
+ * rather than an entry above: it is not a statement about the bytes. The
+ * capacity rung refuses a stream snappy ACCEPTS, because the destination the
+ * caller owns is too small for the length the stream declares - so the loop
+ * above, which requires the reference to reject the same bytes, cannot hold
+ * one. */
+struct CapacityNegative {
+    const char* name;
+    Bytes stream;
+    uint64_t capacity;
+    cudec_detail::SnappyReject branch;
+};
+
+std::vector<CapacityNegative> MakeCapacityNegatives() {
+    const Bytes abcd = Ascii("abcd");
+    std::vector<CapacityNegative> out;
+    Bytes s = Preamble(4);
+    Append(&s, Literal(abcd));
+    out.push_back({"capacity-one-short", s, 3,
+                   cudec_detail::kSnappyRejectDeclaredOverCapacity});
+    out.push_back({"capacity-zero", s, 0,
+                   cudec_detail::kSnappyRejectDeclaredOverCapacity});
+    return out;
+}
+
 /* Streams the reference accepts, which the ladder must not over-reject.
  * Over-strictness is a parity failure and not extra safety: every entry
  * here is a shape snappy's own compressor never emits, so nothing in the
@@ -667,9 +704,10 @@ int main() {
          * CUDEC_ERR_CORRUPT_INPUT with some other entry, so a status
          * comparison cannot tell which rung refused. */
         REQUIRE_CTX(g_last_reject == c.branch,
-                    "crafted %s: reached ladder branch %d, not %d", c.name,
+                    "crafted %s: reached ladder rung %d, not %d", c.name,
                     static_cast<int>(g_last_reject),
                     static_cast<int>(c.branch));
+        CoverBranch(g_last_reject);
         REQUIRE_CTX(twin_out.empty(),
                     "crafted %s: a rejected stream produced output", c.name);
         Bytes oracle_out;
@@ -678,6 +716,53 @@ int main() {
         REQUIRE_CTX(!SnappyOracleAccepts(c.stream),
                     "crafted %s: snappy's validator unexpectedly accepts",
                     c.name);
+    }
+
+    /* The capacity rung, on streams the reference accepts. Its ACCEPTANCE is
+     * asserted here where the crafted loop asserts rejection: a capacity
+     * negative that had drifted into being malformed would otherwise pass for
+     * the wrong reason and leave the rung untested while looking covered. */
+    const auto capacity_negatives = MakeCapacityNegatives();
+    for (const auto& c : capacity_negatives) {
+        Bytes oracle_out;
+        REQUIRE_CTX(SnappyOracleDecodes(c.stream, &oracle_out),
+                    "capacity %s: snappy rejects the stream itself", c.name);
+        Bytes twin_out;
+        g_last_reject = cudec_detail::kSnappyRejectNone;
+        REQUIRE_CTX(Drive(c.stream.data(), c.stream.size(), c.capacity,
+                          &twin_out) == CUDEC_ERR_OUTPUT_TOO_SMALL,
+                    "capacity %s", c.name);
+        REQUIRE_CTX(g_last_reject == c.branch,
+                    "capacity %s: reached ladder rung %d, not %d", c.name,
+                    static_cast<int>(g_last_reject),
+                    static_cast<int>(c.branch));
+        CoverBranch(g_last_reject);
+        REQUIRE_CTX(twin_out.empty(),
+                    "capacity %s: a refused decode produced output", c.name);
+    }
+
+    /* The past-terminal rung, which no stream reaches either: it takes a
+     * DRIVER that ignores *done, and that is the case it exists for - a warp
+     * lane looping past the terminal element must be refused rather than left
+     * to spin against the launch. LivenessHolds proves the refusal over every
+     * stream this test has; this case is what NAMES the rung, so deleting it
+     * leaves the rung uncovered. */
+    {
+        Bytes valid = Preamble(4);
+        Append(&valid, Literal(Ascii("abcd")));
+        cudec_detail::SnappyParser parser{valid.data(), valid.size(), 4};
+        cudec_detail::SnappyElement element;
+        bool done = false;
+        uint64_t fuel = valid.size() + 2;
+        while (!done) {
+            REQUIRE(fuel-- != 0);
+            REQUIRE(parser.Next(&element, &done) == CUDEC_OK);
+        }
+        bool again = false;
+        REQUIRE(parser.Next(&element, &again) == CUDEC_ERR_CORRUPT_INPUT);
+        REQUIRE(!again);
+        REQUIRE(parser.reject == cudec_detail::kSnappyRejectPastTerminal);
+        CoverBranch(parser.reject);
     }
 
     /* The deliberate divergence, pinned explicitly. The four-byte literal
@@ -886,38 +971,38 @@ int main() {
     REQUIRE(g_bounds_violations == 0);
 
     /* The branch-count lock (issue #173): every rung of the ladder in
-     * src/snappy_block.h was reached by something above, and the one rung
-     * declared unreachable there was not.
+     * src/snappy_block.h was reached by a DECLARED NEGATIVE, and the one rung
+     * declared unreachable there was reached by none of them.
      *
-     * The enumeration is not restated here - it is walked. A branch added to
+     * The enumeration is not restated here - it is walked. A rung added to
      * the header with no negative behind it leaves a hole this loop names,
-     * and deleting the only negative that reached a branch opens the same
-     * hole; tests/CMakeLists.txt holds the other end, refusing a refusal that
-     * does not pass through the enumerated choke point at all.
+     * and deleting the negative that reached a rung opens the same hole;
+     * tests/CMakeLists.txt holds the other end, refusing a refusal that does
+     * not pass through the enumerated choke point at all.
      *
      * The unreachable rung is fail-closed in BOTH directions. It carries no
      * negative because the argument for it is that no input reaches it - so
      * if one ever does, the argument was wrong and that has to red rather
      * than pass as extra coverage. */
     {
-        size_t branches_reached = 0;
+        size_t branches_covered = 0;
         for (int branch = cudec_detail::kSnappyRejectNone + 1;
              branch < cudec_detail::kSnappyRejectCount; branch++) {
-            const bool seen = g_reject_seen[branch];
+            const bool covered = g_reject_covered[branch];
             if (branch == cudec_detail::kSnappyRejectPreambleUnreachable) {
-                REQUIRE_CTX(!seen,
-                            "ladder branch %d is declared unreachable in "
-                            "src/snappy_block.h and was reached",
+                REQUIRE_CTX(!covered,
+                            "ladder rung %d is declared unreachable in "
+                            "src/snappy_block.h and a negative reached it",
                             branch);
                 continue;
             }
-            REQUIRE_CTX(seen,
-                        "ladder branch %d has no negative that reaches it - "
-                        "add one, or the branch is untested (issue #173)",
+            REQUIRE_CTX(covered,
+                        "ladder rung %d has no declared negative that reaches "
+                        "it - add one, or the rung is untested (issue #173)",
                         branch);
-            branches_reached++;
+            branches_covered++;
         }
-        REQUIRE(branches_reached ==
+        REQUIRE(branches_covered ==
                 static_cast<size_t>(cudec_detail::kSnappyRejectCount) - 2);
     }
 
@@ -926,7 +1011,8 @@ int main() {
                 "negatives; %zu accept cases held open; wide-offset sweep and "
                 "the capacity axis pinned; the 32-bit literal-length wrap "
                 "pinned as the one divergence; liveness on %zu streams; %d of "
-                "%d ladder branches reached, 1 declared unreachable\n",
+                "%d ladder rungs covered by a declared negative, 1 declared "
+                "unreachable\n",
                 fixtures.size(), mutant_total, rejected_total,
                 stricter_than_oracle, crafted.size(), accepted.size(),
                 liveness_streams,
