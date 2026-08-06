@@ -477,11 +477,13 @@ rather than a silence.
 this file was taken on one NVIDIA device (RTX 3080, sm_86, CUDA 12.6). The
 maintainer hardware is NVIDIA-only, so no AMD GPU has ever executed this
 decoder for the project, and no AMD measurement exists to record. There is also
-no AMD build: the HIP port is a planned M6 milestone, `CUDEC_ENABLE_HIP` does
-not exist in `CMakeLists.txt` today, and no CI job compiles for a `gfx` target.
-So the honest state is neither measured nor compiled, which is one rung below
-where this section will sit once the HIP compile gate lands (issues #209 and
-#111) and the "compiled" half becomes a thing a workflow run can be pointed at.
+no AMD build. `CUDEC_ENABLE_HIP` now exists in `CMakeLists.txt`, and it refuses
+on every machine: cudec has no HIP device sources yet, so the option holds the
+fail-closed contract rather than producing a build, and no CI job compiles for
+a `gfx` target. So the honest state is still neither measured nor compiled,
+which is one rung below where this section will sit once the port and the HIP
+compile gate land (issue #111) and the "compiled" half becomes a thing a
+workflow run can be pointed at.
 
 **What a community result is, and what it is not.** A third-party measurement
 on hardware the maintainer does not have and cannot re-run. It is recorded as

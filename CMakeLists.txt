@@ -43,7 +43,10 @@ option(CUDEC_ENABLE_CUDA "Build the CUDA decode engine and its tests" OFF)
 # error, never a silent host-only fallback. A ROCm CI job that went green
 # because it quietly built the host-only library would be a gate that proves
 # nothing while reading exactly like one that proves the port compiles.
-option(CUDEC_ENABLE_HIP "Build the HIP decode engine and its tests" OFF)
+option(
+  CUDEC_ENABLE_HIP
+  "Build the HIP decode engine and its tests (refuses until the port lands)"
+  OFF)
 
 # One device backend per build tree. Both languages in one tree would give two
 # definitions of the same decode symbols and a link whose winner depends on
@@ -261,56 +264,77 @@ endif()
 
 # ---- The HIP language path (issue #209).
 #
-# Two refusals, and the order matters: the toolchain first, because that is the
-# one a CI runner without ROCm exercises on every PR, and the device sources
-# second, because that is the one that keeps this option from ever going green
-# on a machine that HAS ROCm while compiling no decoder at all.
+# Read this before reading the code, because the block is deliberately smaller
+# than it looks like it should be: cudec has NO HIP device sources and no
+# vendor shim yet, so there is no configuration of this option, on any machine,
+# that can produce a HIP build today. The option exists to hold the
+# fail-closed contract while the port is written, and it refuses in two named
+# ways rather than one so that the refusal a reader hits tells them which of
+# the two things is missing.
+#
+# The order is chosen so a runner with no ROCm exercises the toolchain refusal
+# on every PR, and a caller who supplies a compiler reaches the second one -
+# which is what lets the build job gate BOTH arms without a ROCm runner.
+#
+# Nothing between the two refusals: no enable_language, no architecture
+# default, no test registration. Every one of those would be configuration
+# whose result cannot reach a target, and enable_language(HIP) would in
+# addition abort the configure with CMake's own message before the second
+# refusal could name the real reason. They land with the sources they serve.
 if(CUDEC_ENABLE_HIP)
-  # check_language probes for a HIP compiler without enabling the language, so
-  # the refusal below is this project's message rather than CMake's generic
-  # one, and it names what is missing. enable_language(HIP) would also fail
-  # here, later and less legibly.
-  include(CheckLanguage)
-  check_language(HIP)
-  if(NOT CMAKE_HIP_COMPILER)
+  # Deliberately NOT check_language(HIP). That module wraps its probe in
+  # `if(NOT DEFINED CMAKE_HIP_COMPILER)`, so a value from a toolchain file, a
+  # superbuild, a -D on the command line, or this build tree's own cache makes
+  # it a silent no-op and the refusal below would be skipped over a compiler
+  # nothing validated. It also FORCE-caches a negative result, which pins a
+  # build directory to "none was found" even after ROCm is installed. Probing
+  # here keeps both properties out: the probe runs every configure, and it
+  # writes no cache entry of its own.
+  set(_cudec_hip_compiler "")
+  if(CMAKE_HIP_COMPILER)
+    set(_cudec_hip_compiler "${CMAKE_HIP_COMPILER}")
+  else()
+    find_program(
+      _cudec_hip_compiler_probe
+      NAMES hipcc
+      HINTS ENV ROCM_PATH /opt/rocm
+      PATH_SUFFIXES bin
+      NO_CACHE)
+    if(_cudec_hip_compiler_probe)
+      set(_cudec_hip_compiler "${_cudec_hip_compiler_probe}")
+    endif()
+  endif()
+
+  if(NOT _cudec_hip_compiler)
+    # ROCm rather than a specific binary: CMake drives the HIP language with a
+    # clang that it locates from the ROCm installation, and rejects some
+    # drivers passed directly as CMAKE_HIP_COMPILER. Naming the toolkit is
+    # what a reader can act on; naming one executable would send them at a
+    # value CMake may refuse.
     message(
       FATAL_ERROR
-        "CUDEC_ENABLE_HIP requires a HIP toolchain (ROCm's hipcc, or a clang "
-        "that accepts --offload-arch) and none was found. This never falls "
-        "back to a host-only build: a configuration that dropped the device "
-        "engine and still succeeded would be a fail-open gate.")
+        "CUDEC_ENABLE_HIP requires a HIP toolchain (a ROCm installation, or "
+        "CMAKE_HIP_COMPILER pointing at a compiler CMake accepts for the HIP "
+        "language) and none was found. This never falls back to a host-only "
+        "build: a configuration that dropped the device engine and still "
+        "succeeded would be a fail-open gate.")
   endif()
 
-  # gfx90a is wave64 (CDNA2) and gfx1030 is wave32 (RDNA2), so the default
-  # spans both wave widths the kernel family is parameterized over rather than
-  # picking one and leaving the other uncompiled. The CI job owns the real
-  # list; this only has to accept and forward one, so it is overridable from
-  # the command line exactly as CMAKE_CUDA_ARCHITECTURES is.
-  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
-    set(CMAKE_HIP_ARCHITECTURES gfx90a gfx1030)
-  endif()
-  enable_language(HIP)
-  # Same reason as the CUDA path: the test net and the bench harness add .cpp
-  # translation units, and a language enabled inside one subdirectory is
-  # invisible to its siblings.
-  enable_language(CXX)
-  enable_testing()
-
-  # The second refusal, and the one this file cannot drop until the port
-  # lands. cudec has no HIP device sources and no vendor shim yet, so
-  # everything above could succeed on a ROCm machine and produce a cudec
-  # containing no decoder - a build that reports success while compiling
-  # nothing is the exact failure the option exists to prevent, and it would
-  # read identically to a working port. When the shim and the
-  # width-parameterized kernels land, this refusal is replaced by the
-  # target_sources and hip::device link that compile them.
+  # The second refusal. It is unconditional on purpose and it is the whole
+  # answer to "what does this option do on a machine that HAS ROCm": it
+  # refuses, because everything it would need to compile is still unwritten.
+  # A configure that succeeded here would hand back a cudec with no decoder in
+  # it and report success, which reads identically to a working port and is
+  # the exact failure this option exists to prevent. The port replaces this
+  # message with the sources, the architecture default and the hip::device
+  # link; until then the message is the contract.
   message(
     FATAL_ERROR
-      "CUDEC_ENABLE_HIP found a HIP toolchain (${CMAKE_HIP_COMPILER}) but "
+      "CUDEC_ENABLE_HIP found a HIP toolchain (${_cudec_hip_compiler}) but "
       "cudec carries no HIP device sources yet, so this configuration would "
       "build a library with no decoder in it and report success. The port "
-      "lands them; until then this option holds the fail-closed contract "
-      "rather than producing a build.")
+      "lands them; until then this option refuses rather than producing a "
+      "build.")
 endif()
 
 # ---- The install surface (issue #79). A release nobody can install is not a
