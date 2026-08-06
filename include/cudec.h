@@ -18,8 +18,8 @@ extern "C" {
  * three macros to set the project version, so a bump here is the whole bump
  * and nothing restates the number. */
 #define CUDEC_VERSION_MAJOR 0
-#define CUDEC_VERSION_MINOR 0
-#define CUDEC_VERSION_PATCH 1
+#define CUDEC_VERSION_MINOR 1
+#define CUDEC_VERSION_PATCH 0
 
 /* Returns the runtime library version as (major * 10000 +
  * minor * 100 + patch), for ABI sanity checks against these macros. */

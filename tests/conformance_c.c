@@ -35,6 +35,18 @@ int main(void) {
                                    CUDEC_VERSION_MINOR * 100 +
                                    CUDEC_VERSION_PATCH);
 
+    /* The line above compares two things derived from the same three
+     * macros, so it holds for any version and pins none. This one pins the
+     * current one. It exists to red on a partial bump: a release that edits
+     * the header but leaves a number written out somewhere else stops here
+     * with the arithmetic in front of the reader, instead of shipping two
+     * versions. Bumping the version means editing this literal too, and
+     * that is the point of it rather than a cost of it.
+     *
+     * 0.1.0 encodes as 0 * 10000 + 1 * 100 + 0 = 100. The three-digit look
+     * of it is the encoding working, not a typo: 10000 is 1.0.0. */
+    REQUIRE(cudec_version() == 100); /* 0.1.0 */
+
     /* The build system derives PROJECT_VERSION from the macros above and
      * hands the three numbers back as CUDEC_CMAKE_VERSION_*. A derivation
      * that matched the wrong line in the header would otherwise configure
