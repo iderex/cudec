@@ -900,3 +900,149 @@ section's job.
 5. **The stored-block path is not a fast path** (D4). Whether it is worth
    any specialization at all is a measurement question and belongs to the
    perf pass, not to the first kernel.
+
+### 11.7 The M4 oracles: what is pinned, and what is refused
+
+**Primary oracle: the NVIDIA fork of libdeflate, branch `gdeflate`.** It
+both compresses and decompresses, so one dependency generates the corpora
+and serves as the diff target.
+
+A branch name is not a pin. The pin is the commit and the archive hash of
+the URL the build actually fetches, in the same shape the LZ4, Snappy and
+Zstd oracles already use:
+
+    https://github.com/NVIDIA/libdeflate/archive/
+        8ba9502fb30d2bf728592d121f0d402e40c8cb05.tar.gz
+    sha256 d1b4c38dce43e68a5f4c28d0fbb3f81a01953039a3dea63f4bd1a84d7ff80592
+
+Recorded deviations from how the other three oracles are pinned, so the
+vendoring rung does not have to rediscover them:
+
+- The fork publishes no releases, so this is a commit archive rather than a
+  release asset. Snappy is already fetched from a tag archive rather than a
+  release asset, so the shape is not new; the novelty is pinning a commit
+  with no tag behind it, which is the only thing the fork offers.
+- **The fork is not dormant and it does lag.** Both halves are measurable
+  and both matter. `gh api repos/NVIDIA/libdeflate/commits/gdeflate`
+  reports a commit dated 2026-07-29, so it is alive; and
+  `gh api repos/ebiggers/libdeflate/compare/master...NVIDIA:libdeflate:gdeflate`
+  reports `ahead_by=4 behind_by=425 status=diverged`, so it sits 425
+  upstream commits behind, including whatever correctness fixes those
+  carry. That is acceptable in an oracle, whose job is to be the thing real
+  data came from, and it is the reason the fork is never a source to derive
+  from.
+- Licensing on the fork is mixed per file rather than uniform.
+  `lib/gdeflate_compress.c` and `lib/gdeflate_decompress.c` each carry Eric
+  Biggers' MIT notice from upstream and an
+  `SPDX-License-Identifier: Apache-2.0` line with an NVIDIA copyright, and
+  the repository's `COPYING` is upstream's MIT text.
+
+Compression levels, read from the fork's own `libdeflate.h` rather than
+assumed: the valid range is `[0, 12]`, with 1 fastest, 6 medium and
+default, 9 slow, 12 slowest, and the sliding window fixed at compile time
+to 65536, "the largest size permissible in the GDEFLATE format". **Level 0
+is the interesting one for coverage**: the header defines it as "create a
+valid stream, but only emit uncompressed blocks", so it reaches the stored
+block type by construction rather than by luck.
+
+**Interop evidence: the DirectStorage `GDeflateTest` vectors.** These are
+the bit-exactness check against the shipping runtime, and they are the one
+piece of evidence that comes from a different implementation lineage than
+the libdeflate fork. Their intake is its own issue; what this section fixes
+is that they are load-bearing rather than decorative.
+
+**Independent second decoder: rejected.** The candidate was `sk-zk/GisDeflate`
+(MIT, C#). The decision is no, and the reason is not the harness cost.
+
+Its own README states: "this code is a port of the reference implementation
+by Microsoft and NVIDIA", naming both trees, one of them at a pinned
+libdeflate commit. A port of the same implementation is not a
+non-shared-ancestry second opinion; it shares exactly the ancestry that a
+second decoder exists to avoid sharing, so it would agree with the primary
+oracle precisely where a shared bug would hide. The cost is real too - it
+is a managed .NET component in a tree that carries no .NET anywhere, for
+CI and for local runs - but that cost is what would have been weighed if
+the coverage had been genuine. It is not.
+
+**What that loses, stated rather than waved away.** M4 has no
+independent-lineage oracle for the _reject_ direction on arbitrary bytes:
+where the libdeflate fork refuses a stream, no second implementation
+confirms it should. Three things compensate, and none of them is a full
+substitute:
+
+- the `GDeflateTest` vectors, which are lineage-independent but cover the
+  accept direction only, on a fixed set;
+- cudec's own CPU twin, which is written from the draft rather than from
+  the fork, so a fork-specific parsing bug does not propagate into it by
+  construction - the twin is the second implementation, and this section
+  records that it has to carry that weight;
+- fail-closed posture as the tiebreaker: where the two disagree and no
+  third opinion exists, cudec rejects. Being stricter than an oracle is
+  reportable, not fatal, and section 10 already runs that discipline for
+  Snappy.
+
+If an independent-lineage decoder appears later, it is worth reopening.
+Nothing here forecloses it.
+
+### 11.8 The corpus, and why the level list is not enough on its own
+
+The corpus is Silesia plus the asset-like corpus, compressed through the
+fork across a level sweep, in the 64 KiB page geometry section 11.2 fixes.
+The asset-like half is still an open M2 decision at the time of writing, so
+M4 inherits whatever that settles rather than defining a second one.
+
+The levels to sweep, and what each is there to reach:
+
+- **0** - stored blocks, by construction, per the header text quoted above.
+  This is the only level whose block type the source guarantees.
+- **1** - the fast end of the search, the level most likely to emit static
+  Huffman blocks on small or low-entropy inputs.
+- **6** - the default, and therefore the shape most real data arrives in.
+- **12** - the slowest search, the level whose table descriptions are
+  densest and whose block boundaries are chosen most aggressively.
+
+**And that list is not the coverage argument, only the plan for it.** A
+compressor chooses block types for its own reasons and is free to change
+them between versions; a corpus that assumes level 1 produced a static
+block has assumed its own coverage. So the rule is the one the Snappy
+corpus already follows: **each family asserts the block-type composition it
+actually got, by inspecting the emitted stream, and a family that did not
+reach its target block type fails the test rather than quietly costing
+coverage.** Block type is also not a pure function of level - incompressible
+input forces stored blocks at any level - so the sweep is level crossed
+with input character, and the assertion is what closes the gap between the
+two.
+
+The generated corpus carries a pinned digest, as the LZ4 and Snappy corpora
+do, so that moving the oracle pin moves the corpus consciously rather than
+letting it drift.
+
+### 11.9 Attribution, and what the licences actually require here
+
+Two facts first, both read from the upstream trees rather than assumed,
+because the obligation depends on them:
+
+- **Neither upstream ships a NOTICE file.** `GDeflate/` in
+  `microsoft/DirectStorage` contains none, and the libdeflate fork ships
+  `COPYING` rather than a NOTICE. Apache-2.0 section 4(d) propagates the
+  contents of a NOTICE file that exists; where there is none, it has
+  nothing to propagate. The obligation this project was expecting to carry
+  is therefore not the one it actually has.
+- **cudec distributes no upstream bytes.** The oracles are fetched at
+  configure time by the test build, exactly as liblz4, snappy and libzstd
+  already are, and the no-vendored-binaries rule keeps them out of the
+  tree. What cudec distributes is its own source and, where corpora are
+  published, data a compressor emitted.
+
+What still gets recorded, and why it is a decision rather than a
+compulsion: `NOTICE.md` gains an attribution section naming the three
+upstreams that the M4 verification apparatus depends on - the libdeflate
+fork with its pinned commit and its mixed MIT/Apache-2.0 file headers, the
+DirectStorage GDeflate subtree with its own Apache-2.0 `LICENSE` and its
+NVIDIA and Microsoft copyrights, and the IETF draft with its BCP 78 terms.
+Recording where the verification apparatus came from is worth doing on its
+own terms, and it means the vendoring rung has nothing left to invent.
+
+**This subsection is about attribution only.** The patent position and the
+implementation-provenance posture are a separate, maintainer-gated
+decision, and nothing here pre-empts or softens it.
