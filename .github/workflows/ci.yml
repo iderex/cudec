@@ -235,7 +235,8 @@ jobs:
           test -x build-cuda/tests/stream_twin &&
           test -x build-cuda/tests/termination_gpu &&
           test -x build-cuda/tests/determinism_gpu &&
-          test -x build-cuda/tests/snappy_block_device
+          test -x build-cuda/tests/snappy_block_device &&
+          test -x build-cuda/examples/example_decode_frame
 
       # The other half of the install proof (issue #137). The host-only prefix
       # is the easy flavour: nothing reaches the exported interface. The CUDA
