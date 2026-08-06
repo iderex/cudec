@@ -1,4 +1,4 @@
-# CodeQL - static analysis over the C/C++/CUDA surface, into Code Scanning.
+# CodeQL - static analysis over the host C and C++ surface, into Code Scanning.
 #
 # What it analyses and why the build is manual. CodeQL's C/C++ extractor only
 # sees translation units a real compiler compiles, so the build mode decides
@@ -9,6 +9,32 @@
 # parse, the streaming path, the C-ABI boundary and the CPU twin of the block
 # parser, which is the hostile-input surface worth analysing. The runner has
 # no GPU and needs none - nothing here runs a kernel.
+#
+# What the database actually holds, measured rather than argued (#274). A
+# green run with zero results says nothing on its own about which files were
+# in front of the extractor. Every finished run leaves a downloadable
+# database, and its baseline-info.json is the file list:
+#
+#     gh api repos/iderex/cudec/code-scanning/codeql/databases/cpp \
+#       -H 'Accept: application/zip' > cpp-db.zip
+#     unzip -p cpp-db.zip cpp/codeql-database.yml | grep -E 'sha|buildMode'
+#     unzip -p cpp-db.zip cpp/baseline-info.json \
+#       | tr ',' '\n' | grep -oE '(src|include)/[A-Za-z0-9_.]+' | sort
+#
+# At ab133e0468841fa3c2c1ca3b55ae1ee40f3ae173 that returns eight of the ten
+# tracked files under src/ and include/: frame.cpp and stream.cpp as C++, and
+# batch_limits.h, cuda_raii.h, lz4_block.h, version.c, xxhash32.h and
+# include/cudec.h as C. So the written-out CUDA build does put the parse
+# surface in the database, and the zero-result runs are a statement about
+# those files.
+#
+# The two it does NOT return are src/batch.cu and src/lz4_decode.cuh. nvcc is
+# not a compiler this extractor traces, so no device code reaches the
+# database and no CodeQL alert can be raised against a kernel however the
+# query suite is widened. What stands over device code is the sanitizer gate
+# and the fuzz differential, not this workflow. Nothing refuses a regression
+# in that file list; re-run the command above after a change that moves a
+# file into or out of the analysed configuration.
 #
 # What it does NOT do. It never fails a pull request. Findings land in the
 # Code Scanning tab, where the security-review sweeps read them; making a
