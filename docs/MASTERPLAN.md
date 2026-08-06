@@ -1061,3 +1061,146 @@ own terms, and it means the vendoring rung has nothing left to invent.
 **This subsection is about attribution only.** The patent position and the
 implementation-provenance posture are a separate, maintainer-gated
 decision, and nothing here pre-empts or softens it.
+
+## 12. M5 Zstd v1 decode subset (RFC 8878)
+
+Zstd is the one format on the ladder where "what cudec decodes" is a design
+decision rather than a reading. The spec's full envelope reaches windows the
+spec itself measures in terabytes, dictionaries, and frames that declare no
+content size, and none of those three is batch-GPU-shaped. The spec sanctions
+refusing part of that envelope in as many words, so the subset below is a
+decoder choice made inside the standard rather than a departure from it.
+
+Every fact quoted here was read out of RFC 8878 on 2026-08-06 at
+<https://www.rfc-editor.org/rfc/rfc8878.txt>, with the section number beside
+it, so a later reader can check the subset against the source instead of
+against this paragraph.
+
+### 12.1 The two facts that fix the batch unit
+
+Blocks inside one frame are **not** independent. Section 3.1.1.3 puts
+back-references at "previous decoded data, up to a distance of Window_Size,
+or the beginning of the Frame, whichever is smaller", and section 3.1.1.4
+adds that "all offsets leading to previously decoded data must be smaller
+than Window_Size". Entropy state carries across blocks in the same direction:
+Treeless literals reuse the previous block's Huffman table, and a sequence
+section in Repeat_Mode reuses the previous FSE tables. So decode inside a
+frame is inherently sequential, and no choice of kernel shape changes that.
+
+Frames **are** independent. Section 3.1: "Each frame is independent and can
+be decompressed independently of other frames. The decompressed content of
+multiple concatenated frames is the concatenation of each frame's
+decompressed content."
+
+Therefore **the batch unit is the frame**, which is the chunk model the batch
+ABI already has. The parallelism M5 sells is across frames; a single large
+frame is a sequential decode with intra-block parallelism only. That is the
+honest shape, and it is stated here so that no later section has to walk it
+back.
+
+### 12.2 The accepted envelope
+
+Inside the subset, everything the format offers is decoded: all three usable
+block types (Raw, RLE, Compressed), all four literals section types including
+Treeless, all four sequence table modes including Repeat, full repcode
+semantics, and the XXH64 content checksum verified whenever the frame carries
+one. Section 3.1.1 fixes what that checksum is: "the result of the XXH64()
+hash function digesting the original (decoded) data as input, and a seed of
+zero. The low 4 bytes of the checksum are stored in little-endian format."
+
+The gate sits at the frame header, and nowhere narrower:
+
+| Frame property              | Accepted                        | Refused with            |
+| --------------------------- | ------------------------------- | ----------------------- |
+| Magic number                | The Zstandard magic             | `CORRUPT_INPUT`         |
+| Skippable frame magic       | Never; 0x184D2A50 to 0x184D2A5F | `UNSUPPORTED`, see 12.4 |
+| `Dictionary_ID_flag`        | 0 only                          | `UNSUPPORTED`           |
+| `Frame_Content_Size`        | Present                         | `UNSUPPORTED`           |
+| `Single_Segment_flag` set   | Yes; window is the content size | -                       |
+| `Single_Segment_flag` clear | Window_Size up to 8 MB          | `UNSUPPORTED` above it  |
+| Reserved bits in the header | Zero                            | `CORRUPT_INPUT`         |
+| Block type                  | 0, 1 or 2                       | `CORRUPT_INPUT`         |
+| Block size                  | Up to min(Window_Size, 128 KB)  | `CORRUPT_INPUT`         |
+
+The two window rows come from section 3.1.1.1.2, which recommends "decoders
+to support values of Window_Size up to 8 MB" and, in the same section, allows
+"a decoder to reject a compressed frame that requests a memory size beyond
+the decoder's authorized range". Refusing above 8 MB is therefore inside the
+standard, and the number is the spec's own rather than one this project
+picked.
+
+`Single_Segment_flag` is the shape the GPU wants, and section 3.1.1.1.1.2
+says why it costs nothing to prefer: "If this flag is set, data must be
+regenerated within a single continuous memory segment. In this case,
+Window_Descriptor byte is skipped, but Frame_Content_Size is necessarily
+present." A declared content size is what lets output placement happen before
+the first byte is decoded, which is the property the LZ4 batch path already
+relies on.
+
+Block_Maximum_Size is section 3.1.1.2.4, "the smallest of: Window_Size [and]
+128 KB". Block type 3 is section 3.1.1.2.2: "Reserved: This is not a block.
+This value cannot be used with the current specification. If such a value is
+present, it is considered to be corrupt data." The spec assigns that rejection
+to the corrupt class itself, so cudec does not have to argue for it.
+
+### 12.3 Which rejection class, and why the line sits there
+
+`CUDEC_ERR_CORRUPT_INPUT` means no conforming encoder produced these bytes.
+`CUDEC_ERR_UNSUPPORTED` means a conforming encoder did, and cudec does not
+decode that part of the format. The distinction is a contract with the
+caller: a corrupt verdict is about the data and an unsupported verdict is
+about this library, and a caller that would fall back to a CPU decoder needs
+to tell them apart.
+
+So a dictionary id, an absent content size and a window above 8 MB are all
+`UNSUPPORTED`; each is a valid frame. Reserved bits, block type 3, an
+oversized block and a failed checksum are `CORRUPT_INPUT`. Nothing in the
+subset is refused silently, and no refusal may leave partial output that a
+caller could read as a short decode.
+
+### 12.4 Skippable frames are refused, not stepped over
+
+A skippable frame is refused with `UNSUPPORTED`.
+
+The spec makes stepping over one trivial. Section 3.1.2 gives the magic range
+0x184D2A50 to 0x184D2A5F and a `Frame_Size` field "represented using 4 bytes,
+little-endian format, unsigned 32 bits", so this is not a difficulty; it is a
+scope line. Stepping over one means a chunk holds a frame sequence rather
+than a frame, and the moment the unit is a sequence the per-chunk result has
+to describe several decodes with one status and one byte count. That is a
+batch-ABI question before it is a decode question, and it is what the
+extension ladder's first rung is for. Until that rung is taken, one chunk is
+one frame.
+
+### 12.5 The extension ladder, with its triggers
+
+Each rung carries the thing that would justify taking it, so that nobody
+proposes one without new evidence:
+
+1. **Multi-frame chunks, and skippable frames with them.** Taken when a real
+   corpus arrives whose chunks are frame sequences. Needs a per-chunk result
+   shape that can describe more than one decode.
+2. **Frames with no `Frame_Content_Size`.** Taken when a producer that
+   matters emits them. Needs either a sizing pre-pass or a growable output
+   contract, and both break the single-pass placement the batch model rests
+   on.
+3. **Windows above 8 MB.** Taken when a corpus measurably needs one. The cost
+   is device memory per in-flight frame, so the trigger is a measurement and
+   not a request.
+4. **Performance tiers.** Only once the subset decodes correctly. The
+   project's ordering, correctness before measured performance, applies here
+   with no exception.
+
+Permanently out until a design says otherwise: **dictionaries**, because they
+break the frame independence the batch unit rests on, and **legacy v0.x
+frames**, which are a different format wearing the same name.
+
+### 12.6 The recorded expectation
+
+Zstd is the slowest of the standard formats to decode on a GPU, and M5 wins
+at batch scale or it does not win. The entropy stages are serial by
+construction, each sequence's copy depends on the sequences before it, and
+12.1's block chain means one frame cannot be spread across the device. This
+is written down before the first number is measured, so that the number,
+whatever it turns out to be, is read against the expectation rather than
+against a hope.
