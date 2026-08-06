@@ -292,7 +292,7 @@ int main() {
      * RFC 8878 section 3.1.1.5 again: in the zero-literals case
      * Offset_Value 3 means "the most recent offset, minus one", and the
      * result may not be zero. The reference forces the failure rather than
-     * testing for it - `temp -= !temp` at zstd_decompress_block.c:1309 turns
+     * testing for it - `temp -= !temp` at zstd_decompress_block.c:1308 turns
      * a zero into an offset no output can satisfy, and the refusal lands in
      * execSequence.
      *
@@ -363,8 +363,10 @@ int main() {
      * the fourth stream's size is DERIVED - total, less the three, less the
      * six bytes of the table itself. A derived length is a subtraction on
      * attacker-controlled numbers, which is why it gets a probe of its own:
-     * huf_decompress.c:626 computes it, and huf_decompress.c:642 is the
-     * check that catches the underflow.
+     * huf_decompress.c:626 computes it, and huf_decompress.c:643 is the
+     * check that catches the underflow. Both lines are in the X1 decoder,
+     * the one these literals go through; the X2 variant carries its own copy
+     * of the same arithmetic at 1407 and 1424.
      *
      * Compressor output here rather than a hand-built section: this probe is
      * about the arithmetic over a real Huffman-coded section, and the
@@ -496,7 +498,11 @@ int main() {
 
         /* A zero-length stream is refused for a different reason than the
          * three above: BIT_initDStream refuses an empty bitstream outright
-         * (bitstream.h:255), before any bound on the section is consulted. */
+         * (bitstream.h:256), before any bound on the section is consulted.
+         * It refuses it as srcSize_wrong, and what reaches the caller is
+         * still corruption_detected - the literals path remaps every HUF
+         * error to that one code (zstd_decompress_block.c:241), which is a
+         * second reason the code cannot be read as a reason. */
         Bytes empty_stream = frame;
         empty_stream[jump] = 0;
         empty_stream[jump + 1] = 0;
