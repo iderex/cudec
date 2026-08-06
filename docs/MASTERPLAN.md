@@ -267,7 +267,10 @@ warp-per-chunk, with a recorded measurement-based falsification trigger;
 the exact batch upper bound is pinned by the zero-visible-devices
 technique from the #4 harness once the geometry lands:
 `CUDEC_ERR_CUDA` = passed validation and reached the launch,
-`CUDEC_ERR_INVALID_ARGUMENT` = rejected, no constant published).
+`CUDEC_ERR_INVALID_ARGUMENT` = rejected, no constant published); the
+Snappy raw-format decode and the seam it rides (section 10, via the #85
+design panel - parser contract, validation ladder, batch entry, and the
+framing format ruled out of scope with its evidence).
 
 ## 9. M1 kernel design (settled via the #6 design panel, 2026-07-17)
 
@@ -434,10 +437,15 @@ percentage points"; batches under ~2,000 chunks underfill the machine and
 land near CPU speed (documented, not hidden); warp-synchronous discipline
 is load-bearing - every `__syncwarp` is reviewed as such.
 
-**M3/M4 seam:** the chunk decoder is `template<class FormatParser>` -
-Snappy (M3) swaps the parser and keeps everything else; GDeflate (M4)
-keeps the copy engine, validation posture, and result contract while
-bringing its format-native 32-substream parse model.
+**M3/M4 seam:** the chunk decoder is to become
+`template<class Parser, bool ParseOnly>` - Snappy (M3) swaps the parser and
+keeps everything else; GDeflate (M4) keeps the copy engine, validation
+posture, and result contract while bringing its format-native 32-substream
+parse model. Written as a commitment rather than as a present property,
+because it is one: `src/lz4_decode.cuh` is `template <bool ParseOnly>` with
+`Lz4Parser` named directly in the kernel body, and no `Parser` template
+parameter exists under `src/` today. Section 10 fixes the contract the seam
+must carry; the M3 kernel rung materializes it.
 
 **The M1 PR ladder** (each independently gated): (1) this design section -
 closes the design issue; (2) the sequence parser + validation ladder as a
@@ -451,3 +459,226 @@ deleted, the gpu_fixture expectations flip, all mechanical gates recorded
 baselines - numbers and kernel never move in the same PR; (5) a measured
 perf pass (register-window parse staging, vectorized multi-byte lane
 copies), accepted only on recorded improvement with all gates green.
+
+## 10. M3 Snappy decode design (settled via the #85 design panel, 2026-07-27)
+
+Section 9 already fixed the kernel family's shape - single-pass,
+warp-per-chunk, redundant 32-lane lockstep parse, closed-form modular
+gather, the whole validation ladder living inside the parser - and Snappy
+inherits every one of those decisions unchanged. Nothing below reopens
+them. What M3 had to settle is narrower: what the format seam actually
+promises, what the Snappy parser and its ladder are, what the batch entry
+owes, whether the framing format is in scope, and which locks keep all of
+that from drifting.
+
+The format ground truth is the google/snappy 1.2.2 sources, not
+`format_description.txt`, which says of itself that it is not a formal
+specification. The reference implementation is the de-facto authority, and
+the readings this design leans on are executed rather than argued, by two
+routes: `tests/snappy_probes.cpp` drives hand-built streams straight at the
+oracle for the accept-set behaviours a compressor never emits, and every
+crafted negative in the twin asserts the reference's verdict on the same
+bytes as well as cudec's, so a reject branch is demonstrably in parity
+rather than merely present.
+
+**Where this section is a commitment and where it is a description.** The
+parser core has landed; the seam and the batch entry have not. Each
+subsection below says which it is, so the document cannot be read as a
+report of shipped code. The tree is the authority for the second kind and
+the commands that read it are given inline.
+
+### The seam: what a parser owes the chunk decoder
+
+**A commitment.** The chunk decoder becomes
+`template <class Parser, bool ParseOnly>` in `src/chunk_decode.cuh`: the
+loop body, the fuel cap, the two copy loops, the `__syncwarp()` placement,
+the geometry guards and the argument validation move across unchanged,
+because that code already IS the template modulo one hard-wired type.
+`src/batch.cu` then instantiates it once per format and the bench keeps its
+parse-only ceiling instantiation. LZ4 pays a rename and nothing else.
+
+What a `Parser` owes, and what the kernel is entitled to assume:
+
+- construction from the chunk's source pointer, source size and
+  destination capacity, and nothing else;
+- one entry point returning exactly three outcomes: an element to execute
+  and call again, the single success exit, or a reject status;
+- **liveness** - every call consumes at least one source byte. This is what
+  keeps the kernel's existing source-size-derived fuel bound valid for
+  every instantiation, so it is a seam requirement rather than an LZ4
+  accident, and a parser that can return without advancing breaks
+  termination for the whole family;
+- **lane-uniformity** - the parser reads source bytes and its own state and
+  nothing else, which is what makes the redundant lockstep parse sound;
+- **all input validation inside the parser.** The copy engine performs no
+  input-derived bound check of its own. A parser that hands back an element
+  it has not fully bounded has already failed closed-ness, and no later
+  stage will catch it.
+
+Rejected at the panel and recorded so it is not re-proposed: a per-parser
+associated element type. It invites exactly the divergence the copy
+engine's single contract exists to prevent, for no gain.
+
+The seam serves the byte-oriented family (LZ4, Snappy). M4 brings a
+format-native 32-substream parse model and revisits the lock deliberately;
+that is the lock working rather than an obstacle.
+
+### The Snappy parser and its validation ladder
+
+**Landed** as `src/snappy_block.h`, single-sourced `__host__ __device__`,
+twin-tested host-side on the GPU-less runner before any kernel.
+
+The preamble is a little-endian base-128 varint of the declared
+uncompressed length, at most five groups, with the fifth group refused at
+or above 16 rather than truncated - a decoder that masked the excess away
+would accept a declaration the reference rejects outright. Then, before a
+single element is parsed, **the declared length is checked against the
+caller's destination capacity**. The varint is attacker-controlled and the
+capacity is the caller's truth; nothing anywhere is ever sized or allocated
+from the declaration.
+
+An element is a literal OR a copy, not a literal run followed by a match,
+so one range and a kind describe it. Lengths never continue across an
+unbounded chain of extension bytes: an element's header is the tag plus at
+most four trailing bytes, which is the reference's `kMaximumTagLength`, so
+the per-element termination argument needs no fuel counter at all - a real
+simplification over LZ4's 255-continuation accumulator, and the reason the
+Snappy parse chain is structurally shorter. The header-window check is made
+against the **actual** width the tag implies, not against a blanket
+five-byte lookahead: a stream ending in a one-byte literal is valid, and a
+blanket lookahead would reject it and hand the twin an oracle-diff failure.
+
+Success is reported only at exact source consumption AND exact production
+of the declared length, which is what the reference enforces on both ends.
+Under-production, over-production and trailing bytes all reject.
+
+**The status mapping, decided.** `CUDEC_ERR_OUTPUT_TOO_SMALL` fires in
+exactly one place: the declared length against the caller's capacity, at
+the preamble, before anything is written. Every later bound is checked
+against the _declared remaining output_, and busting it is
+`CUDEC_ERR_CORRUPT_INPUT` - once a stream has declared its length, an
+element that overruns it is a stream inconsistency a larger buffer would
+not make valid. LZ4 has no declared length, which is why its ladder maps
+length-versus-capacity to `OUTPUT_TOO_SMALL` instead; the asymmetry between
+the two ladders is a decision rather than an inconsistency.
+
+**The accept set is as load-bearing as the reject set.** Over-strictness is
+an oracle-diff failure, so the parser accepts what the compressor never
+emits but the reference decoder takes: the four-byte-offset copy form, copy
+lengths below four, offsets at or above 65536 up to the bytes produced,
+non-minimal varints, and non-minimal literal-length encodings.
+
+**The panel expected no stricter-than-reference divergence for Snappy. One
+was found in the building, and it is recorded here rather than absorbed.**
+The panel's reasoning was that LZ4's tolerated zero offset has no Snappy
+analogue, which holds: the reference refuses a zero offset in all three
+copy forms, so cudec refusing it is parity and not strictness. The
+divergence is elsewhere. A literal's length is encoded as length minus one,
+and the reference performs that addition in 32 bits, so the four-byte
+length class spelling `0xFFFFFFFF` wraps to a zero-length literal and the
+reference accepts the stream. cudec refuses it, on the same ground that
+settled LZ4's offset zero: a length that exists only because an accumulator
+wrapped is not a length, and fail-closed on spec-nonsense outranks
+bug-for-bug parity. That makes cudec's Snappy accept set a strict subset of
+the reference's at exactly one point, and the twin pins the divergence
+explicitly - the oracle's acceptance and cudec's refusal both asserted on
+the same bytes, on an otherwise empty stream and on one carrying a real
+literal behind it - so it stays visible instead of hiding inside a parity
+count. The aggregate count over the mutation corpus is separately pinned at
+zero, which is what makes the one named exception readable as the whole of
+it.
+
+The enumeration in `src/snappy_block.h` is the authority for which reject
+branches exist; this document does not restate the list, because a restated
+list drifts against the header. The panel sketched twelve branches and the
+shipped ladder carries thirteen, and the two sets do not correspond one to
+one: the implementation splits some of the panel's rungs, folds others, and
+adds ones the sketch had no place for, including the varint loop's
+compiler-required exit, which is argued unreachable and declared so in the
+twin rather than carried as a negative. The header, not the sketch and not
+this paragraph, is where the current set is read. Count it rather than
+trusting this sentence:
+
+    sed -n '/^enum SnappyReject {/,/^};/p' src/snappy_block.h |
+        grep '    kSnappyReject' | grep -vc 'None\|Count'
+    13
+
+**One departure from the panel record, with its reason.** The panel put the
+preamble inside the element call and rejected a separate initialization
+method, on the grounds that it widens the contract for one format's need
+and gives LZ4 a dead call site. The landed parser exposes an idempotent
+`Begin()` and has the element call go through it. The seam requirement it
+was rejected to protect is unaffected - `Begin()` is not part of the seam,
+the element call still consumes at least one byte on every invocation, and
+the three outcomes are unchanged - and it buys the batch entry the declared
+length without parsing the varint twice. The panel's objection to a _seam_
+method stands; this is a parser-local one.
+
+**Not yet executed:** the panel also called for promoting the LZ4 sequence
+type to one shared element vocabulary in `src/decode_sequence.h`. The
+parser core kept a format-local element type instead, so there are two
+today. Materializing the seam is where that is either executed or overturned
+with a stated reason; it cannot be left implicit, because one shared element
+vocabulary is what the "copy engine checks nothing" rule rests on.
+
+### The batch entry
+
+**A commitment.** `cudec_snappy_decompress_batch` carries the
+`cudec_lz4_decompress_batch` contract with no deltas: device-side argument
+arrays, per-chunk results, synchronous argument-validation refusal through
+the shared validator with the identical geometry refusal, asynchronous
+launch on the caller's stream, the same pending-CUDA-error semantics,
+`bytes_written` zero on any reject, and writes touching exactly the bytes
+reported.
+
+The open question was whether the declared-length preamble changes the
+per-chunk result semantics. **It does not.** Capacity stays the caller's
+bound, the declaration is validated against it, and no new status value is
+needed, so the ABI stays frozen. The public header will document the
+supported surface as raw Snappy streams; M3 ships the batch entry only, and
+generalizing the streaming path to Snappy is a separate scope decision
+already filed rather than smuggled in here.
+
+Today `include/cudec.h` declares no Snappy entry (`grep -c snappy
+include/cudec.h` reports 0). The batch-entry rung carries it.
+
+### The framing format: out of scope, with the evidence
+
+The official Snappy framing format is deliberately not implemented, and the
+reason is a consumer survey rather than a preference: no major data-plane
+user runs it. LevelDB frames raw per block, Hadoop has its own container,
+Kafka uses a third format from xerial, and Parquet stores raw pages. If it
+ever comes back it is a host-side chunk walker plus a masked CRC-32C in
+front of the same raw batch entry, never kernel work. Recorded here so the
+question stays settled instead of being re-argued each time the format is
+named.
+
+### The locks that keep this from drifting
+
+- **The decode-seam lock** (a commitment, landing with the seam): each
+  parser type defined in exactly one header, the shared element type in
+  exactly one header, and the kernel entry point existing in exactly one
+  place. Same honest scope as the existing RAII lock - a drift detector
+  under the known spellings, not tamper-proofing. Its single-entry-point
+  clause is revisited as a reviewed edit when M4's parse model arrives.
+- **The ladder-coverage lock** (landed with the parser core): every reject
+  branch is an enumerator, every enumerator is reached by a crafted
+  negative, and `tests/snappy_parser_twin.cpp` refuses both directions - a
+  branch no negative reaches reds the suite, and a negative naming a branch
+  that no longer exists reds it too. Adding a reject path without a test is
+  therefore not a thing that can be done quietly.
+
+### The M3 rung ladder, confirmed
+
+Design (this section, decisions only, no code); the oracle and its
+empirical probes; the parser core and its twin; the kernel, which
+materializes the seam first and instantiates Snappy second, plus the batch
+entry and the device gate set; the bench rung; the measured perf pass. The
+two follow-ups this design calls for were filed at the time: the bench rung
+with its two density-locked worst-case corpora, and the Snappy
+streaming-entry scope decision. Numbers and kernel never move in the same
+PR, and the perf pass inherits section 9's pre-registered zero-regression
+rule on the worst case from its first baseline.
+
+**No open maintainer decision.** Every fork above was settled at the panel;
+none of them is a call that needs the release gate.
