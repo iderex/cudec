@@ -207,6 +207,21 @@ is not an empty AMD field), and **hackability**.
   vacuously; `--no-tests=error` closes the zero-tests-selected route; CI
   prints the deferred `-L gpu -N` listing and pins the known GPU tests by
   name.
+- **The GPU sanitizer gate**, required from M1 onward for every PR that
+  touches device code: all four Compute Sanitizer tools - memcheck,
+  racecheck, initcheck, synccheck - over every `gpu`-labelled ctest target,
+  through `scripts/sanitize-gpu.sh`, which fails closed on a sweep that
+  covered nothing. CI cannot run it: the free plan has no GPU runners, so no
+  workflow reds for a missing sweep and the output pasted into the pull
+  request is the whole evidence, carrying the commit, the GPU, the driver and
+  the CUDA version it was produced against. **racecheck detects
+  shared-memory hazards only** - global-memory races are outside its scope,
+  and a clean sweep is never read as clearance for them. Today the gate is
+  owed and unproducible on the maintainer route: under WSL2 the device is in
+  WDDM mode, the debugger interface the tools need is absent, and all four
+  report the same two initialization errors against a program with no fault in
+  it, which #258 records with its commands. That is a gap in the evidence, not
+  a dispensation from the gate.
 - **Oracle pinning policy**: oracles are vendored via FetchContent from
   maintainer-uploaded release assets, pinned by a self-computed SHA-256
   cross-checked against a second packaging ecosystem; auto-generated
