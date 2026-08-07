@@ -557,6 +557,16 @@ int main() {
             const unsigned char* trailer = frame.data() + frame.size() - 4;
             const uint64_t digest =
                 cudec_detail::Xxh64(content.data(), length);
+            if (length == 1) {
+                std::string hex;
+                for (size_t k = 0; k < frame.size(); k++) {
+                    char pair[4];
+                    std::snprintf(pair, sizeof(pair), "%02x", frame[k]);
+                    hex += pair;
+                }
+                std::printf("PROBE frame=%s content0=%02x\n", hex.c_str(),
+                            content.empty() ? 0 : content[0]);
+            }
             REQUIRE_CTX(cudec_detail::ZstdVerifyContentChecksum(
                             trailer, 4, digest, &rung) == CUDEC_OK,
                         "XXH64 over %llu bytes does not reproduce the "
@@ -567,17 +577,6 @@ int main() {
                             cudec_detail::ZstdRead32(trailer)),
                         static_cast<unsigned long long>(digest),
                         static_cast<unsigned long long>(frame.size()));
-            if (length == 1) {
-                std::string hex;
-                for (size_t k = 0; k < frame.size(); k++) {
-                    char pair[4];
-                    std::snprintf(pair, sizeof(pair), "%02x", frame[k]);
-                    hex += pair;
-                }
-                std::printf("PROBE frame=%s content0=%02x
-", hex.c_str(),
-                            content.empty() ? 0 : content[0]);
-            }
             frames_checked++;
 
             /* A flipped trailer byte. The reference must refuse the mutated
