@@ -111,7 +111,7 @@ cmake --install build --prefix /some/prefix
 ```
 
 ```cmake
-find_package(cudec 0.0.1 REQUIRED)
+find_package(cudec 0.1.0 REQUIRED)
 target_link_libraries(your_target PRIVATE cudec::cudec)
 ```
 
