@@ -1,7 +1,8 @@
-/* The Zstd frame and block header parser from src/zstd_frame.h, executed on
- * the host and held to libzstd (issue #200). Host-side and GPU-less on
- * purpose: the gate that decides which frames cudec will decode at all runs
- * on the runner with no device, and the sanitizer build reaches it there.
+/* The Zstd frame and block header parser from src/zstd_frame.h, and the
+ * content checksum from src/xxhash64.h, executed on the host and held to
+ * libzstd (issues #200 and #202). Host-side and GPU-less on purpose: the
+ * gate that decides which frames cudec will decode at all runs on the runner
+ * with no device, and the sanitizer build reaches it there.
  *
  * TWO DIRECTIONS, WHICH IS THE WHOLE POINT OF THE LADDER. Every negative
  * below carries the class docs/MASTERPLAN.md section 12 assigns it, and the
@@ -27,6 +28,7 @@
  * target's compile definitions, and it means this test grows no second
  * frame-header parser to check the first one against. */
 #include "require.h"
+#include "xxhash64.h"
 #include "zstd_frame.h"
 
 #include <zstd.h>
@@ -482,6 +484,164 @@ int main() {
         }
     }
 
+    /* ---- The content checksum (issue #202) -----------------------------
+     *
+     * XXH64 is held to libzstd rather than to a table of digests copied out
+     * of a document: every frame below was checksummed by the reference, so
+     * the low 32 bits in its trailer ARE the oracle, and a length sweep puts
+     * every path of the algorithm under one. The classes are the algorithm's
+     * own - below one 32-byte stripe, exactly one, several, plus each tail
+     * width the finish walks: whole 8-byte lanes, one 4-byte half, and
+     * single bytes.
+     *
+     * The seed is not swept because the format fixes it. Section 3.1.1 says
+     * the checksum is XXH64 of the decoded data "and a seed of zero", so the
+     * implementation carries no seed parameter and there is no seeded path
+     * in this tree to test. That is a narrower unit than xxHash offers, and
+     * it is narrower on purpose.
+     *
+     * What is NOT proven here, stated rather than implied: cudec cannot
+     * decode a Zstd frame yet, so the digest is taken over content the
+     * reference produced. Verifying a checksum against bytes THIS project
+     * decoded is #199 and #203, and it is the step that closes the loop. */
+    {
+        const uint64_t lengths[] = {0,  1,  3,  4,   7,    8,    15,   16,
+                                    31, 32, 33, 63,  64,   100,  1000, 4095,
+                                    4096, 70000};
+        size_t frames_checked = 0;
+        for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+            const uint64_t length = lengths[i];
+            /* Deterministic pseudo-random content: a run of one byte would
+             * leave the stripe loop reading the same word every round, which
+             * is the one input shape that hides a lane mix-up. */
+            /* Reserve before resize so an empty content still has a
+             * non-null data pointer to hand to both sides. */
+            Bytes content;
+            content.reserve(1);
+            content.resize(static_cast<size_t>(length));
+            uint32_t state = 0x9E3779B9u ^ static_cast<uint32_t>(length);
+            for (size_t j = 0; j < content.size(); j++) {
+                state = state * 1664525u + 1013904223u;
+                content[j] = static_cast<unsigned char>(state >> 24);
+            }
+
+            Bytes frame(ZSTD_compressBound(content.size()) + 16);
+            ZSTD_CCtx* cctx = ZSTD_createCCtx();
+            REQUIRE(cctx != 0);
+            REQUIRE(!ZSTD_isError(
+                ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1)));
+            const size_t written =
+                ZSTD_compress2(cctx, frame.data(), frame.size(),
+                               content.data(), content.size());
+            ZSTD_freeCCtx(cctx);
+            REQUIRE(!ZSTD_isError(written));
+            frame.resize(written);
+
+            cudec_detail::ZstdFrameHeader header;
+            std::memset(&header, 0, sizeof(header));
+            cudec_detail::ZstdFrameReject rung =
+                cudec_detail::kZstdFrameRejectNone;
+            REQUIRE_CTX(cudec_detail::ZstdParseFrameHeader(
+                            frame.data(), frame.size(), &header,
+                            &rung) == CUDEC_OK,
+                        "checksummed frame of %llu bytes refused",
+                        static_cast<unsigned long long>(length));
+            REQUIRE_CTX(header.content_checksum,
+                        "the descriptor of a --check frame of %llu bytes does "
+                        "not report the flag",
+                        static_cast<unsigned long long>(length));
+
+            /* The trailer is the frame's last four bytes: the subset holds
+             * one frame per chunk, and a checksummed frame ends with it. */
+            REQUIRE(frame.size() >= 4);
+            const unsigned char* trailer = frame.data() + frame.size() - 4;
+            const uint64_t digest =
+                cudec_detail::Xxh64(content.data(), length);
+            REQUIRE_CTX(cudec_detail::ZstdVerifyContentChecksum(
+                            trailer, 4, digest, &rung) == CUDEC_OK,
+                        "XXH64 over %llu bytes does not reproduce the "
+                        "checksum libzstd wrote into the frame",
+                        static_cast<unsigned long long>(length));
+            frames_checked++;
+
+            /* A flipped trailer byte. The reference must refuse the mutated
+             * frame too, which is what says the trailer is load-bearing
+             * there and not only here. */
+            {
+                Bytes mutated = frame;
+                mutated[mutated.size() - 1] ^= 0x01u;
+                const unsigned char* bad = mutated.data() + mutated.size() - 4;
+                REQUIRE(cudec_detail::ZstdVerifyContentChecksum(
+                            bad, 4, digest, &rung) ==
+                        CUDEC_ERR_CORRUPT_INPUT);
+                REQUIRE(rung ==
+                        cudec_detail::kZstdFrameRejectChecksumMismatch);
+                CoverRung(rung);
+                REQUIRE_CTX(!OracleDecodes(mutated, 0),
+                            "libzstd accepts a frame of %llu bytes whose "
+                            "checksum was flipped",
+                            static_cast<unsigned long long>(length));
+            }
+
+            /* A flipped CONTENT byte against the unmutated trailer. This is
+             * the case the checksum exists for: the bytes decode, and the
+             * frame is still wrong. Length zero has no content byte to
+             * flip. */
+            if (length != 0) {
+                Bytes altered = content;
+                altered[altered.size() / 2] ^= 0x80u;
+                const uint64_t altered_digest =
+                    cudec_detail::Xxh64(altered.data(), length);
+                REQUIRE_CTX(altered_digest != digest,
+                            "one flipped byte in %llu did not move the "
+                            "digest",
+                            static_cast<unsigned long long>(length));
+                REQUIRE(cudec_detail::ZstdVerifyContentChecksum(
+                            trailer, 4, altered_digest, &rung) ==
+                        CUDEC_ERR_CORRUPT_INPUT);
+                REQUIRE(rung ==
+                        cudec_detail::kZstdFrameRejectChecksumMismatch);
+            }
+        }
+        REQUIRE(frames_checked == sizeof(lengths) / sizeof(lengths[0]));
+
+        /* A frame that ends before its trailer. The presence check is its
+         * own rung, because a decoder that read three bytes and compared
+         * them against a four-byte field would refuse for the wrong reason
+         * and would read one byte past the frame to do it. */
+        {
+            const unsigned char stub[3] = {0, 0, 0};
+            cudec_detail::ZstdFrameReject rung =
+                cudec_detail::kZstdFrameRejectNone;
+            REQUIRE(cudec_detail::ZstdVerifyContentChecksum(stub, 3, 0,
+                                                            &rung) ==
+                    CUDEC_ERR_CORRUPT_INPUT);
+            REQUIRE(rung == cudec_detail::kZstdFrameRejectChecksumTruncated);
+            CoverRung(rung);
+        }
+
+        /* No flag, no trailer. A decoder that read four bytes after the last
+         * block of an unchecksummed frame would be reading whatever follows
+         * it, so the flag is asserted rather than assumed. */
+        {
+            const std::string source(1024, 'q');
+            Bytes frame(ZSTD_compressBound(source.size()));
+            const size_t written =
+                ZSTD_compress(frame.data(), frame.size(), source.data(),
+                              source.size(), 3);
+            REQUIRE(!ZSTD_isError(written));
+            frame.resize(written);
+            cudec_detail::ZstdFrameHeader header;
+            std::memset(&header, 0, sizeof(header));
+            cudec_detail::ZstdFrameReject rung =
+                cudec_detail::kZstdFrameRejectNone;
+            REQUIRE(cudec_detail::ZstdParseFrameHeader(
+                        frame.data(), frame.size(), &header, &rung) ==
+                    CUDEC_OK);
+            REQUIRE(!header.content_checksum);
+        }
+    }
+
     /* Every rung named by a negative written to reach it, walked rather than
      * restated: a rung added to the parser with none behind it lands here as
      * a hole with its number on it. */
@@ -500,8 +660,9 @@ int main() {
     }
 
     std::printf("PASS: 3 accepted frames checked field for field against "
-                "ZSTD_getFrameHeader, %zu negatives over %d reject rungs, "
-                "each held to libzstd in the direction its class implies\n",
+                "ZSTD_getFrameHeader, 18 checksummed frames whose XXH64 this "
+                "tree reproduces, %zu negatives over %d reject rungs, each "
+                "held to libzstd in the direction its class implies\n",
                 rows.size(),
                 static_cast<int>(cudec_detail::kZstdFrameRejectCount) - 1);
     return 0;
