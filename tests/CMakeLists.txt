@@ -403,6 +403,15 @@ target_compile_definitions(zstd_probes PRIVATE ZSTD_STATIC_LINKING_ONLY)
 # Huffman code exists to run over it (issue #215). Every serial core in M5
 # reads through this one unit, so it is proven alone: hand-written bit strings
 # for expectations, one negative per reject rung. No oracle and no device.
+# The M5 corpus proving itself before any Zstd decoder exists (issue #185),
+# the counterpart of oracle_lz4 and snappy_corpus. It drives the compressor
+# through its advanced API for the forced-mode families, so it links zstd_full
+# alone for the reason zstd_oracle_smoke gives above. Host-side and GPU-less;
+# the source bytes are constructed rather than fetched, because the runner
+# this has to be green on fetches no corpus - docs/ZSTD-CORPUS.md carries that
+# decision and the coverage matrix.
+cudec_add_test(zstd_corpus_selfproof SOURCES zstd_corpus_selfproof.cpp
+               zstd_corpus.cpp LIBS zstd_full)
 cudec_add_test(zstd_bitstream_twin SOURCES zstd_bitstream_twin.cpp)
 target_include_directories(zstd_bitstream_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
