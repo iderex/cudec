@@ -77,8 +77,9 @@ constexpr uint8_t kZstdBlockTypeReserved = 3;
 /* The reject ladder, enumerated once, in the shape the Snappy parser and the
  * bitstream reader use: every refusal returns through one choke point naming
  * its rung, so the twin can require a negative per rung instead of counting
- * statuses that repeat. Ten of these return CUDEC_ERR_CORRUPT_INPUT and four
- * return CUDEC_ERR_UNSUPPORTED, so the status alone identifies nothing. */
+ * statuses that repeat. Twelve of these return CUDEC_ERR_CORRUPT_INPUT and
+ * three return CUDEC_ERR_UNSUPPORTED, so the status alone identifies
+ * nothing. */
 enum ZstdFrameReject {
     kZstdFrameRejectNone = 0,
     kZstdFrameRejectMagicTruncated,
@@ -94,6 +95,8 @@ enum ZstdFrameReject {
     kZstdFrameRejectBlockTypeReserved,
     kZstdFrameRejectBlockTooLarge,
     kZstdFrameRejectBlockBodyTruncated,
+    kZstdFrameRejectChecksumTruncated,
+    kZstdFrameRejectChecksumMismatch,
     kZstdFrameRejectCount
 };
 
@@ -362,6 +365,45 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdParseBlockHeader(
         out->body_size = body_size;
         out->block_type = block_type;
         out->last_block = last_block;
+    }
+    return CUDEC_OK;
+}
+
+/* Verify a frame's content checksum against the digest of what was decoded.
+ *
+ * Section 3.1.1: the trailer is present only when the descriptor sets
+ * Content_Checksum_flag, and it is "the low 4 bytes of the checksum ...
+ * stored in little-endian format", the checksum being XXH64 over the
+ * ORIGINAL decoded data with a seed of zero. So the caller computes the
+ * digest as it produces output and hands the low half here; this function
+ * owns the trailer's presence, its byte order and the comparison, and
+ * nothing else.
+ *
+ * Both refusals are CUDEC_ERR_CORRUPT_INPUT. Section 12.3 puts a failed
+ * checksum in the corrupt class rather than the unsupported one: a frame
+ * whose content does not hash to what its own trailer says is not a legal
+ * frame this decoder declines, it is data no conforming encoder produced.
+ *
+ * `available` is the bytes left after the last block, so a frame that ends
+ * before its trailer refuses rather than reading past itself. A frame with
+ * more bytes after the trailer is not this function's business: a chunk
+ * holding more than one frame is out of the subset and section 12.4 is
+ * where that is argued. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdVerifyContentChecksum(
+    const unsigned char* trailer, uint64_t available, uint64_t content_digest,
+    ZstdFrameReject* reject) {
+    if (reject != 0) {
+        *reject = kZstdFrameRejectNone;
+    }
+    if (available < 4) {
+        return ZstdFrameRefuse(kZstdFrameRejectChecksumTruncated,
+                               CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    const uint32_t stored = ZstdRead32(trailer);
+    const uint32_t computed = static_cast<uint32_t>(content_digest);
+    if (stored != computed) {
+        return ZstdFrameRefuse(kZstdFrameRejectChecksumMismatch,
+                               CUDEC_ERR_CORRUPT_INPUT, reject);
     }
     return CUDEC_OK;
 }

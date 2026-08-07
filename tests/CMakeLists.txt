@@ -422,7 +422,9 @@ target_include_directories(zstd_bitstream_twin
 # alone for the reason zstd_oracle_smoke gives above, and
 # ZSTD_STATIC_LINKING_ONLY is for ZSTD_getFrameHeader, which is the field-for-
 # field oracle the positives are checked against rather than a second frame
-# header parser written to check the first.
+# header parser written to check the first. It also holds src/xxhash64.h, the
+# frame's content checksum (issue #202), to the checksums libzstd writes into
+# real --check frames across every length class the algorithm branches on.
 cudec_add_test(zstd_frame_twin SOURCES zstd_frame_twin.cpp LIBS zstd_full)
 target_include_directories(zstd_frame_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
