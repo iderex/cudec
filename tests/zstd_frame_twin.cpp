@@ -560,8 +560,13 @@ int main() {
             REQUIRE_CTX(cudec_detail::ZstdVerifyContentChecksum(
                             trailer, 4, digest, &rung) == CUDEC_OK,
                         "XXH64 over %llu bytes does not reproduce the "
-                        "checksum libzstd wrote into the frame",
-                        static_cast<unsigned long long>(length));
+                        "checksum libzstd wrote into the frame: trailer "
+                        "%08llx, digest %016llx, frame %llu bytes",
+                        static_cast<unsigned long long>(length),
+                        static_cast<unsigned long long>(
+                            cudec_detail::ZstdRead32(trailer)),
+                        static_cast<unsigned long long>(digest),
+                        static_cast<unsigned long long>(frame.size()));
             frames_checked++;
 
             /* A flipped trailer byte. The reference must refuse the mutated
