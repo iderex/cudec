@@ -143,6 +143,12 @@ asking for 0.0 is not handed 0.1.
 the public header and libc, and nothing else. Both builds compile it, and the
 CUDA build links it into `build-cuda/examples/example_decode_frame`.
 
+[examples/decode_batch.cu](examples/decode_batch.cu) decodes four independent
+LZ4 blocks in one batch call, one of them deliberately corrupt, so the
+per-chunk contract is visible: the bad chunk reports a defined error with no
+bytes written while its neighbours decode. It needs the CUDA build, which
+links it into `build-cuda/examples/example_decode_batch`.
+
 ## Contributing
 
 Issue-driven: every change starts as an issue and lands as a gated PR - see
