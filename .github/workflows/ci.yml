@@ -452,7 +452,7 @@ jobs:
       - name: Run the untrusted-input decode path under ASan+UBSan
         run: >-
           ctest --test-dir build-san --no-tests=error --output-on-failure -R
-          '^(conformance_c|oracle_lz4|parser_twin|snappy_parser_twin|snappy_edge_sweep|snappy_upstream_negatives|frame_host_negative|termination)$'
+          '^(conformance_c|oracle_lz4|parser_twin|snappy_parser_twin|snappy_edge_sweep|snappy_upstream_negatives|frame_host_negative|zstd_frame_twin|termination)$'
           &&
           ctest --test-dir build-san -N | tee san-selected.txt &&
           grep -E ': conformance_c$' san-selected.txt &&
@@ -462,6 +462,7 @@ jobs:
           grep -E ': snappy_edge_sweep$' san-selected.txt &&
           grep -E ': snappy_upstream_negatives$' san-selected.txt &&
           grep -E ': frame_host_negative$' san-selected.txt &&
+          grep -E ': zstd_frame_twin$' san-selected.txt &&
           grep -E ': termination$' san-selected.txt
 
   format:

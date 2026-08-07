@@ -415,6 +415,18 @@ cudec_add_test(zstd_corpus_selfproof SOURCES zstd_corpus_selfproof.cpp
 cudec_add_test(zstd_bitstream_twin SOURCES zstd_bitstream_twin.cpp)
 target_include_directories(zstd_bitstream_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The Zstd frame and block header parser and the v1 subset gate (issue #200):
+# the first thing any Zstd decode path reads, and the only place a frame is
+# judged admissible. Host-side and GPU-less, so the runner with no device
+# reaches the gate and the sanitizer build instruments it. It links zstd_full
+# alone for the reason zstd_oracle_smoke gives above, and
+# ZSTD_STATIC_LINKING_ONLY is for ZSTD_getFrameHeader, which is the field-for-
+# field oracle the positives are checked against rather than a second frame
+# header parser written to check the first.
+cudec_add_test(zstd_frame_twin SOURCES zstd_frame_twin.cpp LIBS zstd_full)
+target_include_directories(zstd_frame_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(zstd_frame_twin PRIVATE ZSTD_STATIC_LINKING_ONLY)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
