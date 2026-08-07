@@ -90,7 +90,7 @@ body:
     id: version
     attributes:
       label: cudec version or commit
-      placeholder: "0.0.1, or ab133e0"
+      placeholder: "0.1.0, or ab133e0"
     validations:
       required: true
 
