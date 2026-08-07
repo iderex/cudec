@@ -342,7 +342,7 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdParseBlockHeader(
     const uint64_t block_max = window_size < kZstdBlockSizeCeiling
                                    ? window_size
                                    : kZstdBlockSizeCeiling;
-    if (static_cast<uint64_t>(block_size) > block_max + 1024) {
+    if (static_cast<uint64_t>(block_size) > block_max) {
         return ZstdFrameRefuse(kZstdFrameRejectBlockTooLarge,
                                CUDEC_ERR_CORRUPT_INPUT, reject);
     }
