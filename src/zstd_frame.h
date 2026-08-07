@@ -257,8 +257,9 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdParseFrameHeader(
      * fixed at zero bytes + the content size. Every term is a small constant,
      * so the sum cannot overflow the 32 bits it is kept in. */
     const unsigned window_size_bytes = single_segment ? 0u : 1u;
-    const uint32_t header_size = 5u + window_size_bytes +
-                                 ZstdDidFieldSize(did_flag) + fcs_size;
+    const unsigned did_bytes = ZstdDidFieldSize(did_flag);
+    const uint32_t header_size =
+        5u + window_size_bytes + did_bytes + fcs_size;
     if (size < header_size) {
         return ZstdFrameRefuse(kZstdFrameRejectHeaderTruncated,
                                CUDEC_ERR_CORRUPT_INPUT, reject);
@@ -267,8 +268,8 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdParseFrameHeader(
     /* Section 3.1.1.1.1.1: the two-byte encoding carries the value minus
      * 256, so the whole 16-bit range maps to 256..65791 rather than wasting
      * the sizes a one-byte field already covers. */
-    uint64_t content_size =
-        ZstdReadLe(src + 5u + window_size_bytes, fcs_size);
+    uint64_t content_size = ZstdReadLe(
+        src + 5u + window_size_bytes + did_bytes, fcs_size);
     if (fcs_size == 2) {
         content_size += 256;
     }
