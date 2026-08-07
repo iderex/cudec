@@ -342,6 +342,10 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdParseBlockHeader(
     const uint64_t block_max = window_size < kZstdBlockSizeCeiling
                                    ? window_size
                                    : kZstdBlockSizeCeiling;
+    if (static_cast<uint64_t>(block_size) > block_max) {
+        return ZstdFrameRefuse(kZstdFrameRejectBlockTooLarge,
+                               CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
     const uint32_t body_size =
         block_type == kZstdBlockTypeRle ? 1u : block_size;
     /* 3 + body_size in 64-bit, against the bytes actually present. body_size
