@@ -71,6 +71,41 @@ and need a CUDA 12.x toolchain plus a GPU for the tests - see the README's
 container command for the maintained path (build directory `build-cuda`,
 `ctest --test-dir build-cuda`).
 
+### The GPU sanitizer gate
+
+Any change that touches device code carries a Compute Sanitizer sweep, from M1
+onward. All four tools run over every `gpu`-labelled ctest target, and the
+output goes in the pull-request body: CI has no GPU, so nothing in the
+workflow can red for a missing sweep and the paste is the whole evidence.
+
+`scripts/sanitize-gpu.sh` is the runner. It discovers its targets with
+`ctest -L gpu -N` rather than from a list, and it refuses a sweep that covered
+nothing - an absent `compute-sanitizer`, an empty discovery, a missing binary
+or a known GPU test gone from the discovered set are errors there and never
+skips. The commit is passed in because the image ships no git:
+
+```sh
+docker run --rm --gpus all -v "$PWD:/w" -w /w \
+  nvidia/cuda:12.6.2-devel-ubuntu24.04@sha256:738fba0fbdb225b7a2931c58a5c8f03a84d3cd2f6a84975826a157339ef750b8 \
+  sh -c "apt-get update -q >/dev/null && \
+         apt-get install -yq cmake >/dev/null 2>&1 && \
+         cmake -B build-cuda -DCUDEC_ENABLE_CUDA=ON && \
+         cmake --build build-cuda -j && \
+         CUDEC_COMMIT=$(git rev-parse HEAD) scripts/sanitize-gpu.sh build-cuda"
+```
+
+racecheck checks shared-memory hazards only. A clean run says nothing about
+global-memory races, and reading it as clearance for them is the mistake this
+sentence exists to stop.
+
+The gate is written down here in full, and issue #258 records that no route to
+a device it can attach to is available today: under WSL2 the device is in WDDM
+mode, the debugger interface the sanitizer needs is absent, and all four tools
+report the same two initialization errors on a program with no fault in it. So
+the sweep is owed and currently cannot be produced on that route. Say that in
+the pull request, with the command that shows it, rather than leaving the block
+looking answered.
+
 `-DCUDEC_ENABLE_HIP=ON` exists and currently refuses on every machine: there
 are no HIP device sources yet, so the option fails the configure rather than
 handing back a host-only library that looks like a working port. The two

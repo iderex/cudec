@@ -30,6 +30,32 @@
       reproduction was produced). Every finding of either kind carries a
       disposition - FIX, a reasoned DECLINE, or DEFER as its own issue.
 
+## GPU sanitizer gate
+
+Required from M1 onward for every change that touches device code. CI has no
+GPU, so the pasted output below is the evidence and there is nothing that
+reds without it. Produced by `scripts/sanitize-gpu.sh` inside the pinned
+container; the invocation is in [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+- [ ] Not applicable: this change touches no device code.
+
+```
+commit:    <sha the sweep ran against>
+gpu:       <name, driver version>
+cuda:      <nvcc release>
+sanitizer: <compute-sanitizer version>
+
+  <test>           memcheck   PASS/FAIL
+  <test>           racecheck  PASS/FAIL
+  <test>           initcheck  PASS/FAIL
+  <test>           synccheck  PASS/FAIL
+```
+
+racecheck reports shared-memory hazards only, so a clean sweep is not
+clearance for global memory. If no route to a device the sanitizer can attach
+to was available, say so here with the command that shows it, and leave the
+block empty rather than removing it.
+
 ## Performance checklist
 
 Fill in for any change on the hot path.
