@@ -390,10 +390,28 @@ endif()
 # reaching for both would be refused by the linker. Host-side and GPU-less;
 # nothing here is about cudec's own Zstd path, which does not exist yet.
 cudec_add_test(zstd_oracle_smoke SOURCES zstd_oracle_smoke.cpp LIBS zstd_full)
+# The M5 decode behaviours the research read out of RFC 8878 and the zstd
+# source, executed instead of argued (issue #189). Same standalone shape and
+# the same reason as zstd_oracle_smoke above: it drives the compressor for the
+# one probe that needs a real Huffman-coded literals section, so it links
+# zstd_full alone. ZSTD_STATIC_LINKING_ONLY is for ZSTD_frameHeaderSize, which
+# is how that probe locates the first block without this test growing a second
+# frame-header parser.
+cudec_add_test(zstd_probes SOURCES zstd_probes.cpp LIBS zstd_full)
+target_compile_definitions(zstd_probes PRIVATE ZSTD_STATIC_LINKING_ONLY)
 # The Zstd backward bitstream reader, executed on the host before any FSE or
 # Huffman code exists to run over it (issue #215). Every serial core in M5
 # reads through this one unit, so it is proven alone: hand-written bit strings
 # for expectations, one negative per reject rung. No oracle and no device.
+# The M5 corpus proving itself before any Zstd decoder exists (issue #185),
+# the counterpart of oracle_lz4 and snappy_corpus. It drives the compressor
+# through its advanced API for the forced-mode families, so it links zstd_full
+# alone for the reason zstd_oracle_smoke gives above. Host-side and GPU-less;
+# the source bytes are constructed rather than fetched, because the runner
+# this has to be green on fetches no corpus - docs/ZSTD-CORPUS.md carries that
+# decision and the coverage matrix.
+cudec_add_test(zstd_corpus_selfproof SOURCES zstd_corpus_selfproof.cpp
+               zstd_corpus.cpp LIBS zstd_full)
 cudec_add_test(zstd_bitstream_twin SOURCES zstd_bitstream_twin.cpp)
 target_include_directories(zstd_bitstream_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)

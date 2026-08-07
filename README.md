@@ -111,7 +111,7 @@ cmake --install build --prefix /some/prefix
 ```
 
 ```cmake
-find_package(cudec 0.0.1 REQUIRED)
+find_package(cudec 0.1.0 REQUIRED)
 target_link_libraries(your_target PRIVATE cudec::cudec)
 ```
 
@@ -142,6 +142,12 @@ asking for 0.0 is not handed 0.1.
 [examples/decode_frame.c](examples/decode_frame.c) decodes a `.lz4` frame using
 the public header and libc, and nothing else. Both builds compile it, and the
 CUDA build links it into `build-cuda/examples/example_decode_frame`.
+
+[examples/decode_batch.cu](examples/decode_batch.cu) decodes four independent
+LZ4 blocks in one batch call, one of them deliberately corrupt, so the
+per-chunk contract is visible: the bad chunk reports a defined error with no
+bytes written while its neighbours decode. It needs the CUDA build, which
+links it into `build-cuda/examples/example_decode_batch`.
 
 ## Contributing
 

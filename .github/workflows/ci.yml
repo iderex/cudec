@@ -171,6 +171,45 @@ jobs:
           }
           cat "$out.log"
 
+      # The versions the consumer legs request are derived here, from
+      # include/cudec.h - the one place the version is written, and the same
+      # three macros the top-level CMakeLists reads to set the project version.
+      # A literal was wrong for the whole life of the 0.1.0 bump: the accept
+      # leg asked for 0.0.1, which SameMinorVersion refuses once the minor
+      # moves, and nothing caught it because the consumer steps arrived after
+      # that bump's own run (issue #307).
+      #
+      # Fail-closed on the parse rather than on the request. An empty capture
+      # would reach find_package as no version at all, and config mode then
+      # never opens cudec-config-version.cmake - so the legs would pass against
+      # a prefix carrying no version file, which is the hole they exist to
+      # close. A component that is absent, non-numeric, or matched twice reds
+      # here instead.
+      - name: Derive the requested versions from the version's single source
+        run: |
+          component() {
+            sed -n "s/^#define CUDEC_VERSION_$1 \([0-9][0-9]*\)$/\1/p" \
+              include/cudec.h
+          }
+          major="$(component MAJOR)"
+          minor="$(component MINOR)"
+          patch="$(component PATCH)"
+          for part in "$major" "$minor" "$patch"; do
+            case "$part" in
+              "" | *[!0-9]*)
+                echo "FAIL: include/cudec.h did not yield three integer" \
+                     "version components (major='$major' minor='$minor'" \
+                     "patch='$patch')"
+                exit 1
+                ;;
+            esac
+          done
+          echo "CUDEC_VERSION=$major.$minor.$patch" >> "$GITHUB_ENV"
+          echo "CUDEC_VERSION_ABOVE_MINOR=$major.$((minor + 1))" \
+            >> "$GITHUB_ENV"
+          echo "accept: $major.$minor.$patch"
+          echo "refuse: $major.$((minor + 1))"
+
       # The install surface is proven by consuming it, never by inspecting it
       # (issue #79). Install the host-only build into a prefix, then configure,
       # build AND RUN a project outside this tree that knows nothing but
@@ -188,17 +227,22 @@ jobs:
       # The consumer is driven TWICE, and both runs pass a version, because
       # config mode reads cudec-config-version.cmake only when the caller
       # requests one: a no-version consumer configures happily against a prefix
-      # whose version file was never installed. 0.0.1 must be accepted, 0.1
-      # must be refused, and the refusal leg reds if that configure SUCCEEDS.
+      # whose version file was never installed. The installed version must be
+      # accepted, the next minor above it must be refused, and the refusal leg
+      # reds if that configure SUCCEEDS. Both requests come from the step above
+      # rather than from a literal, so a bump carries them with it.
       #
       # What that pair does NOT prove, stated so the gate is not read as
-      # stronger than it is: at 0.0.1 no request separates SameMinorVersion
-      # from SameMajorVersion or AnyNewerVersion, because every one of them
-      # refuses a request above the installed version. Measured by swapping the
-      # mode to AnyNewerVersion and watching this step stay green. What the
-      # legs do prove is that the version file is installed and consulted -
-      # dropping it from the install reds the step - and the modes become
-      # distinguishable the first time the minor moves.
+      # stronger than it is: the refused request sits above the installed
+      # version, and SameMajorVersion and AnyNewerVersion refuse such a request
+      # as well, so the pair does not say which mode is configured. That
+      # follows from what the generated version file compares, not from a run
+      # here. The request that would separate the modes is the same major with
+      # a LOWER minor, which only SameMinorVersion refuses; it exists only
+      # while the minor is above zero, so it is not derivable for every version
+      # and is not added here. What the legs do prove is that the version file
+      # is installed and consulted - dropping it from the install reds the step
+      # - and that a minor mismatch is refused.
       - name: Install and consume out of tree (host-only)
         run: >-
           cmake --install build --prefix "$PWD/prefix-host" &&
@@ -209,15 +253,18 @@ jobs:
           -print -quit)" &&
           cmake -S tests/consumer -B build-consumer
           -DCMAKE_PREFIX_PATH="$PWD/prefix-host"
-          -DCUDEC_CONSUMER_REQUEST_VERSION=0.0.1 &&
+          -DCUDEC_CONSUMER_REQUEST_VERSION="$CUDEC_VERSION" &&
           cmake --build build-consumer &&
           ./build-consumer/consumer &&
           if cmake -S tests/consumer -B build-consumer-badver
           -DCMAKE_PREFIX_PATH="$PWD/prefix-host"
-          -DCUDEC_CONSUMER_REQUEST_VERSION=0.1 > badver.log 2>&1; then
-          echo "FAIL: find_package(cudec 0.1) was accepted against a 0.0.1
-          prefix - the version policy is not being applied"; exit 1; else
-          echo "PASS: find_package(cudec 0.1) refused against a 0.0.1 prefix";
+          -DCUDEC_CONSUMER_REQUEST_VERSION="$CUDEC_VERSION_ABOVE_MINOR"
+          > badver.log 2>&1; then
+          echo "FAIL: find_package(cudec $CUDEC_VERSION_ABOVE_MINOR) was
+          accepted against a $CUDEC_VERSION prefix - the version policy is not
+          being applied"; exit 1; else
+          echo "PASS: find_package(cudec $CUDEC_VERSION_ABOVE_MINOR) refused
+          against a $CUDEC_VERSION prefix";
           fi
 
       # Unconditional AND self-verifying: the GPU-test binaries exist only
@@ -236,7 +283,8 @@ jobs:
           test -x build-cuda/tests/termination_gpu &&
           test -x build-cuda/tests/determinism_gpu &&
           test -x build-cuda/tests/snappy_block_device &&
-          test -x build-cuda/examples/example_decode_frame
+          test -x build-cuda/examples/example_decode_frame &&
+          test -x build-cuda/examples/example_decode_batch
 
       # The other half of the install proof (issue #137). The host-only prefix
       # is the easy flavour: nothing reaches the exported interface. The CUDA
@@ -270,7 +318,7 @@ jobs:
           "$(find "$PWD/prefix-cuda" -name cudec-config.cmake -print -quit)" &&
           cmake -S tests/consumer -B build-consumer-cuda
           -DCMAKE_PREFIX_PATH="$PWD/prefix-cuda"
-          -DCUDEC_CONSUMER_REQUEST_VERSION=0.0.1
+          -DCUDEC_CONSUMER_REQUEST_VERSION="$CUDEC_VERSION"
           -DCUDEC_CONSUMER_CALLS_DECODE=ON &&
           cmake --build build-consumer-cuda &&
           ./build-consumer-cuda/consumer
@@ -294,7 +342,7 @@ jobs:
           env -i PATH=/usr/bin:/bin HOME="$HOME"
           cmake -S tests/consumer -B build-consumer-nocuda
           -DCMAKE_PREFIX_PATH="$PWD/prefix-host"
-          -DCUDEC_CONSUMER_REQUEST_VERSION=0.0.1
+          -DCUDEC_CONSUMER_REQUEST_VERSION="$CUDEC_VERSION"
           -DCUDAToolkit_ROOT=/nonexistent
           -DCMAKE_IGNORE_PREFIX_PATH=/usr/local/cuda &&
           cmake --build build-consumer-nocuda &&
