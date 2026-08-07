@@ -42,7 +42,7 @@ one, and this README will never claim otherwise.
 
 ## Status
 
-**M0 and M1 are complete; M2 is in progress.** cudec decodes real LZ4 on an
+**M0 through M2 are complete; M3 is next.** cudec decodes real LZ4 on an
 NVIDIA GPU today - batch block decode, the `.lz4` frame format
 (block-independent subset), and a pinned-host streaming path - all fail-closed
 and fuzz-diffed against liblz4. The design record is
@@ -52,15 +52,15 @@ baselines, each carrying its full methodology, are in
 port are planned, not yet implemented. Progress is tracked in the issues and
 milestones:
 
-| Milestone        | Deliverable                                         | Status      |
-| ---------------- | --------------------------------------------------- | ----------- |
-| M0 - Foundation  | Toolchain, CMake+CUDA skeleton, CI, test harness    | done        |
-| M1 - LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      | done        |
-| M2 - LZ4 batch   | Frame format, batch API, streaming path, benchmarks | in progress |
-| M3 - Snappy      | Snappy decode on the same kernel family             | planned     |
-| M4 - GDeflate    | GDeflate decode as an auditable CUDA library        | planned     |
-| M5 - Zstd        | Zstd decode (FSE/Huffman sequences)                 | planned     |
-| M6 - Portability | HIP port                                            | planned     |
+| Milestone        | Deliverable                                         | Status  |
+| ---------------- | --------------------------------------------------- | ------- |
+| M0 - Foundation  | Toolchain, CMake+CUDA skeleton, CI, test harness    | done    |
+| M1 - LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      | done    |
+| M2 - LZ4 batch   | Frame format, batch API, streaming path, benchmarks | done    |
+| M3 - Snappy      | Snappy decode on the same kernel family             | planned |
+| M4 - GDeflate    | GDeflate decode as an auditable CUDA library        | planned |
+| M5 - Zstd        | Zstd decode (FSE/Huffman sequences)                 | planned |
+| M6 - Portability | HIP port                                            | planned |
 
 ## Principles
 
