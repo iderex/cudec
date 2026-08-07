@@ -35,8 +35,15 @@
 
 namespace cudec_detail {
 
-/* xxHash's five primes, in the reference's own order. */
-constexpr uint64_t kXxh64Prime1 = 11400714785074569124ull;
+/* xxHash's five primes, in the reference's own order.
+ *
+ * These are the one part of this file that cannot be derived from anything
+ * around them, and prime 1 in particular is reachable by every input longer
+ * than three bytes and by none shorter. A transposed digit in it therefore
+ * passes the published empty-input vector and fails on the first real byte,
+ * which is how the wrong value got here and how the length sweep in the twin
+ * caught it. */
+constexpr uint64_t kXxh64Prime1 = 11400714785074694791ull;
 constexpr uint64_t kXxh64Prime2 = 14029467366897019727ull;
 constexpr uint64_t kXxh64Prime3 = 1609587929392839161ull;
 constexpr uint64_t kXxh64Prime4 = 9650029242287828579ull;
