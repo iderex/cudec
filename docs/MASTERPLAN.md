@@ -269,10 +269,46 @@ is not an empty AMD field), and **hackability**.
 ## 8. Open design questions (settled via design issues before use)
 
 - Benchmark corpus set beyond Silesia/enwik (game-asset-like data) - M2.
-- Device-side chunk-size binning for mixed batches - M2 (see section 9:
-  the async ABI rules out host-side histogramming, so the block-per-chunk /
-  binning option in section 4 resolves to device-side binning or nothing;
-  M1 ships without a dispatch heuristic).
+
+**Device-side chunk-size binning for mixed batches - RETIRED (issue #78,
+2026-08-08), with the trigger that reopens it.** The async batch ABI rules out
+host-side histogramming, so the block-per-chunk / binning option in section 4
+resolved to device-side binning or nothing, and it is nothing.
+
+What binning would buy is a second dispatch shape: a block per large chunk
+beside the warp per chunk the kernel ships. The evidence against paying for one
+is that nothing has ever measured the dispatch losing. Every recorded
+distribution is effectively uniform 64 KiB:
+
+    grep -n "chunk sizes:" docs/BENCHMARKS.md
+
+Six of the seven recorded corpora report median 65536 and max 65536, the
+minimum being one short trailing chunk (8066, 57600, or 65536 itself). The
+seventh is the 12-chunk, 0.21 MB builtin corpus the harness self-checks on,
+which is a correctness fixture and not a throughput measurement. So no recorded
+run has put a mixed chunk-size distribution on the device at all, and the case
+for binning rests on a shape none of the numbers describes.
+
+Against that, perf passes 1-3 (issues #16, #21, #36, all in section 9) put the
+kernel at a structural local optimum and named the bottleneck: the redundant
+32-lane parse ceiling and latency-bound short-run copies. Dispatch is not on
+that list. Binning would add a device-side counting pass, a second kernel
+shape, and a second review surface on the sensitive kernel path, for a gain no
+measurement has located - which is what "formats over percentage points" ranks
+below the next format.
+
+**Falsification trigger.** Reopened when a recorded benchmark shows the
+dispatch losing on a mixed distribution: the same bytes measured at a mixed
+chunk-size distribution and at a uniform one, in the same container on the same
+GPU, with the mixed rung slower by more than the run-to-run spread both rungs
+report. Both numbers go in [docs/BENCHMARKS.md](BENCHMARKS.md) with the full
+methodology block before anything is designed. The asset-like benchmark corpus
+(the question still open above) is the natural source of such a distribution,
+so that measurement is the cheapest route to reopening this - and until it
+exists, this stays retired.
+
+This retires one of the two M2 questions. The corpus question above is the
+other and is still open, so the M2 list is not yet empty.
 
 Settled: test framework and oracle vendoring (section 5, via the #4 design
 review); dev-container image and CI toolchain pinning (issues #1/#3 -
@@ -651,8 +687,8 @@ per-chunk result semantics. **It does not.** Capacity stays the caller's
 bound, the declaration is validated against it, and no new status value is
 needed, so the ABI stays frozen. The public header will document the
 supported surface as raw Snappy streams; M3 ships the batch entry only, and
-generalizing the streaming path to Snappy is a separate scope decision
-already filed rather than smuggled in here.
+generalizing the streaming path to Snappy was a separate scope decision, filed
+rather than smuggled in here and now settled below.
 
 Today `include/cudec.h` declares no Snappy entry (`grep -c snappy
 include/cudec.h` reports 0). The batch-entry rung carries it.
@@ -667,6 +703,33 @@ ever comes back it is a host-side chunk walker plus a masked CRC-32C in
 front of the same raw batch entry, never kernel work. Recorded here so the
 question stays settled instead of being re-argued each time the format is
 named.
+
+### The streaming entry: deferred, with the trigger
+
+The scope decision this design filed rather than smuggled in (issue #120) is
+settled the same way the framing format above is: **cudec does not offer a
+Snappy streaming entry, and no milestone carries one.** Not "not in M3" - not
+scheduled at all, until something below fires.
+
+The reason is that the demand is not there and the cost is not zero. The
+streaming path exists for LZ4 because the frame format is a stream of blocks a
+consumer meets incrementally. Raw Snappy is what the data-plane consumers
+actually store - LevelDB frames raw per block, Parquet stores raw pages - and a
+consumer holding a raw page holds all of it. The framing format, which is the
+shape that would make an incremental entry mean something, is out of scope
+above on its own evidence. Building a resumable Snappy context now would mean
+carrying a second streaming state machine, its own geometry refusals and its
+own device gate set, for a caller nobody has named.
+
+Nothing in the parser blocks it. The seam contract is already incremental -
+`SnappyParser::Next` with the lazy preamble - so this is a decision about what
+to build, not about what is possible.
+
+**Trigger.** Reopened by a named consumer with a stream it cannot hold whole:
+an issue that says which system produces the stream, why the raw batch entry
+does not serve it, and what the chunking looks like. A request for symmetry
+with the LZ4 streaming context is not that trigger, because symmetry is the
+argument this paragraph is refusing.
 
 ### The locks that keep this from drifting
 
