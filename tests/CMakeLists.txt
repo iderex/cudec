@@ -344,6 +344,15 @@ target_include_directories(batch_limit_parity
 cudec_add_test(frame_host_negative SOURCES frame_host_negative.cpp)
 target_include_directories(frame_host_negative
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The GDeflate TileStream envelope's reject branches (issue #174), the same
+# shape and for the same reason: src/tilestream.h is pure host arithmetic over
+# a byte range, so the whole container ladder is gated on the GPU-less runner
+# and gets the ASan/UBSan pass over the pointer arithmetic a hostile envelope
+# drives. No oracle: this is fail-closed coverage, and parity against the real
+# DirectStorage vectors is issues #169 and #179.
+cudec_add_test(tilestream_host_negative SOURCES tilestream_host_negative.cpp)
+target_include_directories(tilestream_host_negative
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # Termination as a tested invariant (issue #72): the parser's liveness
 # contract asserted per call over the truncation ladder, the mutant corpus,
 # the crafted hostile corpus, and the frame block-table walk - all of it
