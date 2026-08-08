@@ -171,6 +171,21 @@ struct Lz4Parser {
             if (src_pos + literals_len != src_size) {
                 return CUDEC_ERR_CORRUPT_INPUT;
             }
+            /* liblz4's empty-output-buffer early-out, mirrored (issue #315).
+             * With dstCapacity == 0 the reference accepts exactly one stream,
+             * the single byte 0x00, and rejects every other input before it
+             * looks at the token. Reaching this line with dst_capacity == 0
+             * means literals_len == 0 (the capacity check above admits no
+             * other length) and exact consumption of a one-byte stream, so
+             * `token` IS that byte: without this, every token whose literal
+             * nibble is zero satisfies the terminal rule vacuously and
+             * fifteen streams the reference rejects are accepted here. Only
+             * capacity zero is affected - at every other capacity liblz4
+             * ignores a terminal token's match nibble exactly as this parser
+             * does, so no other acceptance moves. */
+            if (dst_capacity == 0 && token != 0) {
+                return CUDEC_ERR_CORRUPT_INPUT;
+            }
             sequence->literals_src = src_pos;
             sequence->literals_dst = dst_pos;
             sequence->literals_len = literals_len;

@@ -233,6 +233,62 @@ int SweepExtensionReadBound(size_t* accepts, size_t* rejects) {
     return 0;
 }
 
+/* The zero-capacity family (issue #315, found by the differential fuzz target
+ * of #140). liblz4 handles an empty output buffer in its own early-out and
+ * accepts exactly one stream there, the single byte 0x00; the parser's
+ * terminal rule is satisfied vacuously by every token whose literal nibble is
+ * zero, so before the guard in src/lz4_block.h it accepted 0x01 through 0x0F
+ * as well - fifteen streams the reference rejects.
+ *
+ * All 256 one-byte streams, both directions, and the direction that matters is
+ * exact here rather than a subset: no match can be reached at capacity zero
+ * (any literal length above zero is refused by the capacity check, so the run
+ * is always terminal), which is why the offset==0 strictness cannot appear in
+ * this family and equality of the two verdicts is the right assertion.
+ * Deleting the guard reds this sweep. */
+int SweepZeroCapacity(size_t* accepts, size_t* rejects) {
+    for (int token = 0; token < 256; token++) {
+        const std::vector<unsigned char> s = {
+            static_cast<unsigned char>(token)};
+        std::vector<unsigned char> twin_out;
+        const cudec_status twin = TwinDecode(s, 0, &twin_out);
+        const bool oracle_ok = OracleDecodesAtZeroCapacity(s);
+        REQUIRE_CTX((twin == CUDEC_OK) == oracle_ok,
+                    "zero-capacity parity: token 0x%02X (twin %d, oracle %d)",
+                    token, static_cast<int>(twin),
+                    static_cast<int>(oracle_ok));
+        if (twin == CUDEC_OK) {
+            REQUIRE_CTX(token == 0x00, "zero-capacity accept: token 0x%02X",
+                        token);
+            REQUIRE_CTX(twin_out.empty(),
+                        "zero-capacity output: token 0x%02X", token);
+            (*accepts)++;
+        } else {
+            REQUIRE_CTX(twin == CUDEC_ERR_CORRUPT_INPUT ||
+                            twin == CUDEC_ERR_OUTPUT_TOO_SMALL,
+                        "zero-capacity reject status %d: token 0x%02X",
+                        static_cast<int>(twin), token);
+            (*rejects)++;
+        }
+    }
+    /* A longer stream at capacity zero stays refused on both sides whatever
+     * its first byte is: the reference's early-out takes only a one-byte
+     * input, and the parser's exact-consumption check takes only a one-byte
+     * terminal run. */
+    for (int token = 0; token < 256; token++) {
+        const std::vector<unsigned char> s = {
+            static_cast<unsigned char>(token), 0x00};
+        std::vector<unsigned char> twin_out;
+        REQUIRE_CTX(TwinDecode(s, 0, &twin_out) != CUDEC_OK,
+                    "zero-capacity two-byte accept: token 0x%02X", token);
+        REQUIRE_CTX(!OracleDecodesAtZeroCapacity(s),
+                    "zero-capacity two-byte oracle accept: token 0x%02X",
+                    token);
+        (*rejects)++;
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -326,6 +382,14 @@ int main() {
     REQUIRE(ext_accepts > 0);
     REQUIRE(ext_rejects > 0);
 
+    /* The empty-output-buffer family, swept exhaustively over the token
+     * (issue #315). Exactly one of the 256 one-byte streams may be accepted. */
+    size_t zerocap_accepts = 0;
+    size_t zerocap_rejects = 0;
+    REQUIRE(SweepZeroCapacity(&zerocap_accepts, &zerocap_rejects) == 0);
+    REQUIRE(zerocap_accepts == 1);
+    REQUIRE(zerocap_rejects == 511);
+
     /* One crafted negative per ladder branch that liblz4 also rejects:
      * pins the twin's specific status AND that the stream is malformed. */
     const auto crafted = MakeCraftedNegatives();
@@ -405,9 +469,11 @@ int main() {
                 "spec-invalid input); %zu crafted negatives; last-5 sweep "
                 "%zu accept / %zu reject; empty block, offset==0 "
                 "divergence, SIZE_MAX and beyond-convention capacity "
-                "pinned; ext-read sweep %zu accept / %zu reject\n",
+                "pinned; ext-read sweep %zu accept / %zu reject; "
+                "zero-capacity sweep %zu accept / %zu reject\n",
                 fixtures.size(), mutant_total, rejected_total,
                 stricter_than_oracle, crafted.size(), last5_accepts,
-                last5_rejects, ext_accepts, ext_rejects);
+                last5_rejects, ext_accepts, ext_rejects, zerocap_accepts,
+                zerocap_rejects);
     return 0;
 }
