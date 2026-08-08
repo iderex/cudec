@@ -41,6 +41,7 @@
 #define CUDEC_ZSTD_FSE_H
 
 #include "cudec.h"
+#include "zstd_bitstream.h"
 
 #include <stdint.h>
 
@@ -128,6 +129,15 @@ enum ZstdFseReject {
      * Unreachable from a description this header decoded; reachable, and
      * reached by the twin, from a caller that builds a vector by hand. */
     kZstdFseRejectBuildCountsNotNormalized,
+    /* Core side: the stream held fewer bits than the two initial states need,
+     * or a zero-bit cell was reached through a reader that never started. */
+    kZstdFseRejectStateInitTruncated,
+    /* Core side: a state landed outside the table. Well-formed tables cannot
+     * produce one - the successor of every cell is inside - so this refuses a
+     * cell array that came from somewhere else. */
+    kZstdFseRejectStateOutOfTable,
+    /* Core side: the caller's capacity filled before the bits ran out. */
+    kZstdFseRejectOutputFull,
     kZstdFseRejectCount
 };
 
@@ -516,6 +526,153 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdFseBuildDTable(
             static_cast<uint16_t>((next_state << bits) - table_size);
     }
     return CUDEC_OK;
+}
+
+/* The decode cores that walk a built table over a backward bitstream.
+ *
+ * A state is an index into the table. Initialising it reads accuracy_log
+ * bits; decoding a symbol reads the cell's own bit count and lands on the
+ * cell's successor. The emit precedes the update, which is the whole of the
+ * ordering: a decoder that updates first emits the symbol of a cell the
+ * encoder never wrote.
+ *
+ * WHERE THE STREAM ENDS IS DECIDED BY THE BITS, not by a length. An FSE
+ * stream carries no symbol count: the encoder wrote exactly the bits the
+ * decoder needs for every update except the last, so the run ends when an
+ * update would need more bits than are left. The reference reaches the same
+ * point from the other side, by noticing after the fact that its read pointer
+ * passed the start of the buffer (FSE_decompress_usingDTable_generic in
+ * lib/common/fse_decompress.c), and emitting one final symbol from the other
+ * state. This unit refuses to read the bits instead of reading them and
+ * noticing, which is the same stopping point and no fabricated bit.
+ *
+ * THE OUTPUT BOUND IS NOT DECORATION. A table whose cells all read zero bits
+ * is well formed - one symbol holding the whole table produces exactly that -
+ * and over such a table the bit budget never runs down. The caller's capacity
+ * is what ends the run there, and reaching it is a refusal rather than a
+ * truncated answer. */
+struct ZstdFseState {
+    uint32_t value;
+};
+
+CUDEC_HOST_DEVICE inline cudec_status ZstdFseInitState(ZstdBitReader* reader,
+                                                       unsigned accuracy_log,
+                                                       ZstdFseState* state,
+                                                       ZstdFseReject* reject) {
+    uint64_t bits = 0;
+    if (reader->ReadBits(accuracy_log, &bits) != CUDEC_OK) {
+        return ZstdFseRefuse(kZstdFseRejectStateInitTruncated,
+                             CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    state->value = static_cast<uint32_t>(bits);
+    return CUDEC_OK;
+}
+
+/* One symbol. `spent` comes back true when the update would have needed more
+ * bits than the stream holds: the symbol just emitted is real and the state
+ * is left where it was, and the caller stops after taking one more symbol
+ * from its other state.
+ *
+ * `table_size` is checked against the state on every call rather than trusted
+ * from the build. A cell array is the one thing here a caller can hand in
+ * from anywhere, and an index into it that came out of a stream is exactly
+ * the read this project does not allow to go unbounded. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdFseNextSymbol(
+    ZstdBitReader* reader, const ZstdFseCell* cells, uint32_t table_size,
+    ZstdFseState* state, uint8_t* symbol, bool* spent,
+    ZstdFseReject* reject) {
+    *spent = false;
+    if (state->value >= table_size) {
+        return ZstdFseRefuse(kZstdFseRejectStateOutOfTable,
+                             CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    const ZstdFseCell cell = cells[state->value];
+    *symbol = cell.symbol;
+    if (cell.nb_bits > reader->BitsRemaining()) {
+        *spent = true;
+        return CUDEC_OK;
+    }
+    uint64_t bits = 0;
+    const cudec_status status = reader->ReadBits(cell.nb_bits, &bits);
+    if (status != CUDEC_OK) {
+        /* Reachable: a reader whose Start never succeeded reports no bits
+         * remaining and refuses a zero-width read, so the check above lets a
+         * zero-bit cell through to here. */
+        return ZstdFseRefuse(kZstdFseRejectStateInitTruncated, status, reject);
+    }
+    state->value = cell.new_state + static_cast<uint32_t>(bits);
+    return CUDEC_OK;
+}
+
+/* The two-state interleaved run, which is the shape the Huffman weight
+ * description is written in: two states initialised in order from one stream,
+ * symbols taken from them alternately, and the pair of final symbols taken
+ * once the bits run out.
+ *
+ * The reader must already have been started. Symbols land in `out` and the
+ * count comes back in `out_count`. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdFseDecode2State(
+    ZstdBitReader* reader, const ZstdFseCell* cells, uint32_t table_size,
+    unsigned accuracy_log, uint8_t* out, uint32_t out_capacity,
+    uint32_t* out_count, ZstdFseReject* reject) {
+    *out_count = 0;
+    if (reject != 0) {
+        *reject = kZstdFseRejectNone;
+    }
+    if (cells == 0 || out == 0 || accuracy_log < kZstdFseMinAccuracyLog ||
+        accuracy_log > kZstdFseMaxAccuracyLog ||
+        table_size != (1u << accuracy_log)) {
+        return ZstdFseRefuse(kZstdFseRejectBadRequest,
+                             CUDEC_ERR_INVALID_ARGUMENT, reject);
+    }
+    ZstdFseState first;
+    ZstdFseState second;
+    cudec_status status =
+        ZstdFseInitState(reader, accuracy_log, &first, reject);
+    if (status != CUDEC_OK) {
+        return status;
+    }
+    status = ZstdFseInitState(reader, accuracy_log, &second, reject);
+    if (status != CUDEC_OK) {
+        return status;
+    }
+
+    uint32_t produced = 0;
+    /* Counted, and the bound is the caller's capacity: every iteration writes
+     * one symbol, so a table over which the bit budget never runs down ends
+     * here rather than spinning. */
+    for (uint32_t step = 0; step < out_capacity; step++) {
+        ZstdFseState* active = (step % 2u) == 0 ? &first : &second;
+        ZstdFseState* other = (step % 2u) == 0 ? &second : &first;
+        uint8_t symbol = 0;
+        bool spent = false;
+        status = ZstdFseNextSymbol(reader, cells, table_size, active, &symbol,
+                                   &spent, reject);
+        if (status != CUDEC_OK) {
+            return status;
+        }
+        out[produced] = symbol;
+        produced++;
+        if (!spent) {
+            continue;
+        }
+        /* The last update could not be paid for, so the run ends with one
+         * more symbol from the other state - the reference's own tail. */
+        if (produced == out_capacity) {
+            return ZstdFseRefuse(kZstdFseRejectOutputFull,
+                                 CUDEC_ERR_OUTPUT_TOO_SMALL, reject);
+        }
+        if (other->value >= table_size) {
+            return ZstdFseRefuse(kZstdFseRejectStateOutOfTable,
+                                 CUDEC_ERR_CORRUPT_INPUT, reject);
+        }
+        out[produced] = cells[other->value].symbol;
+        produced++;
+        *out_count = produced;
+        return CUDEC_OK;
+    }
+    return ZstdFseRefuse(kZstdFseRejectOutputFull, CUDEC_ERR_OUTPUT_TOO_SMALL,
+                         reject);
 }
 
 }  // namespace cudec_detail

@@ -323,7 +323,10 @@ target_include_directories(zstd_frame_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(zstd_frame_twin PRIVATE ZSTD_STATIC_LINKING_ONLY)
 # The Zstd FSE table description decode and the table it builds (issue #217),
-# held to FSE_readNCount and FSE_buildDTable_wksp cell by cell. Host-side and
+# held to FSE_readNCount and FSE_buildDTable_wksp cell by cell, plus the state
+# cores that walk that table over a backward bitstream (issue #219), held to
+# the reference's own decode of streams its compress pipeline wrote and of the
+# Huffman weight descriptions the corpus carries. Host-side and
 # GPU-less. It links zstd_full alone for the reason zstd_oracle_smoke gives
 # above and because FSE_writeNCount lives on the compress side: the test
 # writes the descriptions its negatives are mutations of, and proves its own

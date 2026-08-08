@@ -1,10 +1,11 @@
-/* The CPU twin of the Zstd FSE table description decode and the decoding
- * table built from it (src/zstd_fse.h), issue #217. The sibling of
+/* The CPU twin of the Zstd FSE unit (src/zstd_fse.h): the table description
+ * decode and the table built from it (issue #217), and the state cores that
+ * walk that table over a backward bitstream (issue #219). The sibling of
  * tests/parser_twin.cpp, tests/snappy_parser_twin.cpp and
  * tests/zstd_bitstream_twin.cpp: the single-source unit executed on the host,
  * on the GPU-less CI runner, and held to the pinned reference's verdicts.
  *
- * Three proofs, and they are different in kind.
+ * Five proofs, and they are different in kind.
  *
  * THE DESCRIPTIONS ARE BUILT BY AN ENCODER THIS FILE OWNS, and the first
  * thing the test does is prove that encoder byte for byte against
@@ -36,7 +37,18 @@
  * descriptions all come back corruption_detected, measured on #189 - so a
  * negative here asserts that the oracle refused and that the twin refused
  * through the rung the negative was written for. Reading a reason out of the
- * oracle's code would be reading something it does not report. */
+ * oracle's code would be reading something it does not report.
+ *
+ * THE STATE CORES are proven twice over. Once against a table this file
+ * writes by hand, where every cell names itself and lands on the state the
+ * next bits spell, so the expected symbol sequence is the stream's successive
+ * bit groups and a reader checks it by reading the bit string - that isolates
+ * the emit-before-update ordering and the state arithmetic from the table
+ * builder. And once against the reference end to end, over streams the
+ * reference's own compress pipeline wrote and over the Huffman weight
+ * descriptions the #185 corpus really carries, where the whole chain -
+ * description, table, two-state run, tail rule - has to agree symbol for
+ * symbol with FSE_decompress. */
 #include "require.h"
 #include "zstd_corpus.h"
 #include "zstd_fse.h"
@@ -368,6 +380,173 @@ bool ParityHolds(const unsigned char* src, size_t size,
     }
     *cells_compared += reference.size();
     return true;
+}
+
+/* An FSE-compressed buffer decoded the way the reference's FSE_decompress
+ * decodes one: the NCount description, the table it describes, then the
+ * two-state interleaved run over everything after it. This is the whole of
+ * the unit under test wired together in the order a caller uses it. */
+bool TwinFseDecompress(const unsigned char* src, size_t size,
+                       std::vector<uint8_t>* out,
+                       cudec_detail::ZstdFseReject* rung) {
+    TwinStorage storage;
+    unsigned max_symbol = 0;
+    unsigned accuracy_log = 0;
+    uint64_t consumed = 0;
+    if (cudec_detail::ZstdFseReadNCount(
+            src, size, cudec_detail::kZstdFseMaxSymbolValue,
+            cudec_detail::kZstdFseMaxAccuracyLog, storage.counts.data(),
+            &max_symbol, &accuracy_log, &consumed, rung) != CUDEC_OK) {
+        return false;
+    }
+    const uint32_t table_size = 1u << accuracy_log;
+    if (cudec_detail::ZstdFseBuildDTable(
+            storage.counts.data(), max_symbol, accuracy_log,
+            storage.cells.data(), static_cast<uint32_t>(storage.cells.size()),
+            storage.symbol_next.data(), rung) != CUDEC_OK) {
+        return false;
+    }
+    cudec_detail::ZstdBitReader reader{src + consumed,
+                                       size - static_cast<size_t>(consumed)};
+    if (reader.Start() != CUDEC_OK) {
+        return false;
+    }
+    out->assign(1u << 16, 0);
+    uint32_t produced = 0;
+    if (cudec_detail::ZstdFseDecode2State(
+            &reader, storage.cells.data(), table_size, accuracy_log,
+            out->data(), static_cast<uint32_t>(out->size()), &produced,
+            rung) != CUDEC_OK) {
+        out->clear();
+        return false;
+    }
+    out->resize(produced);
+    return true;
+}
+
+/* An FSE stream written by the reference's own compress pipeline. There is no
+ * one-call FSE_compress in this release, so the four steps are spelled out:
+ * the histogram, the normalized distribution, its description, and the
+ * two-state interleaved body. That is the object the weight description in a
+ * real frame is, and it is what the cores are then held to. Empty when the
+ * source has fewer than two distinct symbols, which the caller reports. */
+Bytes ReferenceFseCompress(const Bytes& source) {
+    unsigned histogram[256] = {0};
+    for (size_t i = 0; i < source.size(); i++) {
+        histogram[source[i]]++;
+    }
+    unsigned max_symbol = 0;
+    unsigned distinct = 0;
+    for (unsigned symbol = 0; symbol < 256; symbol++) {
+        if (histogram[symbol] != 0) {
+            max_symbol = symbol;
+            distinct++;
+        }
+    }
+    if (distinct < 2) {
+        return Bytes();
+    }
+    const unsigned table_log =
+        FSE_optimalTableLog(12, source.size(), max_symbol);
+    std::vector<short> norm(max_symbol + 1, 0);
+    if (FSE_isError(FSE_normalizeCount(norm.data(), table_log, histogram,
+                                       source.size(), max_symbol, 0))) {
+        return Bytes();
+    }
+    Bytes out(source.size() + 4096, 0);
+    const size_t header = FSE_writeNCount(out.data(), out.size(), norm.data(),
+                                          max_symbol, table_log);
+    if (FSE_isError(header)) {
+        return Bytes();
+    }
+    std::vector<FSE_CTable> ctable(
+        FSE_CTABLE_SIZE_U32(table_log, max_symbol), 0);
+    std::vector<unsigned> work(
+        FSE_BUILD_CTABLE_WORKSPACE_SIZE_U32(max_symbol, table_log) + 8, 0);
+    if (FSE_isError(FSE_buildCTable_wksp(ctable.data(), norm.data(),
+                                         max_symbol, table_log, work.data(),
+                                         work.size() * sizeof(unsigned)))) {
+        return Bytes();
+    }
+    const size_t body = FSE_compress_usingCTable(
+        out.data() + header, out.size() - header, source.data(),
+        source.size(), ctable.data());
+    if (FSE_isError(body) || body == 0) {
+        return Bytes();
+    }
+    out.resize(header + body);
+    return out;
+}
+
+/* The reference's own decode of such a stream. */
+bool ReferenceFseDecompress(const unsigned char* src, size_t size,
+                            std::vector<uint8_t>* out) {
+    std::vector<unsigned> work(
+        FSE_DECOMPRESS_WKSP_SIZE_U32(12, FSE_MAX_SYMBOL_VALUE) + 8, 0);
+    out->assign(1u << 16, 0);
+    const size_t produced = FSE_decompress_wksp_bmi2(
+        out->data(), out->size(), src, size, 12, work.data(),
+        work.size() * sizeof(unsigned), 0);
+    if (FSE_isError(produced)) {
+        out->clear();
+        return false;
+    }
+    out->resize(produced);
+    return true;
+}
+
+/* A table this file writes rather than builds, so the cores are proven
+ * without the table builder in the loop. Every cell names itself as its own
+ * symbol and lands on the state the next bits spell, so a decode over it is
+ * literally the stream's successive accuracy-log-wide groups - an expectation
+ * a reader checks by reading the bit string, not by running the code.
+ *
+ * It is not a distribution any encoder would emit, and it does not need to
+ * be: what it isolates is the emit-before-update ordering and the state
+ * arithmetic, which are the two things a table-driven check cannot separate. */
+std::vector<cudec_detail::ZstdFseCell> MakeSelfNamingTable(
+    unsigned accuracy_log) {
+    const size_t table_size = static_cast<size_t>(1u) << accuracy_log;
+    std::vector<cudec_detail::ZstdFseCell> cells(table_size);
+    for (size_t cell = 0; cell < table_size; cell++) {
+        cells[cell].symbol = static_cast<uint8_t>(cell);
+        cells[cell].nb_bits = static_cast<uint8_t>(accuracy_log);
+        cells[cell].new_state = 0;
+    }
+    return cells;
+}
+
+/* A backward bitstream carrying the given fixed-width groups in consumption
+ * order, and nothing else.
+ *
+ * The final byte is 0x01, whose highest set bit is bit zero, so it
+ * contributes the start marker and no data - which makes the live bit count
+ * exactly eight times the bytes before it. Consumption then walks those bytes
+ * downwards from the last, most significant bit first, which is where each
+ * group's own most significant bit goes. The total width must land on a byte
+ * boundary; a caller that asks otherwise gets an empty stream. */
+Bytes BackwardStreamOfGroups(const uint8_t* groups, size_t count,
+                             unsigned width) {
+    const size_t bits = count * width;
+    if (bits == 0 || bits % 8 != 0) {
+        return Bytes();
+    }
+    Bytes stream(bits / 8 + 1, 0);
+    stream.back() = 0x01;
+    const size_t last_data = stream.size() - 2;
+    size_t index = 0;
+    for (size_t group = 0; group < count; group++) {
+        for (unsigned bit = 0; bit < width; bit++) {
+            const unsigned value =
+                (groups[group] >> (width - 1u - bit)) & 1u;
+            if (value != 0) {
+                stream[last_data - index / 8] = static_cast<unsigned char>(
+                    stream[last_data - index / 8] | (1u << (7 - index % 8)));
+            }
+            index++;
+        }
+    }
+    return stream;
 }
 
 /* The per-field bounds, in the order the three descriptions appear inside a
@@ -744,7 +923,250 @@ int main() {
         REQUIRE(rung == cudec_detail::kZstdFseRejectBadRequest);
     }
 
-    /* 5. Every rung named by a negative written to reach it, walked rather
+    /* 5. The state cores over a table this file writes by hand, so the
+     * ordering and the state arithmetic are proven with the table builder out
+     * of the loop.
+     *
+     * Every cell of the table names itself and reads accuracy_log bits into a
+     * successor of zero, so the decode is exactly the stream's successive
+     * five-bit groups in consumption order. The stream below carries eight of
+     * them, spelled out here rather than computed:
+     *
+     *     00001 00010 00011 00100 00101 00110 00111 01000
+     *
+     * The first two are the initial states, and the tail rule is what makes
+     * the last two come out: after the sixth group there are no bits left for
+     * an update, so the symbol standing in the other state is taken and the
+     * run stops. Eight groups in, eight symbols out. */
+    {
+        const unsigned kLog = 5;
+        const uint8_t groups[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        const Bytes stream =
+            BackwardStreamOfGroups(groups, sizeof(groups), kLog);
+        const std::vector<cudec_detail::ZstdFseCell> cells =
+            MakeSelfNamingTable(kLog);
+        cudec_detail::ZstdBitReader reader{stream.data(), stream.size()};
+        REQUIRE(reader.Start() == CUDEC_OK);
+        REQUIRE(reader.BitsRemaining() == sizeof(groups) * kLog);
+        uint8_t out[16] = {0};
+        uint32_t produced = 0;
+        REQUIRE(cudec_detail::ZstdFseDecode2State(
+                    &reader, cells.data(), 1u << kLog, kLog, out,
+                    static_cast<uint32_t>(sizeof(out)), &produced, &rung) ==
+                CUDEC_OK);
+        REQUIRE_CTX(produced == sizeof(groups), "produced %u symbols",
+                    produced);
+        for (size_t i = 0; i < sizeof(groups); i++) {
+            REQUIRE_CTX(out[i] == groups[i], "symbol %zu is %u, want %u", i,
+                        out[i], groups[i]);
+        }
+        REQUIRE(reader.AtEnd());
+    }
+
+    /* 6. The cores against the reference over real FSE streams: the pinned
+     * compressor writes them, FSE_decompress reads them, and the unit under
+     * test reads the same bytes. This is the whole chain - description,
+     * table, two-state run - held to the reference's own answer.
+     *
+     * The sources are shaped to move the accuracy log and the alphabet: a
+     * heavily skewed one, a two-symbol one, a spread one, and a text-like
+     * one. FSE_compress declines a source it cannot beat, which is reported
+     * rather than skipped silently. */
+    {
+        size_t streams_compared = 0;
+        size_t symbols_compared = 0;
+        for (unsigned shape = 0; shape < 4; shape++) {
+            Bytes source(4096, 0);
+            uint32_t seed = 0x9E3779B9u + shape;
+            for (size_t i = 0; i < source.size(); i++) {
+                seed = seed * 1664525u + 1013904223u;
+                const unsigned draw = (seed >> 16) & 0xFFu;
+                if (shape == 0) {
+                    source[i] = static_cast<unsigned char>(draw < 200 ? 7
+                                                           : draw % 5u);
+                } else if (shape == 1) {
+                    source[i] = static_cast<unsigned char>(draw < 128 ? 0 : 1);
+                } else if (shape == 2) {
+                    source[i] = static_cast<unsigned char>(draw % 60u);
+                } else {
+                    source[i] = static_cast<unsigned char>(
+                        draw < 180 ? 'a' + (draw % 12u) : ' ');
+                }
+            }
+            const Bytes packed = ReferenceFseCompress(source);
+            REQUIRE_CTX(!packed.empty(),
+                        "shape %u: the reference's compress pipeline produced "
+                        "no stream, so there is nothing to compare over",
+                        shape);
+
+            std::vector<uint8_t> reference;
+            REQUIRE_CTX(ReferenceFseDecompress(packed.data(), packed.size(),
+                                               &reference),
+                        "shape %u: the reference refused its own stream",
+                        shape);
+            const size_t reference_size = reference.size();
+
+            std::vector<uint8_t> mine;
+            cudec_detail::ZstdFseReject core_rung =
+                cudec_detail::kZstdFseRejectNone;
+            REQUIRE_CTX(TwinFseDecompress(packed.data(), packed.size(), &mine,
+                                          &core_rung),
+                        "shape %u: the twin refused (rung %d)", shape,
+                        static_cast<int>(core_rung));
+            REQUIRE_CTX(mine.size() == reference_size,
+                        "shape %u: %zu symbols against the reference's %zu",
+                        shape, mine.size(), reference_size);
+            REQUIRE(equal_bytes(mine.data(), reference.data(), mine.size()));
+            /* And against the source, which is what the round trip is worth
+             * saying out loud: the symbols are the original bytes. */
+            REQUIRE(mine.size() == source.size());
+            REQUIRE(equal_bytes(mine.data(), source.data(), mine.size()));
+            streams_compared++;
+            symbols_compared += mine.size();
+        }
+        REQUIRE(streams_compared == 4);
+        std::printf("      %zu FSE streams, %zu symbols, against "
+                    "FSE_decompress\n",
+                    streams_compared, symbols_compared);
+    }
+
+    /* 7. The weight descriptions the #185 corpus actually carries. A
+     * Compressed literals section opens with the Huffman tree description,
+     * and a first byte below 128 says the weights are an FSE stream of that
+     * many bytes - the same object as the streams above, reached where the
+     * format really puts it. */
+    {
+        size_t weight_streams = 0;
+        for (const ZstdFixture& fixture : fixtures) {
+            ZstdFrameShape shape;
+            std::string why;
+            REQUIRE(ParseZstdFrameShape(fixture.compressed, &shape, &why));
+            for (const ZstdBlockShape& block : shape.blocks) {
+                if (block.block_type != kZstdBlockCompressed ||
+                    block.literals_type != kZstdLiteralsCompressed ||
+                    block.literals_payload_size < 2) {
+                    continue;
+                }
+                const unsigned char* payload =
+                    fixture.compressed.data() + block.literals_payload_offset;
+                const unsigned header = payload[0];
+                if (header >= 128) {
+                    /* The direct weight table, four bits a weight, which is
+                     * not an FSE stream and is not this unit's business. */
+                    continue;
+                }
+                REQUIRE(header + 1u <= block.literals_payload_size);
+                std::vector<uint8_t> reference;
+                REQUIRE_CTX(ReferenceFseDecompress(payload + 1, header,
+                                                   &reference),
+                            "%s: the reference refused a weight stream out of "
+                            "its own frame",
+                            fixture.name.c_str());
+                const size_t reference_size = reference.size();
+                std::vector<uint8_t> mine;
+                cudec_detail::ZstdFseReject core_rung =
+                    cudec_detail::kZstdFseRejectNone;
+                REQUIRE_CTX(TwinFseDecompress(payload + 1, header, &mine,
+                                              &core_rung),
+                            "%s: the twin refused a weight stream (rung %d)",
+                            fixture.name.c_str(),
+                            static_cast<int>(core_rung));
+                REQUIRE_CTX(mine.size() == reference_size,
+                            "%s: %zu weights against the reference's %zu",
+                            fixture.name.c_str(), mine.size(), reference_size);
+                REQUIRE(equal_bytes(mine.data(), reference.data(),
+                                    mine.size()));
+                weight_streams++;
+            }
+        }
+        REQUIRE_CTX(weight_streams > 0,
+                    "no fixture carried an FSE-coded Huffman weight "
+                    "description - this half of the proof would pass "
+                    "vacuously");
+        std::printf("      %zu Huffman weight streams out of the corpus\n",
+                    weight_streams);
+    }
+
+    /* 8. The cores' own negatives. */
+    {
+        const unsigned kLog = 5;
+        const std::vector<cudec_detail::ZstdFseCell> cells =
+            MakeSelfNamingTable(kLog);
+        uint8_t out[16] = {0};
+        uint32_t produced = 0;
+
+        /* A table size that is not the accuracy log's. */
+        const uint8_t plain[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        const Bytes ordinary =
+            BackwardStreamOfGroups(plain, sizeof(plain), kLog);
+        cudec_detail::ZstdBitReader reader{ordinary.data(), ordinary.size()};
+        REQUIRE(reader.Start() == CUDEC_OK);
+        REQUIRE(cudec_detail::ZstdFseDecode2State(
+                    &reader, cells.data(), (1u << kLog) - 1u, kLog, out,
+                    static_cast<uint32_t>(sizeof(out)), &produced, &rung) !=
+                CUDEC_OK);
+        REQUIRE(rung == cudec_detail::kZstdFseRejectBadRequest);
+        CoverRung(rung);
+
+        /* Fewer bits than the two initial states need: nine live bits where
+         * ten are wanted. */
+        {
+            const Bytes stream = {0xFF, 0x02};
+            cudec_detail::ZstdBitReader thin{stream.data(), stream.size()};
+            REQUIRE(thin.Start() == CUDEC_OK);
+            REQUIRE(thin.BitsRemaining() == 9);
+            REQUIRE(cudec_detail::ZstdFseDecode2State(
+                        &thin, cells.data(), 1u << kLog, kLog, out,
+                        static_cast<uint32_t>(sizeof(out)), &produced,
+                        &rung) != CUDEC_OK);
+            REQUIRE(rung == cudec_detail::kZstdFseRejectStateInitTruncated);
+            CoverRung(rung);
+        }
+
+        /* A cell array that lands a state outside its own table. No table
+         * this tree builds can do it, which is why the array is written here
+         * instead of built. */
+        {
+            std::vector<cudec_detail::ZstdFseCell> broken = cells;
+            broken[1].new_state = static_cast<uint16_t>(1u << kLog);
+            const uint8_t groups[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            const Bytes stream =
+                BackwardStreamOfGroups(groups, sizeof(groups), kLog);
+            cudec_detail::ZstdBitReader walk{stream.data(), stream.size()};
+            REQUIRE(walk.Start() == CUDEC_OK);
+            REQUIRE(cudec_detail::ZstdFseDecode2State(
+                        &walk, broken.data(), 1u << kLog, kLog, out,
+                        static_cast<uint32_t>(sizeof(out)), &produced,
+                        &rung) != CUDEC_OK);
+            REQUIRE(rung == cudec_detail::kZstdFseRejectStateOutOfTable);
+            CoverRung(rung);
+        }
+
+        /* A table whose every cell reads no bits at all. It is well formed -
+         * one symbol holding the whole table produces exactly this - and the
+         * bit budget never runs down over it, so the capacity is what ends
+         * the run, and ending there is a refusal. */
+        {
+            std::vector<cudec_detail::ZstdFseCell> stuck = cells;
+            for (size_t cell = 0; cell < stuck.size(); cell++) {
+                stuck[cell].nb_bits = 0;
+                stuck[cell].new_state = 0;
+            }
+            const uint8_t groups[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            const Bytes stream =
+                BackwardStreamOfGroups(groups, sizeof(groups), kLog);
+            cudec_detail::ZstdBitReader walk{stream.data(), stream.size()};
+            REQUIRE(walk.Start() == CUDEC_OK);
+            REQUIRE(cudec_detail::ZstdFseDecode2State(
+                        &walk, stuck.data(), 1u << kLog, kLog, out,
+                        static_cast<uint32_t>(sizeof(out)), &produced,
+                        &rung) != CUDEC_OK);
+            REQUIRE(rung == cudec_detail::kZstdFseRejectOutputFull);
+            CoverRung(rung);
+        }
+    }
+
+    /* 9. Every rung named by a negative written to reach it, walked rather
      * than restated: a rung added to the unit with none behind it lands here
      * as a hole with its number on it. */
     for (int declared = cudec_detail::kZstdFseRejectNone + 1;
