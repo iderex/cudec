@@ -7,12 +7,13 @@
  * (tests/parser_twin.cpp pins that divergence); asserting it would red on
  * legitimate strictness.
  *
- * Both sides get a tight allocation for the stream and for the output, so an
- * over-read past the last stream byte or an over-write past the capacity lands
- * in an ASan redzone rather than in vector slack.
- */
+ * The twin side is tests/lz4_twin.h - the same driver tests/parser_twin.cpp
+ * runs, not a second copy of it, so this target cannot go green about a
+ * parser execution the test net never performs. Both sides get tight
+ * allocations, so an over-read past the last stream byte or a write past the
+ * declared capacity lands in an ASan redzone rather than in slack. */
 #include "cudec.h"
-#include "lz4_block.h"
+#include "lz4_twin.h"
 
 #include "lz4.h"
 
@@ -24,8 +25,10 @@
 
 namespace {
 
-/* Ceilings, so the fuzzer explores the parser instead of the allocator. */
-constexpr size_t kMaxCapacity = 1u << 16;
+/* Ceilings, so the fuzzer explores the parser instead of the allocator. The
+ * capacity ceiling is what two header bytes can express; the stream ceiling
+ * is set below libFuzzer's own -max_len so a length-prefix blow-up cannot
+ * turn a corpus entry into an allocation. */
 constexpr size_t kMaxStream = 1u << 14;
 
 struct Decoded {
@@ -34,55 +37,25 @@ struct Decoded {
     std::unique_ptr<unsigned char[]> bytes; /* tight: exactly `capacity` */
 };
 
-/* Sequential reference execution of the parsed sequences - the same driver
- * shape as TwinDecode in tests/parser_twin.cpp. */
-Decoded TwinDecode(const unsigned char* stream, size_t stream_size,
-                   size_t capacity) {
-    Decoded d{false, 0, nullptr};
-    d.bytes = std::make_unique<unsigned char[]>(capacity);
-    std::memset(d.bytes.get(), 0, capacity);
-
-    cudec_detail::Lz4Parser parser{stream, stream_size, capacity};
-    cudec_detail::Lz4Sequence seq;
-    bool done = false;
-    while (true) {
-        const cudec_status status = parser.Next(&seq, &done);
-        if (status != CUDEC_OK) {
-            return d;
-        }
-        for (uint64_t i = 0; i < seq.literals_len; i++) {
-            d.bytes[seq.literals_dst + i] = stream[seq.literals_src + i];
-        }
-        for (uint64_t i = 0; i < seq.match_len; i++) {
-            d.bytes[seq.match_dst + i] = d.bytes[seq.match_src + i];
-        }
-        if (done) {
-            break;
-        }
-    }
-    d.ok = true;
-    d.size = static_cast<size_t>(parser.dst_pos);
-    return d;
-}
-
 Decoded OracleDecode(const unsigned char* stream, size_t stream_size,
                      size_t capacity) {
-    Decoded d{false, 0, nullptr};
-    d.bytes = std::make_unique<unsigned char[]>(capacity);
-    std::memset(d.bytes.get(), 0, capacity);
+    Decoded decoded{false, 0, std::make_unique<unsigned char[]>(capacity)};
+    if (capacity != 0) {
+        std::memset(decoded.bytes.get(), 0, capacity);
+    }
     if (stream_size == 0) {
-        return d; /* never hand liblz4 a null source pointer */
+        return decoded; /* never hand liblz4 a null source pointer */
     }
     const int written = LZ4_decompress_safe(
         reinterpret_cast<const char*>(stream),
-        reinterpret_cast<char*>(d.bytes.get()), static_cast<int>(stream_size),
-        static_cast<int>(capacity));
+        reinterpret_cast<char*>(decoded.bytes.get()),
+        static_cast<int>(stream_size), static_cast<int>(capacity));
     if (written < 0) {
-        return d;
+        return decoded;
     }
-    d.ok = true;
-    d.size = static_cast<size_t>(written);
-    return d;
+    decoded.ok = true;
+    decoded.size = static_cast<size_t>(written);
+    return decoded;
 }
 
 }  // namespace
@@ -90,41 +63,46 @@ Decoded OracleDecode(const unsigned char* stream, size_t stream_size,
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     /* The fuzzer controls the output capacity as well as the stream: with a
      * fixed capacity, CUDEC_ERR_OUTPUT_TOO_SMALL swamps the corpus and the
-     * deeper reject branches stay unreached. Two header bytes, then the
-     * stream. Both sides are handed the identical capacity. */
+     * deeper reject branches stay unreached. Two big-endian header bytes,
+     * then the stream. Both sides are handed the identical capacity, so a
+     * divergence is never an artefact of comparing two different contracts. */
     if (size < 2) {
         return 0;
     }
     const size_t capacity =
-        (static_cast<size_t>(data[0]) << 8 | static_cast<size_t>(data[1])) %
-        (kMaxCapacity + 1);
+        static_cast<size_t>(data[0]) << 8 | static_cast<size_t>(data[1]);
     const uint8_t* body = data + 2;
     size_t body_size = size - 2;
     if (body_size > kMaxStream) {
         body_size = kMaxStream;
     }
 
-    /* Tight copy of the stream: an over-read past the last byte must land in
-     * an ASan redzone, not in slack the allocator happened to round up. */
-    auto tight = std::make_unique<unsigned char[]>(body_size);
+    /* libFuzzer hands out a slice of a buffer sized to -max_len, not to this
+     * input, so a read past `body_size` would land in that slack and stay
+     * green. Both sides are run over one exactly-sized copy instead. The twin
+     * driver tightens again internally - that is its own guarantee to its
+     * other caller, and it costs one copy of at most 16 KiB here. */
+    auto stream = std::make_unique<unsigned char[]>(body_size);
     if (body_size != 0) {
-        std::memcpy(tight.get(), body, body_size);
+        std::memcpy(stream.get(), body, body_size);
     }
 
-    const Decoded twin = TwinDecode(tight.get(), body_size, capacity);
-    const Decoded oracle = OracleDecode(tight.get(), body_size, capacity);
+    const cudec_test::Lz4TwinResult twin =
+        cudec_test::Lz4TwinDecode(stream.get(), body_size, capacity);
+    Decoded oracle = OracleDecode(stream.get(), body_size, capacity);
 
 #ifdef CUDEC_FUZZ_SELFTEST_BREAK
-    /* Off by default, and the only way to prove the comparison below is live:
-     * a second binary built with this defined perturbs an accepted output, so
-     * a harness that had silently stopped comparing would pass where this one
-     * traps. Never define it in a build whose findings are being believed. */
-    if (twin.ok && twin.size != 0) {
-        const_cast<Decoded&>(twin).bytes[0] ^= 0xFFu;
+    /* Off by default, and the only way to prove the comparison below is live
+     * without waiting for a real divergence: a second binary built with this
+     * defined perturbs an accepted output, so a harness that had silently
+     * stopped comparing would pass where this one traps. Never define it in a
+     * build whose findings are being believed. */
+    if (oracle.ok && oracle.size != 0) {
+        oracle.bytes[0] ^= 0xFFu;
     }
 #endif
 
-    if (!twin.ok) {
+    if (twin.status != CUDEC_OK) {
         return 0; /* the twin may be stricter; that direction is not asserted */
     }
     if (!oracle.ok) {
@@ -150,20 +128,3 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     }
     return 0;
 }
-
-/* Built and run so far without a CMake seam, because no machine available to
- * this work has CMake and Clang together. The exact invocation that produced
- * the findings recorded on issue #140, against the liblz4 release tarball
- * pinned in tests/CMakeLists.txt and hash-verified before use:
- *
- *   clang -std=c11 -O2 -g -fsanitize=address,undefined \
- *     -fno-sanitize-recover=all -isystem lz4-1.10.0/lib \
- *     -c lz4-1.10.0/lib/lz4.c -o lz4_oracle.o
- *   clang++ -std=c++17 -g -O1 -fsanitize=fuzzer,address,undefined \
- *     -fno-sanitize-recover=all -I include -I src \
- *     -isystem lz4-1.10.0/lib -o fuzz_lz4_block \
- *     fuzz/fuzz_lz4_block.cpp lz4_oracle.o
- *
- * The CMake option that replaces it, and the committed seed corpus, are what
- * issue #140 still owes.
- */
