@@ -62,7 +62,22 @@ Two artifacts per finding, and one of them is not optional:
   is covered only while the fuzz job runs; a pinned negative is covered on
   every pull request.
 
-The committed corpus, its integrity check and the CI wiring that runs these
-targets are issue #142. Until that lands, a target is run from a corpus
-directory the runner supplies, and a finding is recorded on its issue with the
-input in it.
+The corpus lives in `corpus/<target>/`, one directory per target, and
+`corpus/SHA256SUMS` pins every seed by hash. `scripts/check-fuzz-corpus.sh`
+refuses a changed seed, a seed the manifest does not name, an emptied target
+directory and a target declared in `CMakeLists.txt` with no corpus at all; the
+target list it checks against is read out of `CMakeLists.txt` rather than
+written down a second time. Adding a seed means adding its line to the
+manifest:
+
+```
+cd fuzz/corpus && find . -type f ! -name SHA256SUMS | sed 's|^\./||' \
+  | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+```
+
+`.github/workflows/fuzz.yml` runs the targets: every seed replayed on every
+pull request, then a bounded exploration, with a longer scheduled run whose
+corpus and crashing inputs are uploaded as artifacts. The seeds are replayed
+before anything explores, which is what makes a kept regression seed cheap -
+a defect that comes back is caught in seconds rather than by a fuzzer
+rediscovering it.
