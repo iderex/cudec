@@ -60,6 +60,14 @@ struct ZstdBlockShape {
     unsigned ll_mode = 0;
     unsigned of_mode = 0;
     unsigned ml_mode = 0;
+    /* Where the three FSE table descriptions begin, as an offset into the
+     * frame, and where the block ends. The walk already stands on the first
+     * of those bytes when it has read the mode byte, and throwing the
+     * position away made every consumer re-derive it - so it is reported
+     * instead. Set only where sequence_count > 0; block_end is set for every
+     * compressed block. */
+    size_t tables_offset = 0;
+    size_t block_end = 0;
 };
 
 struct ZstdFrameShape {

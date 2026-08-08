@@ -322,6 +322,22 @@ cudec_add_test(zstd_frame_twin SOURCES zstd_frame_twin.cpp LIBS zstd_full)
 target_include_directories(zstd_frame_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(zstd_frame_twin PRIVATE ZSTD_STATIC_LINKING_ONLY)
+# The Zstd FSE table description decode and the table it builds (issue #217),
+# held to FSE_readNCount and FSE_buildDTable_wksp cell by cell. Host-side and
+# GPU-less. It links zstd_full alone for the reason zstd_oracle_smoke gives
+# above and because FSE_writeNCount lives on the compress side: the test
+# writes the descriptions its negatives are mutations of, and proves its own
+# writer against the reference's before using it. It compiles zstd_corpus.cpp
+# for the same reason zstd_corpus_selfproof does - the #185 fixtures are where
+# the Set_Compressed fields this sweeps over come from.
+# FSE_STATIC_LINKING_ONLY is what exposes FSE_buildDTable_wksp and
+# FSE_decode_t; the non-wksp entry point is not exported by the pinned
+# release.
+cudec_add_test(zstd_fse_twin SOURCES zstd_fse_twin.cpp zstd_corpus.cpp LIBS
+               zstd_full)
+target_include_directories(zstd_fse_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(zstd_fse_twin PRIVATE FSE_STATIC_LINKING_ONLY)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
