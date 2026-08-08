@@ -227,6 +227,8 @@ bool ReadLiteralsSection(Reader* r, ZstdBlockShape* shape) {
         compressed = static_cast<size_t>((packed >> 18) & 0x3ffffu);
     }
     shape->literals_streams = size_format == 0 ? 1u : 4u;
+    shape->literals_payload_offset = r->pos;
+    shape->literals_payload_size = compressed;
     return r->Skip(compressed);
 }
 

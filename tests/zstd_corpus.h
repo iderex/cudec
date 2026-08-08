@@ -68,6 +68,14 @@ struct ZstdBlockShape {
      * compressed block. */
     size_t tables_offset = 0;
     size_t block_end = 0;
+    /* Where a Compressed or Treeless literals section's payload begins and
+     * how long it is, as an offset into the frame. Reported for the same
+     * reason as the two above: the walk reads the size in order to step over
+     * it, and a consumer that wants the Huffman tree description would
+     * otherwise re-read the header to find where the walk had just been. Set
+     * only for those two literals types. */
+    size_t literals_payload_offset = 0;
+    size_t literals_payload_size = 0;
 };
 
 struct ZstdFrameShape {
