@@ -479,12 +479,23 @@ bool ZstdOracleDecodes(const Bytes& frame, Bytes* out) {
         ZSTD_getFrameContentSize(frame.data(), frame.size());
     /* A frame without a content size still has to be decodable here, so the
      * bound comes from the corpus rather than from the frame: nothing this
-     * generator emits exceeds it, and a hostile frame is not this function's
-     * job. */
+     * generator emits exceeds it.
+     *
+     * IT IS A CEILING AND NOT ONLY A FALLBACK, and it became one when the
+     * mutation layer arrived (issue #187). A mutant that moves the content
+     * size field declares whatever the bits say, and taking that at its word
+     * asked the allocator for it - which is a std::bad_alloc rather than a
+     * verdict, measured the first time this ran over mutants. The reference
+     * still decides: it gets the buffer this harness will actually produce
+     * and answers on it, and a frame declaring more than the ceiling comes
+     * back refused with dstSize_tooSmall. No corpus frame reaches the
+     * ceiling, so no unmutated verdict moves. */
+    const size_t kOutputCeiling = size_t{1} << 22;
     const size_t bound =
         (declared == ZSTD_CONTENTSIZE_UNKNOWN ||
-         declared == ZSTD_CONTENTSIZE_ERROR)
-            ? size_t{1} << 22
+         declared == ZSTD_CONTENTSIZE_ERROR ||
+         declared > static_cast<unsigned long long>(kOutputCeiling))
+            ? kOutputCeiling
             : static_cast<size_t>(declared);
     out->assign(bound, 0);
     const size_t written =
@@ -648,4 +659,124 @@ std::vector<ZstdFixture> MakeZstdFixtures() {
         fixtures.push_back(fixture);
     }
     return fixtures;
+}
+
+std::vector<ZstdMutant> MutateZstdFrame(const Bytes& frame, uint64_t seed) {
+    std::vector<ZstdMutant> out;
+    const size_t n = frame.size();
+    if (n == 0) {
+        return out;
+    }
+    const auto add = [&out](std::string description, Bytes bytes) {
+        out.push_back(ZstdMutant{std::move(description), std::move(bytes)});
+    };
+    /* One byte, one xor. Every aimed mutation below is this: the smallest
+     * change that moves a named field into a different branch of the
+     * reference's decoder. */
+    const auto xor_at = [&frame, &add, n](const char* name, size_t offset,
+                                          unsigned char mask) {
+        if (offset >= n) {
+            return;
+        }
+        Bytes bytes = frame;
+        bytes[offset] = static_cast<unsigned char>(bytes[offset] ^ mask);
+        add(std::string(name) + "-at-" + std::to_string(offset),
+            std::move(bytes));
+    };
+
+    /* ---- The aimed set, walked out of the frame's own headers ---------- */
+
+    /* The magic, which is the first thing the reference looks at. */
+    xor_at("magic-byte-0", 0, 0x01);
+    xor_at("magic-byte-3", 3, 0x80);
+
+    /* The frame header descriptor: the reserved bit the reference refuses
+     * outright, the checksum flag, the content-size width and the dictionary
+     * id width. Each moves a different branch of ZSTD_getFrameHeader. */
+    xor_at("descriptor-reserved-bit", 4, 0x08);
+    xor_at("descriptor-checksum-flag", 4, 0x04);
+    xor_at("descriptor-content-size-width", 4, 0x40);
+    xor_at("descriptor-dictionary-id-width", 4, 0x01);
+    xor_at("descriptor-single-segment", 4, 0x20);
+    /* Whatever byte follows it - the window descriptor when there is one,
+     * otherwise the first content-size byte. Both are size fields the
+     * reference bounds. */
+    xor_at("byte-after-descriptor", 5, 0x0F);
+
+    ZstdFrameShape shape;
+    std::string why;
+    if (ParseZstdFrameShape(frame, &shape, &why)) {
+        /* Block headers, and inside a compressed block the section headers
+         * the walker reached. Only the first two blocks are aimed at: the
+         * families that carry many blocks carry the same shapes in each, and
+         * a mutant per block would multiply the corpus without adding a
+         * branch. */
+        size_t index = 0;
+        for (const ZstdBlockShape& block : shape.blocks) {
+            if (index >= 2) {
+                break;
+            }
+            const std::string tag = "block" + std::to_string(index) + "-";
+            if (block.tables_offset != 0) {
+                /* The Symbol_Compression_Modes byte sits immediately before
+                 * the first table description, and its low two bits are
+                 * reserved: setting one is a refusal the reference states in
+                 * so many words. */
+                xor_at((tag + "symbol-modes-reserved-bits").c_str(),
+                       block.tables_offset - 1, 0x03);
+                xor_at((tag + "symbol-modes-litlen").c_str(),
+                       block.tables_offset - 1, 0xC0);
+                xor_at((tag + "symbol-modes-offset").c_str(),
+                       block.tables_offset - 1, 0x30);
+                /* The accuracy log of whichever table description starts
+                 * there: the low nibble of its first byte. */
+                xor_at((tag + "first-table-accuracy-log").c_str(),
+                       block.tables_offset, 0x0F);
+                xor_at((tag + "first-table-body").c_str(),
+                       block.tables_offset + 1, 0x55);
+            }
+            if (block.literals_payload_size != 0) {
+                /* The Huffman tree description opens the payload of a
+                 * Compressed literals section, and its first byte decides
+                 * between an FSE-coded weight stream and a direct table. */
+                xor_at((tag + "huffman-description-header").c_str(),
+                       block.literals_payload_offset, 0x80);
+                xor_at((tag + "huffman-description-body").c_str(),
+                       block.literals_payload_offset + 1, 0x0F);
+            }
+            /* The last byte a block's payload declares. For a compressed
+             * block that is the tail of the sequence bitstream, which is
+             * where the reference's own sequence loop runs out. */
+            if (block.block_end > 0) {
+                xor_at((tag + "payload-last-byte").c_str(),
+                       block.block_end - 1, 0xFF);
+            }
+            index++;
+        }
+    }
+
+    /* ---- The blind set, which is what reaches the entropy payloads ----- */
+
+    for (const size_t quarters : {size_t{1}, size_t{2}, size_t{3}}) {
+        const size_t keep = n * quarters / 4;
+        if (keep < n && keep > 0) {
+            add("truncate-to-" + std::to_string(keep),
+                Bytes{frame.begin(), frame.begin() + static_cast<long>(keep)});
+        }
+    }
+    for (size_t k = 1; k <= 4 && k < n; k++) {
+        add("drop-" + std::to_string(k) + "-tail",
+            Bytes{frame.begin(), frame.end() - static_cast<long>(k)});
+        add("drop-" + std::to_string(k) + "-head",
+            Bytes{frame.begin() + static_cast<long>(k), frame.end()});
+    }
+    uint64_t state = seed;
+    for (int i = 0; i < 12; i++) {
+        Bytes flipped = frame;
+        const size_t offset = static_cast<size_t>(Mix(&state) % n);
+        flipped[offset] = static_cast<unsigned char>(
+            flipped[offset] ^ (1u << (Mix(&state) % 8)));
+        add("flip-bit-at-" + std::to_string(offset), std::move(flipped));
+    }
+    return out;
 }

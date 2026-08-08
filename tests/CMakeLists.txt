@@ -305,6 +305,15 @@ target_compile_definitions(zstd_probes PRIVATE ZSTD_STATIC_LINKING_ONLY)
 # decision and the coverage matrix.
 cudec_add_test(zstd_corpus_selfproof SOURCES zstd_corpus_selfproof.cpp
                zstd_corpus.cpp LIBS zstd_full)
+# The Zstd mutation corpus proving itself (issue #187): the mutants are
+# deterministic and digest-pinned, every fixture yields at least one the
+# reference refuses, and the aimed header-field classes are asserted by name so
+# a walker change cannot drop one in silence. It links zstd_full and compiles
+# zstd_corpus.cpp for the reason zstd_corpus_selfproof gives above - the
+# generator lives beside the corpus rather than in fixtures.cpp, because the
+# decode-only and full zstd archives may never meet in one link.
+cudec_add_test(zstd_mutants SOURCES zstd_mutants.cpp zstd_corpus.cpp LIBS
+               zstd_full)
 cudec_add_test(zstd_bitstream_twin SOURCES zstd_bitstream_twin.cpp)
 target_include_directories(zstd_bitstream_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)

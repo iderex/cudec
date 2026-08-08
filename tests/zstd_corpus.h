@@ -134,4 +134,41 @@ std::vector<std::vector<unsigned char>> MakeZstdBatchFrames(
 bool ZstdOracleDecodes(const std::vector<unsigned char>& frame,
                        std::vector<unsigned char>* out);
 
+/* One mutated frame and what was done to it. The description is the repro
+ * key: a failure names the fixture and this string and nothing else is
+ * needed to rebuild the bytes. */
+struct ZstdMutant {
+    std::string description;
+    std::vector<unsigned char> frame;
+};
+
+/* The mutation layer over Zstd frames (issue #187).
+ *
+ * TWO KINDS OF MUTATION, and the second is the point. The blind kind -
+ * truncations and seeded single-bit flips - is what the LZ4 and Snappy
+ * corpora already do, and over a frame format with a header, a block table
+ * and two checksums it mostly lands in an entropy payload and produces a
+ * checksum failure. The aimed kind walks the frame's own headers and moves
+ * one named field at a time: the magic, each descriptor flag, the window
+ * byte, the content size, a block header's type and size, the literals
+ * section's type and size format, the Huffman description's first byte, the
+ * sequence count, the Symbol_Compression_Modes byte including its reserved
+ * bits, and an FSE table description's accuracy log. That set is read out of
+ * what the reference decoder branches on rather than out of anything cudec
+ * does.
+ *
+ * WHERE THE AIM STOPS is where the walker stops: it reads headers and steps
+ * over payloads by their declared sizes, so a mutation cannot be aimed at a
+ * field inside an entropy bitstream. The blind flips are what reach those,
+ * and they reach them without knowing what they hit.
+ *
+ * A MUTANT IS NOT ASSUMED INVALID. Some of these are accepted by the
+ * reference, and that is kept rather than filtered: cudec being stricter than
+ * the reference is a divergence in the same way cudec being looser is. The
+ * verdict always comes from ZstdOracleDecodes, never from this function.
+ *
+ * Deterministic: same frame and seed, same mutants, byte for byte. */
+std::vector<ZstdMutant> MutateZstdFrame(const std::vector<unsigned char>& frame,
+                                        uint64_t seed);
+
 #endif /* CUDEC_TESTS_ZSTD_CORPUS_H */
