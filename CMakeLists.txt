@@ -337,6 +337,47 @@ if(CUDEC_ENABLE_HIP)
       "build.")
 endif()
 
+# ---- The fuzz gate (issue #140). Opt-in, default OFF, and fail-closed twice
+# over: asking for it without a Clang host toolchain is a configure error, and
+# so is asking for it without sanitizers. The second refusal is the one worth
+# stating - a fuzz run whose memory errors nobody is watching finds only the
+# divergences the harness happens to assert, while reading exactly like a run
+# that also proved the parser touched nothing it should not.
+#
+# The sanitizer set is CUDEC_SANITIZE's rather than a second string of its
+# own, so there is one spelling of "which sanitizers" in this build system and
+# the fuzz build cannot be instrumented differently from the sanitizer gate
+# without somebody meaning it.
+#
+# Host-only by construction: fuzz/ has no CUDA sources and does not link the
+# cudec archive, so this configures and builds on a machine with no CUDA
+# toolchain at all - which is the point, since the parser under it is the
+# single-sourced host/device header.
+option(CUDEC_FUZZ "Build the libFuzzer targets (requires Clang + CUDEC_SANITIZE)"
+       OFF)
+if(CUDEC_FUZZ AND PROJECT_IS_TOP_LEVEL)
+  if(NOT CUDEC_SANITIZE)
+    message(
+      FATAL_ERROR
+        "CUDEC_FUZZ needs CUDEC_SANITIZE set (e.g. "
+        "-DCUDEC_SANITIZE=address,undefined): -fsanitize=fuzzer alone builds "
+        "a fuzzer that cannot see an out-of-bounds access, which is most of "
+        "what fuzzing this parser is for.")
+  endif()
+  enable_language(CXX)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(
+      FATAL_ERROR
+        "CUDEC_FUZZ requires a Clang host toolchain (libFuzzer ships with "
+        "Clang; got '${CMAKE_CXX_COMPILER_ID}'). Configure with "
+        "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++.")
+  endif()
+  # After the CUDA block, so in a combined configure the timeout sweep has
+  # already run over every directory that registers tests - fuzz/ registers
+  # none, and says why.
+  add_subdirectory(fuzz)
+endif()
+
 # ---- The examples (issue #158). Built in BOTH configurations, which is the
 # point: they include nothing but the public header, so they compile wherever
 # the header is usable and link wherever the decoder is built. Top-level only,

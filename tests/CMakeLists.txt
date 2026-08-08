@@ -6,41 +6,13 @@
 # source - a system copy must never silently substitute for it.
 set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE NEVER)
 
-# liblz4, pinned by the SHA-256 of the maintainer-uploaded release asset
-# (self-computed at pin time and cross-checked against conan-center; the
-# auto-generated /archive/ tarballs are avoided - GitHub regenerated them
-# in 2023 and their hashes moved). Test-only dependency: the link
-# allowlist below keeps it out of the library.
+# liblz4 and its two oracle targets, lz4_oracle and lz4_frame_oracle. The
+# declaration moved to cmake/CudecLz4Oracle.cmake when fuzz/ became a second
+# consumer of the same pin (issue #140): FetchContent lets the first
+# declaration win in silence, so two copies of the URL and hash could drift
+# with nothing to say which one the build used.
 include(FetchContent)
-FetchContent_Declare(
-  lz4
-  URL https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
-  URL_HASH
-    SHA256=537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-FetchContent_MakeAvailable(lz4)
-
-# The uploaded tarball has no top-level CMakeLists (lz4's lives in
-# build/cmake), so MakeAvailable only populates the source tree; we compile
-# the one translation unit the block-format oracle needs and depend on
-# nothing of lz4's build system. SYSTEM include + none of our strict flags:
-# third-party code is audited by hash, not reformatted.
-add_library(lz4_oracle STATIC ${lz4_SOURCE_DIR}/lib/lz4.c)
-target_include_directories(lz4_oracle SYSTEM PUBLIC ${lz4_SOURCE_DIR}/lib)
-
-# The frame oracle adds liblz4's frame API and xxHash (the checksum the
-# frame format uses) - the reference the cudec frame decoder is held to.
-add_library(
-  lz4_frame_oracle STATIC
-  ${lz4_SOURCE_DIR}/lib/lz4.c ${lz4_SOURCE_DIR}/lib/lz4hc.c
-  ${lz4_SOURCE_DIR}/lib/lz4frame.c ${lz4_SOURCE_DIR}/lib/xxhash.c)
-target_include_directories(lz4_frame_oracle SYSTEM PUBLIC
-                           ${lz4_SOURCE_DIR}/lib)
-# -O2 unconditionally: the oracle is also the bench harness's timed
-# decoder, and an empty CMAKE_BUILD_TYPE (the documented container
-# command) would otherwise time -O0 reference code. Correctness is
-# optimization-independent; honest numbers are not.
-target_compile_options(lz4_oracle PRIVATE -O2)
+include(${PROJECT_SOURCE_DIR}/cmake/CudecLz4Oracle.cmake)
 
 # google/snappy, the M3 oracle, pinned by the SHA-256 of the tag archive.
 # snappy publishes no maintainer-uploaded release asset, so this is the
