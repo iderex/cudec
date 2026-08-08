@@ -317,6 +317,7 @@ bool ParseZstdFrameShape(const Bytes& frame, ZstdFrameShape* out,
                     *why = "reserved bits set in symbol compression modes";
                     return false;
                 }
+                block.tables_offset = r.pos;
             }
             /* The walk stops at the mode byte, so it resumes from the block
              * size the header declared rather than from where it stopped. */
@@ -324,6 +325,7 @@ bool ParseZstdFrameShape(const Bytes& frame, ZstdFrameShape* out,
                 *why = "compressed block runs past the frame";
                 return false;
             }
+            block.block_end = block_start + block_size;
             r.pos = block_start + block_size;
         } else if (!r.Skip(block.block_type == kZstdBlockRle ? 1u
                                                              : block_size)) {
