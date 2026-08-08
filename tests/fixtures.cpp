@@ -160,6 +160,16 @@ bool OracleDecodes(const std::vector<unsigned char>& stream,
     return true;
 }
 
+bool OracleDecodesAtZeroCapacity(const std::vector<unsigned char>& stream) {
+    if (stream.empty()) {
+        return false; /* never hand liblz4 a null source pointer */
+    }
+    unsigned char scratch = 0;
+    return LZ4_decompress_safe(reinterpret_cast<const char*>(stream.data()),
+                               reinterpret_cast<char*>(&scratch),
+                               static_cast<int>(stream.size()), 0) >= 0;
+}
+
 bool SnappyOracleDecodes(const std::vector<unsigned char>& stream,
                          std::vector<unsigned char>* decoded) {
     decoded->clear();
