@@ -17,6 +17,7 @@
 #include "fixtures.h"
 #include "require.h"
 #include "snappy_block.h"
+#include "snappy_twin.h"
 
 #include <cstdio>
 #include <cstring>
@@ -28,25 +29,22 @@ namespace {
 
 using Bytes = std::vector<unsigned char>;
 
-/* Counts elements the parser handed back that the caller could not have
- * executed without leaving its buffers, and cursors left outside their own
- * bounds. main() requires it to be zero; the status Drive returns is left
- * alone, so a violation cannot be swallowed by a parity comparison that
- * only reads verdicts.
+/* The driver's own two counters, in the shared header that owns the driver
+ * (tests/snappy_twin.h). main() requires the bounds count to be zero; the
+ * status the driver returns is left alone, so a violation cannot be swallowed
+ * by a parity comparison that only reads verdicts. The references keep this
+ * file's call sites reading as they did before the driver moved out.
  *
- * It exists because a verdict alone cannot prove a bounds guard. Removing
- * the check that a long-form literal's length bytes are present, or that a
- * copy's offset bytes are, still rejects every crafted stream: the cursor
- * runs past the source end, the next subtraction wraps, and a later branch
- * catches it after the read has already happened. What the guard actually
- * prevents is that read, so that is what is counted. Measured - three of
- * those removals left a verdict-only suite green. */
-size_t g_bounds_violations = 0;
-
-/* Which ladder branch refused last, recorded wherever a driver sees a reject.
- * Diagnostic: it says which rung, where the returned status only says that
- * some rung refused, and eight of the crafted negatives share one status. */
-cudec_detail::SnappyReject g_last_reject = cudec_detail::kSnappyRejectNone;
+ * Why a count rather than a status: a verdict alone cannot prove a bounds
+ * guard. Removing the check that a long-form literal's length bytes are
+ * present, or that a copy's offset bytes are, still rejects every crafted
+ * stream - the cursor runs past the source end, the next subtraction wraps,
+ * and a later branch catches it after the read has already happened. What the
+ * guard actually prevents is that read, so that is what is counted. Measured,
+ * three of those removals left a verdict-only suite green. */
+cudec_test::SnappyTwinObserver g_twin;
+size_t& g_bounds_violations = g_twin.bounds_violations;
+cudec_detail::SnappyReject& g_last_reject = g_twin.last_reject;
 
 void ObserveReject(cudec_detail::SnappyReject branch) {
     g_last_reject = branch;
@@ -73,113 +71,20 @@ void CoverBranch(cudec_detail::SnappyReject branch) {
     }
 }
 
-/* Sequential reference execution of the parsed elements. A copy is the
- * chasing byte copy - reads may land on just-written bytes, which is the
- * pattern-repeating semantics an overlapping Snappy copy has. */
+/* The two vector-shaped entries this file uses, over the shared driver in
+ * tests/snappy_twin.h - one copy with the fuzz target (issue #90). The
+ * capacity bound handed to the whole-stream entry is the harness bound rather
+ * than the declaration itself: that is the same refusal SnappyOracleDecodes
+ * applies, so a mutant declaring 4 GiB is refused on both sides for the same
+ * reason instead of reading as a parity failure. */
 cudec_status Drive(const unsigned char* src, uint64_t src_size,
                    uint64_t capacity, Bytes* out) {
-    out->assign(static_cast<size_t>(capacity), 0);
-    cudec_detail::SnappyParser parser{src, src_size, capacity};
-    cudec_detail::SnappyElement element;
-    bool done = false;
-    /* Fuel, for the same reason every driver loop in this tree carries one:
-     * a parser that stops making progress must red the run rather than hang
-     * it. Every non-terminal call consumes at least one source byte, so one
-     * call per byte plus the terminal one is more than a live parser needs. */
-    uint64_t fuel = src_size + 2;
-    while (true) {
-        if (fuel-- == 0) {
-            std::fprintf(stderr, "the parser did not terminate on a %llu-byte "
-                                 "stream\n",
-                         static_cast<unsigned long long>(src_size));
-            g_bounds_violations++;
-            out->clear();
-            return CUDEC_ERR_CORRUPT_INPUT;
-        }
-        const cudec_status status = parser.Next(&element, &done);
-        if (status != CUDEC_OK) {
-            /* A rejected stream produces nothing, the same contract
-             * SnappyOracleDecodes holds its caller to. */
-            ObserveReject(parser.reject);
-            out->clear();
-            return status;
-        }
-        /* Both cursors stay inside their buffers, the produced length stays
-         * inside the declaration, and the element lies inside what the
-         * parser says it produced. A literal's source range is inside the
-         * stream; a copy reaches strictly backwards, which is what makes the
-         * chasing read below defined. */
-        const bool bounded =
-            parser.src_pos <= parser.src_size &&
-            parser.dst_pos <= parser.declared &&
-            parser.declared <= capacity &&
-            element.to + element.length <= parser.dst_pos &&
-            (element.is_copy ? element.from < element.to
-                             : element.from + element.length <=
-                                   parser.src_pos);
-        if (!bounded) {
-            std::fprintf(stderr,
-                         "the parser left its bounds: src_pos=%llu/%llu "
-                         "dst_pos=%llu/%llu element from=%llu to=%llu len=%llu "
-                         "copy=%d\n",
-                         static_cast<unsigned long long>(parser.src_pos),
-                         static_cast<unsigned long long>(parser.src_size),
-                         static_cast<unsigned long long>(parser.dst_pos),
-                         static_cast<unsigned long long>(parser.declared),
-                         static_cast<unsigned long long>(element.from),
-                         static_cast<unsigned long long>(element.to),
-                         static_cast<unsigned long long>(element.length),
-                         element.is_copy ? 1 : 0);
-            g_bounds_violations++;
-            out->clear();
-            return CUDEC_ERR_CORRUPT_INPUT;
-        }
-        if (element.is_copy) {
-            for (uint64_t i = 0; i < element.length; i++) {
-                (*out)[static_cast<size_t>(element.to + i)] =
-                    (*out)[static_cast<size_t>(element.from + i)];
-            }
-        } else {
-            for (uint64_t i = 0; i < element.length; i++) {
-                (*out)[static_cast<size_t>(element.to + i)] =
-                    src[element.from + i];
-            }
-        }
-        if (done) {
-            break;
-        }
-    }
-    out->resize(static_cast<size_t>(parser.dst_pos));
-    return CUDEC_OK;
+    return cudec_test::SnappyTwinDrive(src, src_size, capacity, out, &g_twin);
 }
 
-/* Parse from an EXACTLY-sized copy of the stream, as TwinDecode in
- * tests/parser_twin.cpp does: the mutation corpus truncates by
- * resize()-DOWN, which leaves the vector's rounded-up capacity readable, so
- * an over-read past src_size would land in that slack and leave ASan green.
- * A tight allocation puts a redzone right after the last stream byte. */
 cudec_status TwinDecode(const Bytes& stream, Bytes* out) {
-    out->clear();
-    const size_t stream_size = stream.size();
-    auto tight = std::make_unique<unsigned char[]>(stream_size);
-    if (stream_size != 0) {
-        std::memcpy(tight.get(), stream.data(), stream_size);
-    }
-    /* The declaration is read through the parser's own Begin, so the varint
-     * is parsed once and the destination is sized from a value that has
-     * already been compared against a capacity. The capacity here is the
-     * harness bound rather than the declaration itself: that is the same
-     * refusal SnappyOracleDecodes applies, so a mutant declaring 4 GiB is
-     * refused on both sides for the same reason instead of reading as a
-     * parity failure. */
-    cudec_detail::SnappyParser probe{tight.get(), stream_size,
-                                     kSnappyOracleMaxOutput};
-    const cudec_status header = probe.Begin();
-    if (header != CUDEC_OK) {
-        ObserveReject(probe.reject);
-        return header;
-    }
-    return Drive(tight.get(), stream_size, probe.declared, out);
+    return cudec_test::SnappyTwinDecode(stream.data(), stream.size(),
+                                        kSnappyOracleMaxOutput, out, &g_twin);
 }
 
 /* Drives the parser for its liveness contract alone, producing nothing.

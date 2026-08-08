@@ -8,6 +8,7 @@
 #include "cudec.h"
 #include "fixtures.h"
 #include "lz4_block.h"
+#include "lz4_twin.h"
 #include "require.h"
 
 #include <cstdio>
@@ -18,45 +19,19 @@
 
 namespace {
 
-/* Sequential reference execution of the parsed sequences. The match copy
- * is the chasing byte copy - reads may land on just-written bytes, which
- * is exactly LZ4's replication semantics for overlapping matches (and
- * equivalent to the kernel's closed-form modular gather). */
+/* The vector-shaped call sites of this file over the shared driver in
+ * tests/lz4_twin.h, which is where the tight allocations and the sequential
+ * execution now live - one copy with the fuzz target (issue #140). On a
+ * reject `out` keeps the capacity-sized buffer with whatever the parser had
+ * already authorised, which is what the assertions below expect. */
 cudec_status TwinDecode(const std::vector<unsigned char>& stream,
                         size_t capacity, std::vector<unsigned char>* out) {
-    out->assign(capacity, 0);
-    /* Parse from an EXACTLY-sized copy of the stream: the mutation corpus
-     * truncates by resize()-DOWN, which leaves the vector's rounded-up
-     * capacity readable, so a src/lz4_block.h over-read past src_size would
-     * land in that slack and leave ASan green. A tight allocation puts an ASan
-     * redzone right after the last stream byte so the over-read reds instead.
-     * Literals are still executed from `stream` below, but only over the
-     * ranges the parser has already bound to <= src_size. */
-    const size_t stream_size = stream.size();
-    auto tight = std::make_unique<unsigned char[]>(stream_size);
-    if (stream_size != 0) {
-        std::memcpy(tight.get(), stream.data(), stream_size);
-    }
-    cudec_detail::Lz4Parser parser{tight.get(), stream_size, capacity};
-    cudec_detail::Lz4Sequence seq;
-    bool done = false;
-    while (true) {
-        const cudec_status status = parser.Next(&seq, &done);
-        if (status != CUDEC_OK) {
-            return status;
-        }
-        for (uint64_t i = 0; i < seq.literals_len; i++) {
-            (*out)[seq.literals_dst + i] = stream[seq.literals_src + i];
-        }
-        for (uint64_t i = 0; i < seq.match_len; i++) {
-            (*out)[seq.match_dst + i] = (*out)[seq.match_src + i];
-        }
-        if (done) {
-            break;
-        }
-    }
-    out->resize(parser.dst_pos);
-    return CUDEC_OK;
+    cudec_test::Lz4TwinResult decoded =
+        cudec_test::Lz4TwinDecode(stream.data(), stream.size(), capacity);
+    const size_t kept =
+        decoded.status == CUDEC_OK ? decoded.size : capacity;
+    out->assign(decoded.bytes.get(), decoded.bytes.get() + kept);
+    return decoded.status;
 }
 
 struct CraftedNegative {

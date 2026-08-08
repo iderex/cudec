@@ -6,125 +6,18 @@
 # source - a system copy must never silently substitute for it.
 set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE NEVER)
 
-# liblz4, pinned by the SHA-256 of the maintainer-uploaded release asset
-# (self-computed at pin time and cross-checked against conan-center; the
-# auto-generated /archive/ tarballs are avoided - GitHub regenerated them
-# in 2023 and their hashes moved). Test-only dependency: the link
-# allowlist below keeps it out of the library.
+# liblz4 and its two oracle targets, lz4_oracle and lz4_frame_oracle. The
+# declaration moved to cmake/CudecLz4Oracle.cmake when fuzz/ became a second
+# consumer of the same pin (issue #140): FetchContent lets the first
+# declaration win in silence, so two copies of the URL and hash could drift
+# with nothing to say which one the build used.
 include(FetchContent)
-FetchContent_Declare(
-  lz4
-  URL https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
-  URL_HASH
-    SHA256=537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-FetchContent_MakeAvailable(lz4)
+include(${PROJECT_SOURCE_DIR}/cmake/CudecLz4Oracle.cmake)
 
-# The uploaded tarball has no top-level CMakeLists (lz4's lives in
-# build/cmake), so MakeAvailable only populates the source tree; we compile
-# the one translation unit the block-format oracle needs and depend on
-# nothing of lz4's build system. SYSTEM include + none of our strict flags:
-# third-party code is audited by hash, not reformatted.
-add_library(lz4_oracle STATIC ${lz4_SOURCE_DIR}/lib/lz4.c)
-target_include_directories(lz4_oracle SYSTEM PUBLIC ${lz4_SOURCE_DIR}/lib)
-
-# The frame oracle adds liblz4's frame API and xxHash (the checksum the
-# frame format uses) - the reference the cudec frame decoder is held to.
-add_library(
-  lz4_frame_oracle STATIC
-  ${lz4_SOURCE_DIR}/lib/lz4.c ${lz4_SOURCE_DIR}/lib/lz4hc.c
-  ${lz4_SOURCE_DIR}/lib/lz4frame.c ${lz4_SOURCE_DIR}/lib/xxhash.c)
-target_include_directories(lz4_frame_oracle SYSTEM PUBLIC
-                           ${lz4_SOURCE_DIR}/lib)
-# -O2 unconditionally: the oracle is also the bench harness's timed
-# decoder, and an empty CMAKE_BUILD_TYPE (the documented container
-# command) would otherwise time -O0 reference code. Correctness is
-# optimization-independent; honest numbers are not.
-target_compile_options(lz4_oracle PRIVATE -O2)
-
-# google/snappy, the M3 oracle, pinned by the SHA-256 of the tag archive.
-# snappy publishes no maintainer-uploaded release asset, so this is the
-# fallback the pinning policy names (docs/MASTERPLAN.md section 5): the
-# auto-generated archive, pinned, with a future hash mismatch read as the
-# invariant working rather than as noise. Cross-checked at pin time against a
-# second packaging ecosystem each - the SHA-256 against the Homebrew formula,
-# the SHA-512
-# 0c1e1019e1bec9281f9877996d896e59e1533456130143224acb9cbfc35c1b0dd9de0a76e4a36494844d9ec58c295eed8c50bdf6dbabe47cf679652eb24b1281
-# against vcpkg (conan-center only reaches 1.2.1). 1108618 bytes.
-set(CUDEC_SNAPPY_VERSION 1.2.2)
-FetchContent_Declare(
-  snappy
-  URL https://github.com/google/snappy/archive/refs/tags/${CUDEC_SNAPPY_VERSION}.tar.gz
-  URL_HASH
-    SHA256=90f74bc1fbf78a6c56b3c4a082a05103b3a56bb17bca1a27e052ea11723292dc
-  # snappy, unlike lz4, DOES ship a top-level CMakeLists.txt, and pointing
-  # MakeAvailable at a directory that holds none is what keeps that build out
-  # of this tree: one oracle target over the sources the decode path needs,
-  # never the project's own build system, which would bring its tests, its
-  # install rules and its generated config.h with it.
-  SOURCE_SUBDIR cudec-uses-no-snappy-cmake
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-FetchContent_MakeAvailable(snappy)
-# And the same statement as a check rather than as a comment: snappy's build
-# system defines this target, so its presence means the line above stopped
-# working - a newer snappy layout, or a MakeAvailable that stopped honouring
-# SOURCE_SUBDIR.
-if(TARGET snappy)
-  message(
-    FATAL_ERROR
-      "snappy's own build system was added to this tree - the oracle rule is "
-      "one target over the translation units the decode path needs "
-      "(docs/MASTERPLAN.md section 5)")
-endif()
-
-# snappy.h includes snappy-stubs-public.h, which snappy generates from a .in
-# at configure time; generated here instead, with the four substitutions it
-# has and nothing else. config.h stays undefined: every reference to it in
-# these translation units sits behind `#if HAVE_CONFIG_H`, so the platform
-# detection falls back to the compiler's own macros rather than to a header
-# this project would have to keep true.
-#
-# A function, not inline code: the .in names ${PROJECT_VERSION_MAJOR} and its
-# siblings, which are CMake's own variables for the enclosing project, and
-# setting them for the rest of this directory to satisfy a third-party
-# template is a trap for whoever reads one later.
-function(cudec_generate_snappy_stubs version out_dir)
-  string(REPLACE "." ";" _parts "${version}")
-  list(LENGTH _parts _count)
-  if(NOT _count EQUAL 3)
-    message(FATAL_ERROR "the snappy pin '${version}' is not major.minor.patch "
-                        "- the version macros cannot be derived from it")
-  endif()
-  list(GET _parts 0 PROJECT_VERSION_MAJOR)
-  list(GET _parts 1 PROJECT_VERSION_MINOR)
-  list(GET _parts 2 PROJECT_VERSION_PATCH)
-  # 1 for the Linux container this builds in, which is where iovec lives. On a
-  # host without sys/uio.h the header defines its own, so the 0 case is real
-  # code and not a fallback that has to be added later.
-  set(HAVE_SYS_UIO_H_01 1)
-  # No @ONLY: the template's placeholders are ${...}, which is exactly what
-  # the default substitution reads.
-  configure_file(${snappy_SOURCE_DIR}/snappy-stubs-public.h.in
-                 ${out_dir}/snappy-stubs-public.h)
-endfunction()
-set(_snappy_generated_dir ${CMAKE_CURRENT_BINARY_DIR}/snappy-generated)
-cudec_generate_snappy_stubs(${CUDEC_SNAPPY_VERSION} ${_snappy_generated_dir})
-
-# Two translation units, which is the whole decode path: snappy.cc, and
-# snappy-sinksource.cc for the ByteArraySource the Source-taking calls read
-# through. snappy-stubs-internal.cc carries none of it. SYSTEM include and
-# none of the project's strict flags, the rule lz4_oracle follows for the
-# same reason - third-party code is audited by hash, not reformatted.
-add_library(snappy_oracle STATIC ${snappy_SOURCE_DIR}/snappy.cc
-                                 ${snappy_SOURCE_DIR}/snappy-sinksource.cc)
-target_include_directories(snappy_oracle SYSTEM PUBLIC ${snappy_SOURCE_DIR}
-                                                       ${_snappy_generated_dir})
-set_target_properties(snappy_oracle PROPERTIES CXX_STANDARD 11
-                                               CXX_STANDARD_REQUIRED ON)
-# -O2 for the same reason lz4_oracle carries it: the documented container
-# command sets no CMAKE_BUILD_TYPE, and the reference decoder runs over whole
-# corpora during fixture generation.
-target_compile_options(snappy_oracle PRIVATE -O2)
+# google/snappy and its snappy_oracle target. The declaration moved to
+# cmake/CudecSnappyOracle.cmake when fuzz/ became a second consumer of the
+# same pin (issue #90), for the reason the liblz4 include above carries.
+include(${PROJECT_SOURCE_DIR}/cmake/CudecSnappyOracle.cmake)
 
 # facebook/zstd, the M5 oracle, pinned by the SHA-256 of the
 # MAINTAINER-UPLOADED release asset - the shape the pinning policy prefers and
@@ -371,7 +264,7 @@ target_include_directories(snappy_upstream_negatives
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(
   snappy_upstream_negatives
-  PRIVATE CUDEC_SNAPPY_TESTDATA_DIR="${snappy_SOURCE_DIR}/testdata")
+  PRIVATE CUDEC_SNAPPY_TESTDATA_DIR="${CUDEC_SNAPPY_SOURCE_DIR}/testdata")
 # The other half of "single-source host AND device" (issue #171): the twin
 # above compiles src/snappy_block.h with the host compiler and this one hands
 # the same header to nvcc, then requires the two to produce an identical
