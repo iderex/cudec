@@ -10,6 +10,7 @@
 # the timeout sweep has run, so a test added here would escape it entirely.
 
 include(${PROJECT_SOURCE_DIR}/cmake/CudecLz4Oracle.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/CudecSnappyOracle.cmake)
 
 function(cudec_add_fuzz_target name)
   cmake_parse_arguments(F "" "" "SOURCES;LIBS" ${ARGN})
@@ -49,4 +50,12 @@ cudec_add_fuzz_target(fuzz_lz4_block SOURCES fuzz_lz4_block.cpp LIBS
 cudec_add_fuzz_target(fuzz_lz4_block_selftest SOURCES fuzz_lz4_block.cpp LIBS
                       lz4_oracle)
 target_compile_definitions(fuzz_lz4_block_selftest
+                           PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
+
+# The Snappy pair (issue #90), the same two binaries for the same two reasons.
+cudec_add_fuzz_target(fuzz_snappy_block SOURCES fuzz_snappy_block.cpp LIBS
+                      snappy_oracle)
+cudec_add_fuzz_target(fuzz_snappy_block_selftest SOURCES fuzz_snappy_block.cpp
+                      LIBS snappy_oracle)
+target_compile_definitions(fuzz_snappy_block_selftest
                            PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
