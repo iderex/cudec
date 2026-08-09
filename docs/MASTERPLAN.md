@@ -268,7 +268,8 @@ is not an empty AMD field), and **hackability**.
 
 ## 8. Open design questions (settled via design issues before use)
 
-- Benchmark corpus set beyond Silesia/enwik (game-asset-like data) - M2.
+The M2 list is empty. Both questions it held are resolved below, one retired
+and one settled.
 
 **Device-side chunk-size binning for mixed batches - RETIRED (issue #78,
 2026-08-08), with the trigger that reopens it.** The async batch ABI rules out
@@ -303,12 +304,36 @@ chunk-size distribution and at a uniform one, in the same container on the same
 GPU, with the mixed rung slower by more than the run-to-run spread both rungs
 report. Both numbers go in [docs/BENCHMARKS.md](BENCHMARKS.md) with the full
 methodology block before anything is designed. The asset-like benchmark corpus
-(the question still open above) is the natural source of such a distribution,
-so that measurement is the cheapest route to reopening this - and until it
-exists, this stays retired.
+settled below is the natural source of such a distribution, so that
+measurement is the cheapest route to reopening this - and until it exists,
+this stays retired.
 
-This retires one of the two M2 questions. The corpus question above is the
-other and is still open, so the M2 list is not yet empty.
+**The benchmark corpus set beyond Silesia/enwik - SETTLED (issue #139,
+2026-08-09).** The game-asset-like corpus is GENERATED, deterministically in
+the bench harness, rather than fetched from a redistributable asset pack. No
+network, no mirror that can rot, no licence review on a third-party package,
+and the pattern already stands twice in the tree: `BuildWorst4bCorpus` and
+`BuildLongmatchCorpus` construct their block directly, round-trip it through
+`LZ4_decompress_safe` before any timing, and assert the intended shape. The
+generator is `--assetlike`, locked against rot by the CPU-only
+`bench_assetlike_selfcheck` ctest.
+
+The price is in the documentation rather than the small print: a generated
+corpus is a MODEL of the workload and not the workload. A synthetic mixture of
+texture-, mesh- and audio-shaped regions reproduces the regime - longer
+matches, a higher incompressible share, a different sequence density - and is
+expressly not a substitute for a measurement on real game data. That sentence
+sits beside the corpus entry in
+[BENCHMARK-METHODOLOGY.md](BENCHMARK-METHODOLOGY.md), and the baseline block
+in [BENCHMARKS.md](BENCHMARKS.md) carries it too once that block is recorded,
+so anyone quoting a number from the corpus sees what it was measured against.
+
+A hash-pinned asset pack would have been more representative, and for
+benchmarking that is what counts - the argument against the decision at full
+strength. It would have cost a licence review, two mirrors and a manifest, and
+put CI on the network; building both would have created two regimes to keep
+apart at citation time. The option stays open: a pack with checked terms joins
+the set BESIDE the generator rather than replacing it, and CI stays offline.
 
 Settled: test framework and oracle vendoring (section 5, via the #4 design
 review); dev-container image and CI toolchain pinning (issues #1/#3 -
@@ -321,7 +346,11 @@ technique from the #4 harness once the geometry lands:
 `CUDEC_ERR_INVALID_ARGUMENT` = rejected, no constant published); the
 Snappy raw-format decode and the seam it rides (section 10, via the #85
 design panel - parser contract, validation ladder, batch entry, and the
-framing format ruled out of scope with its evidence).
+framing format ruled out of scope with its evidence); the benchmark corpus
+set beyond Silesia/enwik (issue #139 - a deterministic in-harness generator
+for the game-asset-like regime rather than a redistributable pack, with the
+representativeness it gives up stated wherever its numbers are, argued in full
+above).
 
 ## 9. M1 kernel design (settled via the #6 design panel, 2026-07-17)
 

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,6 +62,49 @@ static_assert(kLongmatchOffset >= kLongmatchMatchLen,
               "that disjoint-range regime is exactly what issue #36's fast "
               "path targets, and an overlapping block would measure the "
               "wrong thing");
+
+/* The game-asset-like corpus (issue #139). Same 64 KB chunk and ~200 MB
+ * scale as the three rows above so every throughput number in the record is
+ * directly comparable. It models the payload of a shipped asset package -
+ * block-compressed texture, interleaved geometry, streamed audio - and it is
+ * the one regime none of the recorded corpora reaches: most of the block is
+ * incompressible, so the decode is dominated by literal transfer rather than
+ * by sequence parsing (worst-4Bmatch) or by match copying (longmatch).
+ *
+ * It is a MODEL of the workload, not the workload. A synthetic mixture is
+ * not a measurement on real game data, and no number taken here may be
+ * quoted as one; docs/BENCHMARK-METHODOLOGY.md carries the same sentence
+ * beside the corpus entry. The maintainer's decision on issue #139 chose the
+ * generator over a hash-pinned asset pack deliberately: no network, no mirror
+ * that can rot, no licence review on a third-party package, and CI stays
+ * offline. A vetted pack may later join the set beside this generator; it
+ * does not replace it. */
+constexpr size_t kAssetlikeChunks = 3200;
+constexpr size_t kAssetlikeSelfcheckChunks = 4;
+
+/* The three regions of the block, in bytes, tiling one chunk exactly. The
+ * proportions follow a shipped package: block-compressed texture dominates,
+ * geometry follows, streamed audio fills the rest. */
+constexpr size_t kAssetTextureBytes = 32768;
+constexpr size_t kAssetVertexBytes = 14336;
+constexpr size_t kAssetIndexBytes = 2048;
+constexpr size_t kAssetAudioBytes = 16384;
+static_assert(kAssetTextureBytes + kAssetVertexBytes + kAssetIndexBytes +
+                      kAssetAudioBytes ==
+                  kChunkBytes,
+              "the asset-like regions must tile the 64 KB chunk exactly: a "
+              "short block would change the chunk-size distribution the "
+              "report attests");
+
+/* BC1/DXT1 layout: two 16-bit endpoints plus 32 bits of 2-bit indices. */
+constexpr size_t kAssetTexBlockBytes = 8;
+/* A 64-block-wide image, in 8x8-block tiles. */
+constexpr size_t kAssetTexBlocksPerRow = 64;
+constexpr size_t kAssetTexTileBlocks = 8;
+/* Interleaved position/normal/uv/colour/tangent record. */
+constexpr size_t kAssetVertexStride = 32;
+/* The lattice the geometry sits on, and the row step the index buffer uses. */
+constexpr size_t kAssetLatticeWidth = 28;
 
 struct Corpus {
     std::string name;
@@ -385,6 +429,324 @@ bool BuildLongmatchCorpus(Corpus* corpus, size_t chunks) {
     return true;
 }
 
+/* Deterministic byte source for the asset-like block. SplitMix64, chosen
+ * because it is four lines of integer arithmetic with no state beyond a
+ * uint64: the corpus must be byte-identical on the CI runner and on the GPU
+ * box, and a library generator's stream is not fixed across standard
+ * libraries. */
+uint64_t SplitMix64(uint64_t* state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+/* Parabolic sine approximation over a 1024-step period, in [-16384, 16384].
+ * Integer-only on purpose: a libm sine is free to differ in the last bits
+ * between platforms, which would make the corpus - and therefore every
+ * recorded number taken on it - not reproducible off this machine. */
+int32_t PseudoSine(uint32_t phase) {
+    const uint32_t p = phase & 1023u;
+    const uint32_t half = p & 511u;
+    const int32_t y = static_cast<int32_t>((half * (512u - half)) >> 2);
+    return p < 512u ? y : -y;
+}
+
+void PushLe16(std::vector<unsigned char>* out, uint16_t v) {
+    out->push_back(static_cast<unsigned char>(v & 0xFF));
+    out->push_back(static_cast<unsigned char>((v >> 8) & 0xFF));
+}
+
+/* A 32-bit float's byte pattern without touching a float: the high half
+ * carries sign, exponent and the top mantissa bits, which barely move across
+ * neighbouring vertices, while the low half is noise. That split is what
+ * makes vertex data compress the way it does - partial matches at the record
+ * stride - and building it from integers keeps the block reproducible and
+ * the harness free of the floating-point types the project bans in sources. */
+void PushPseudoFloat(std::vector<unsigned char>* out, uint16_t hi,
+                     uint16_t lo) {
+    PushLe16(out, lo);
+    PushLe16(out, hi);
+}
+
+/* Block-compressed texture: 8-byte BC1 blocks in raster order over a
+ * 64-block-wide image. A third of the 8x8-block tiles are flat - every block
+ * in them identical, which is what a BC1 flat region really is - and the
+ * rest carry smoothly varying endpoints with high-entropy index bits. The
+ * flat tiles are the only source of long matches in the whole corpus; the
+ * detailed ones are where its incompressible share comes from. */
+void BuildTextureRegion(std::vector<unsigned char>* out, uint64_t* rng) {
+    const size_t blocks = kAssetTextureBytes / kAssetTexBlockBytes;
+    for (size_t b = 0; b < blocks; b++) {
+        const size_t bx = b % kAssetTexBlocksPerRow;
+        const size_t by = b / kAssetTexBlocksPerRow;
+        const size_t tx = bx / kAssetTexTileBlocks;
+        const size_t ty = by / kAssetTexTileBlocks;
+        const bool flat = ((tx + ty) % 3u) == 0u;
+        /* Inside a flat tile the endpoints depend on the TILE, not on the
+         * block, so all 64 of its blocks are byte-identical. */
+        const uint16_t r =
+            static_cast<uint16_t>((flat ? (tx * 5u) : (bx >> 1)) & 0x1F);
+        const uint16_t g = static_cast<uint16_t>((flat ? (ty * 9u) : by) &
+                                                 0x3F);
+        const uint16_t bl = static_cast<uint16_t>(
+            (flat ? (tx + ty) : ((bx + by) >> 2)) & 0x1F);
+        const uint16_t c0 = static_cast<uint16_t>((r << 11) | (g << 5) | bl);
+        const uint16_t c1 = static_cast<uint16_t>(c0 - 0x0821u);
+        PushLe16(out, c0);
+        PushLe16(out, c1);
+        if (flat) {
+            for (size_t i = 0; i < 4; i++) {
+                out->push_back(0x00);
+            }
+        } else {
+            const uint64_t bits = SplitMix64(rng);
+            for (size_t i = 0; i < 4; i++) {
+                out->push_back(static_cast<unsigned char>(bits >> (i * 8)));
+            }
+        }
+    }
+}
+
+/* Interleaved vertex records at a fixed 32-byte stride: position, packed
+ * normal, uv, colour, packed tangent. Everything that varies smoothly across
+ * the lattice sits in the high halves; everything noisy sits in the low
+ * halves. */
+void BuildVertexRegion(std::vector<unsigned char>* out, uint64_t* rng) {
+    const size_t records = kAssetVertexBytes / kAssetVertexStride;
+    static const unsigned char kPacked[8][4] = {
+        {0x7F, 0x00, 0x00, 0x00}, {0x00, 0x7F, 0x00, 0x00},
+        {0x00, 0x00, 0x7F, 0x00}, {0x5A, 0x5A, 0x00, 0x00},
+        {0x5A, 0x00, 0x5A, 0x00}, {0x00, 0x5A, 0x5A, 0x00},
+        {0x49, 0x49, 0x49, 0x00}, {0x81, 0x00, 0x00, 0x00}};
+    for (size_t v = 0; v < records; v++) {
+        const uint16_t gx = static_cast<uint16_t>(v % kAssetLatticeWidth);
+        const uint16_t gy = static_cast<uint16_t>(v / kAssetLatticeWidth);
+        const uint64_t noise = SplitMix64(rng);
+        PushPseudoFloat(out, static_cast<uint16_t>(0x3F80u + gx),
+                        static_cast<uint16_t>(noise & 0xFFFFu));
+        PushPseudoFloat(out, static_cast<uint16_t>(0x3F80u + gy),
+                        static_cast<uint16_t>((noise >> 16) & 0xFFFFu));
+        PushPseudoFloat(out, static_cast<uint16_t>(0x3E00u + ((gx + gy) & 7u)),
+                        static_cast<uint16_t>((noise >> 32) & 0xFFFFu));
+        const unsigned char* n = kPacked[(gx + gy) & 7u];
+        for (size_t i = 0; i < 4; i++) {
+            out->push_back(n[i]);
+        }
+        PushPseudoFloat(out, static_cast<uint16_t>(0x3F00u + (gx & 3u)),
+                        static_cast<uint16_t>((noise >> 48) & 0xFFFFu));
+        PushPseudoFloat(out, static_cast<uint16_t>(0x3F00u + (gy & 3u)),
+                        static_cast<uint16_t>(SplitMix64(rng) & 0xFFFFu));
+        out->push_back(static_cast<unsigned char>(0xC0u + (gx & 0x1Fu)));
+        out->push_back(static_cast<unsigned char>(0xC0u + (gy & 0x1Fu)));
+        out->push_back(0xB4);
+        out->push_back(0xFF);
+        const unsigned char* t = kPacked[(gx * 3u + gy) & 7u];
+        for (size_t i = 0; i < 4; i++) {
+            out->push_back(t[i]);
+        }
+    }
+}
+
+/* A triangle-list index buffer over the same lattice: three 16-bit indices
+ * per triangle, the base walking forward one vertex at a time. Slowly
+ * increasing 16-bit values are the shape that defeats a 4-byte minimum
+ * match, which is why the region is carried rather than assumed away. */
+void BuildIndexRegion(std::vector<unsigned char>* out) {
+    const size_t indices = kAssetIndexBytes / 2;
+    const size_t records = kAssetVertexBytes / kAssetVertexStride;
+    /* Every emitted index stays inside the vertex region. */
+    const size_t bases = records - (kAssetLatticeWidth + 2);
+    static const size_t kCorner[3] = {0, 1, kAssetLatticeWidth};
+    for (size_t i = 0; i < indices; i++) {
+        const size_t base = (i / 3) % bases;
+        PushLe16(out, static_cast<uint16_t>(base + kCorner[i % 3]));
+    }
+}
+
+/* Streamed audio: 16-bit stereo PCM, three detuned oscillators plus a small
+ * dither. The high byte of each sample moves smoothly and the low byte does
+ * not, so the region is effectively incompressible - which is what audio in
+ * an asset package is, and a large part of why this corpus sits where it
+ * does on the ratio scale. */
+void BuildAudioRegion(std::vector<unsigned char>* out, uint64_t* rng) {
+    const size_t frames = kAssetAudioBytes / 4;
+    for (size_t f = 0; f < frames; f++) {
+        const uint64_t noise = SplitMix64(rng);
+        for (size_t ch = 0; ch < 2; ch++) {
+            const uint32_t phase = static_cast<uint32_t>(f * 7u + ch * 61u);
+            int32_t s = PseudoSine(phase) + (PseudoSine(phase * 3u) >> 1) +
+                        (PseudoSine(phase * 11u) >> 2);
+            s += static_cast<int32_t>((noise >> (ch * 8)) & 0x7F) - 64;
+            PushLe16(out, static_cast<uint16_t>(s & 0xFFFF));
+        }
+    }
+}
+
+void BuildAssetlikeSource(std::vector<unsigned char>* original) {
+    uint64_t rng = 0x5C0DEC0A55E7ull;
+    original->clear();
+    original->reserve(kChunkBytes);
+    BuildTextureRegion(original, &rng);
+    BuildVertexRegion(original, &rng);
+    BuildIndexRegion(original);
+    BuildAudioRegion(original, &rng);
+}
+
+/* What one pass over a valid LZ4 block says about its shape. */
+struct BlockShape {
+    size_t sequences;
+    size_t literal_bytes;
+    size_t match_bytes;
+};
+
+/* Walks an LZ4 block and totals its sequence count, literal bytes and match
+ * bytes. Used only on a stream the oracle has already accepted, so a
+ * malformed walk is a harness bug rather than an input verdict - it returns
+ * false and the caller refuses to time anything. Every loop advances `pos`
+ * on each iteration and `pos` is bounded by the block size, so the walk
+ * terminates on any input. */
+bool WalkBlock(const std::vector<unsigned char>& c, size_t out_bytes,
+               BlockShape* shape) {
+    *shape = BlockShape{0, 0, 0};
+    size_t pos = 0;
+    while (pos < c.size()) {
+        const unsigned char token = c[pos++];
+        size_t lit = token >> 4;
+        if (lit == 15) {
+            while (pos < c.size() && c[pos] == 255) {
+                lit += 255;
+                pos++;
+            }
+            if (pos >= c.size()) {
+                return false;
+            }
+            lit += c[pos++];
+        }
+        if (c.size() - pos < lit) {
+            return false;
+        }
+        shape->literal_bytes += lit;
+        pos += lit;
+        /* A block ends on a literals-only sequence: no offset follows. */
+        if (pos == c.size()) {
+            break;
+        }
+        if (c.size() - pos < 2) {
+            return false;
+        }
+        pos += 2; /* the two little-endian offset bytes */
+        size_t match = token & 0x0F;
+        if (match == 15) {
+            while (pos < c.size() && c[pos] == 255) {
+                match += 255;
+                pos++;
+            }
+            if (pos >= c.size()) {
+                return false;
+            }
+            match += c[pos++];
+        }
+        match += 4; /* MINMATCH */
+        shape->sequences++;
+        shape->match_bytes += match;
+    }
+    return shape->literal_bytes + shape->match_bytes == out_bytes;
+}
+
+/* Replicates the asset-like block to `chunks` identical chunks. Unlike the
+ * two adversarial corpora above, the compressed stream here is ordinary
+ * `LZ4_compress_default` output: the shape being modelled is the SOURCE
+ * data, and letting the standard compressor decide the sequence structure is
+ * the whole point - a hand-built wire would model the compressor too.
+ *
+ * The oracle still round-trips it before any timing, and the shape lock
+ * below is over the four quantities that define the regime rather than over
+ * the ratio alone. */
+bool BuildAssetlikeCorpus(Corpus* corpus, size_t chunks) {
+    std::vector<unsigned char> original;
+    BuildAssetlikeSource(&original);
+    if (original.size() != kChunkBytes) {
+        std::fprintf(stderr, "asset-like block is %zu bytes, expected %zu\n",
+                     original.size(), kChunkBytes);
+        return false;
+    }
+    std::vector<unsigned char> compressed = Lz4CompressBlock(original);
+
+    std::vector<unsigned char> decoded;
+    if (!OracleDecodes(compressed, original.size(), &decoded) ||
+        decoded.size() != original.size() ||
+        std::memcmp(decoded.data(), original.data(), decoded.size()) != 0) {
+        std::fprintf(stderr, "asset-like construction rejected by the oracle "
+                             "- refusing to time an invalid stream\n");
+        return false;
+    }
+
+    /* Lock the REGIME, not just validity. The intended block is mostly
+     * incompressible with a modest number of short-to-medium matches, which
+     * is what separates it from every recorded corpus: worst-4Bmatch is
+     * parse-bound (one sequence per 4 output bytes), longmatch is copy-bound
+     * (few sequences, very long matches), Silesia and enwik8 compress far
+     * harder. A generator that drifted toward any of those - or that lost
+     * its noise sources and became repetitive, or lost its structure and
+     * became pure noise - leaves at least one of these four bands, and the
+     * selfcheck reds. The numbers below were measured on the block this
+     * generator produces against the pinned liblz4; the bands carry margin
+     * for a compressor version bump, not for a changed generator. */
+    BlockShape shape;
+    if (!WalkBlock(compressed, original.size(), &shape)) {
+        std::fprintf(stderr, "asset-like block failed the shape walk - the "
+                             "harness cannot attest a regime it cannot "
+                             "parse\n");
+        return false;
+    }
+    const double ratio = static_cast<double>(compressed.size()) /
+                         static_cast<double>(original.size());
+    const double literal_share = static_cast<double>(shape.literal_bytes) /
+                                 static_cast<double>(original.size());
+    const double mean_match =
+        shape.sequences == 0 ? 0.0
+                             : static_cast<double>(shape.match_bytes) /
+                                   static_cast<double>(shape.sequences);
+    if (ratio < 0.70 || ratio > 0.90) {
+        std::fprintf(stderr, "asset-like block is not the intended shape: "
+                             "compressed/original %.4f outside the "
+                             "[0.70, 0.90] band\n",
+                     ratio);
+        return false;
+    }
+    if (literal_share < 0.55) {
+        std::fprintf(stderr, "asset-like block is not literal-dominated: "
+                             "literal share %.4f below the 0.55 floor\n",
+                     literal_share);
+        return false;
+    }
+    if (shape.sequences < 1200 || shape.sequences > 4000) {
+        std::fprintf(stderr, "asset-like block has %zu sequences, outside the "
+                             "[1200, 4000] density band\n",
+                     shape.sequences);
+        return false;
+    }
+    if (mean_match < 6.0 || mean_match > 20.0) {
+        std::fprintf(stderr, "asset-like block's mean match length %.2f is "
+                             "outside the [6, 20] band\n",
+                     mean_match);
+        return false;
+    }
+
+    corpus->name = "asset-like";
+    corpus->originals.assign(chunks, original);
+    corpus->compressed.assign(chunks, compressed);
+    corpus->original_bytes = original.size() * chunks;
+    corpus->compressed_bytes = compressed.size() * chunks;
+    corpus->provenance = "generated in-harness, a MODEL of a game asset "
+                         "package (BC1 texture, interleaved geometry, 16-bit "
+                         "PCM audio) and not a measurement on real game "
+                         "data; compressed by LZ4_compress_default and "
+                         "oracle-validated";
+    return true;
+}
+
 /* One measured repetition: decode the whole batch, wall clock. The timed
  * region contains ONLY LZ4_decompress_safe calls into a pre-sized scratch
  * buffer - no buffer clears, no allocation - so the label on the number
@@ -518,6 +880,7 @@ int main(int argc, char** argv) {
     bool gpu_stream_ctx = false;
     bool worst4b = false;
     bool longmatch = false;
+    bool assetlike = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -531,6 +894,8 @@ int main(int argc, char** argv) {
             worst4b = true;
         } else if (arg == "--longmatch") {
             longmatch = true;
+        } else if (arg == "--assetlike") {
+            assetlike = true;
         } else if (arg == "--runs" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n",
@@ -550,7 +915,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: bench_lz4 [--runs N] [--warmup N] [--gpu] "
                          "[--gpu-stream-ctx] [--worst4b] [--longmatch] "
-                         "[--selfcheck] [corpus files...]\n");
+                         "[--assetlike] [--selfcheck] [corpus files...]\n");
             return 2;
         } else {
             files.push_back(arg);
@@ -561,9 +926,11 @@ int main(int argc, char** argv) {
         runs = 3;
     }
 
-    if (worst4b && longmatch) {
-        std::fprintf(stderr, "--worst4b and --longmatch each build their own "
-                             "corpus; pass at most one\n");
+    const int generated = (worst4b ? 1 : 0) + (longmatch ? 1 : 0) +
+                          (assetlike ? 1 : 0);
+    if (generated > 1) {
+        std::fprintf(stderr, "--worst4b, --longmatch and --assetlike each "
+                             "build their own corpus; pass at most one\n");
         return 2;
     }
 
@@ -589,6 +956,20 @@ int main(int argc, char** argv) {
         }
         if (!BuildLongmatchCorpus(&corpus, selfcheck ? kLongmatchSelfcheckChunks
                                                      : kLongmatchChunks)) {
+            return 1;
+        }
+    } else if (assetlike) {
+        /* Generated like the two above, though its wire is ordinary
+         * compressor output rather than hand-built; it carries its own
+         * compressed streams either way, so it must not also take files. */
+        if (!files.empty()) {
+            std::fprintf(stderr, "--assetlike builds its own corpus; do not "
+                                 "also pass corpus files\n");
+            return 2;
+        }
+        if (!BuildAssetlikeCorpus(&corpus, selfcheck
+                                               ? kAssetlikeSelfcheckChunks
+                                               : kAssetlikeChunks)) {
             return 1;
         }
     } else if (files.empty()) {
@@ -629,8 +1010,10 @@ int main(int argc, char** argv) {
     /* The worst-case and longmatch corpora already carry their hand-built
      * streams; the standard compressor would replace them (a single long
      * match, or a fixed-offset run collapsed into one match), defeating the
-     * point. Every other corpus is compressed by the oracle here. */
-    if (!worst4b && !longmatch) {
+     * point. The asset-like corpus is compressor output, but it was
+     * compressed inside its builder so its shape could be locked there.
+     * Every other corpus is compressed by the oracle here. */
+    if (generated == 0) {
         CompressAll(&corpus);
     }
 
