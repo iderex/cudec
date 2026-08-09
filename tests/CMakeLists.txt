@@ -19,6 +19,13 @@ include(${PROJECT_SOURCE_DIR}/cmake/CudecLz4Oracle.cmake)
 # same pin (issue #90), for the reason the liblz4 include above carries.
 include(${PROJECT_SOURCE_DIR}/cmake/CudecSnappyOracle.cmake)
 
+# The NVIDIA/libdeflate fork and its gdeflate_oracle target, the M4 oracle
+# (issue #168). In its own module from the start rather than after a second
+# consumer appears: the M4 fuzz rungs are that consumer, and the pin's three
+# deviations from the standing policy are argued next to the pin instead of
+# here.
+include(${PROJECT_SOURCE_DIR}/cmake/CudecGDeflateOracle.cmake)
+
 # facebook/zstd, the M5 oracle, pinned by the SHA-256 of the
 # MAINTAINER-UPLOADED release asset - the shape the pinning policy prefers and
 # lz4 already uses, rather than the auto-generated /archive/ tarball snappy
@@ -225,6 +232,15 @@ cudec_add_test(oracle_lz4 SOURCES oracle_lz4.cpp LIBS cudec_test_fixtures)
 # and nothing about cudec's own Snappy path, which does not exist yet.
 cudec_add_test(oracle_snappy SOURCES oracle_snappy.cpp LIBS
                cudec_test_fixtures)
+# The M4 oracle proving itself (issue #168), the counterpart of oracle_snappy
+# one milestone later: the pin downloads and builds, both directions link, a
+# stream it produced comes back byte-identical, and the three answering
+# behaviours the M4 parity tests have to be written around are pinned rather
+# than assumed. It links gdeflate_oracle alone - the shared fixture library
+# carries no GDeflate anything yet, and adding this to it would put the fork's
+# headers in front of every test that includes fixtures.h.
+cudec_add_test(oracle_gdeflate SOURCES oracle_gdeflate.cpp LIBS
+               gdeflate_oracle)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.
