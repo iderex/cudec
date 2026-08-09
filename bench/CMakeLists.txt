@@ -7,8 +7,13 @@
 find_package(CUDAToolkit REQUIRED)
 
 add_executable(bench_lz4 bench_lz4.cpp gpu_bench.cu)
+# lz4_frame_oracle is the frame COMPRESSOR for --frame (issue #132): the
+# harness has to produce block-independent .lz4 frames to time
+# cudec_lz4f_decompress on, and liblz4's frame compressor defaults to the
+# linked mode cudec refuses. Nothing here decodes through it - the frame
+# decode under test is cudec's.
 target_link_libraries(bench_lz4 PRIVATE cudec cudec_test_fixtures lz4_oracle
-                                        CUDA::cudart)
+                                        lz4_frame_oracle CUDA::cudart)
 # gpu_bench.cu includes the internal kernel header from src/.
 target_include_directories(bench_lz4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 set_target_properties(
@@ -55,6 +60,16 @@ add_test(NAME bench_longmatch_selfcheck COMMAND bench_lz4 --longmatch
 add_test(NAME bench_assetlike_selfcheck COMMAND bench_lz4 --assetlike
                                                 --selfcheck)
 
+# The frame sweep (issue #132). Unlike the four above this one cannot be
+# CPU-only: --frame times cudec_lz4f_decompress, which decodes on the
+# device, so the rot check that runs the same construction has to run there
+# too. It therefore carries the gpu label and the GPU-less CI runner defers
+# it to the local gate, exactly like frame_twin. RUN_SERIAL for the reason
+# every gpu test here has it: one device, one occupant.
+add_test(NAME bench_frame_selfcheck COMMAND bench_lz4 --frame --selfcheck)
+set_tests_properties(bench_frame_selfcheck PROPERTIES LABELS gpu RUN_SERIAL
+                                                      TRUE)
+
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
 # sequence-compression entry point and decoded by the reference, so the
@@ -96,6 +111,6 @@ add_test(NAME bench_zstd_worst_selfcheck COMMAND bench_zstd --worst
 # one.
 set_tests_properties(
   bench_selfcheck bench_worst4b_selfcheck bench_longmatch_selfcheck
-  bench_assetlike_selfcheck bench_zstd_worst_selfcheck
+  bench_assetlike_selfcheck bench_zstd_worst_selfcheck bench_frame_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()
