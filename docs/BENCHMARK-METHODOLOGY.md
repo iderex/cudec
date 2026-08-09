@@ -199,19 +199,28 @@ device-to-host readback - wall-clocked. On Silesia, reusing a warmed context:
 
 | Output target            | Steady-state (reused ctx) | Cold (fresh ctx) |
 | ------------------------ | ------------------------- | ---------------- |
-| Device out               | ~0.92 GB/s (229.5 ms)     | ~0.89 GB/s       |
-| Host out (sync readback) | ~0.58 GB/s (365.2 ms)     | ~0.57 GB/s       |
+| Device out               | ~7.65 GB/s (27.7 ms)      | ~1.39 GB/s       |
+| Host out (sync readback) | ~1.36 GB/s (155.4 ms)     | ~0.76 GB/s       |
 
-This is a different, honest metric - not a regression of the ~18 GB/s
-device-resident kernel throughput. Read it plainly:
+Recorded 2026-08-09, after the wave sizing landed (issue #33); the rows it
+replaced read 229.5 ms and 365.2 ms at a fixed 64-chunk wave. This is a
+different, honest metric - not a regression of the ~18 GB/s device-resident
+kernel throughput. Read it plainly:
 
-- **The streaming wall is submission-bound, not compute-bound.** Against a
-  ~12 ms device-resident decode and a ~4 ms compressed host-to-device copy,
-  the ~230 ms steady-state wall is dominated by the **per-wave serial
-  submission** of the batch (Silesia is ~51 waves of 64 chunks) on this
-  WSL2/WDDM path, where each submission flush costs milliseconds. Raising the
-  wave granularity so the path submits once is the real lever, tracked as
-  [issue #33](https://github.com/iderex/cudec/issues/33).
+- **The streaming wall was submission-bound, not compute-bound, and that is
+  what was fixed.** Against a ~12 ms device-resident decode and a ~4 ms
+  compressed host-to-device copy, the old ~230 ms steady-state wall was
+  dominated by the **per-wave serial submission** of the batch (Silesia was
+  ~51 waves of 64 chunks) on this WSL2/WDDM path, where each submission flush
+  costs milliseconds. Sizing the wave by its staging cost instead
+  ([issue #33](https://github.com/iderex/cudec/issues/33)) makes Silesia one
+  submission on the device path and brings the wall to 27.7 ms, an 8.5×
+  improvement won in 5 of 5 alternated passes. Peak staging is bounded at
+  384 MiB by construction, which is the price and is stated in
+  [BENCHMARKS.md](BENCHMARKS.md) beside the table.
+- **Host output is still ~5× the device path**, and not because of the wave:
+  its readback targets pageable caller memory one chunk at a time, so it is
+  3239 synchronous copies at any wave size. That is issues #133 and #135.
 - **The per-call allocation is not the dominant cost** (~8 ms cold − steady),
   correcting the earlier assumption; the reusable context earns its place as a
   simplification and as the primitive #33 builds on, not as a speedup.

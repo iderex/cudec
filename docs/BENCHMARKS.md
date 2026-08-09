@@ -658,6 +658,68 @@ The device-resident M1 row (~18 GB/s, H2D/D2H excluded) remains the kernel
 throughput; the streaming numbers are a different, honest metric (copy +
 per-wave submission included) and are not a regression of it.
 
+### The wave is sized by staging, not by a chunk count (issue #33)
+
+The attribution above named the lever and this is it taken. `kWaveChunks = 64`
+is gone; the wave is now the largest number of chunks whose staging fits a
+384 MiB budget, capped at 4096 chunks. The budget is charged against the
+LARGEST chunk in the call rather than the mean, so peak staging stays inside it
+for any distribution including a hostile one, and the chunk ceiling bounds the
+metadata staging on its own - without it a batch of zero-length chunks divides
+the budget by one. Silesia's 3239 chunks become ONE wave on the device-output
+path and two on the host-output path, against ~51 before.
+
+Measured 2026-08-09, same container and RTX 3080. **Both binaries built once
+up front and then alternated**, baseline and patched, pass after pass - the
+protocol perf pass 4 established, because this host drifts over minutes.
+3 warmup + 30 runs per number, `--gpu-stream-ctx`.
+
+| Pass   | Baseline device out | Patched device out |
+| ------ | ------------------- | ------------------ |
+| 1      | 232.5 ms            | 27.2 ms            |
+| 2      | 235.6 ms            | 27.7 ms            |
+| 3      | 235.0 ms            | 27.8 ms            |
+| 4      | 235.5 ms            | 28.2 ms            |
+| 5      | 235.4 ms            | 27.6 ms            |
+| median | **235.4 ms**        | **27.7 ms**        |
+
+| Pass   | Baseline host out | Patched host out |
+| ------ | ----------------- | ---------------- |
+| 1      | 377.5 ms          | 155.4 ms         |
+| 2      | 391.1 ms          | 155.0 ms         |
+| 3      | 374.3 ms          | 173.9 ms         |
+| median | **377.5 ms**      | **155.4 ms**     |
+
+Device output is **8.5× faster** (0.90 → 7.65 GB/s), won in 5 of 5 passes; host
+output is **2.4× faster** (0.56 → 1.36 GB/s), won in 3 of 3. The steady-state
+device wall lands at 27.7 ms against the ~16 ms floor the issue named (a ~12 ms
+device-resident decode plus a ~4 ms compressed H2D), so the residual is now
+~12 ms rather than ~213 ms. That residual is not isolated here and no claim is
+made about it.
+
+**Host output does not reach the same place, and the reason is not the wave.**
+Its D2H targets pageable caller memory one chunk at a time, so it is 3239
+synchronous copies whatever the wave size; the wave change removes the
+submission cost around them and leaves the copies. That path is what issues
+#133 and #135 are about.
+
+**The price, stated rather than implied.** Peak staging rises from ~4 MB per
+wave to at most the budget: device memory (compressed source plus, for host
+output, the destination arena) stays within 384 MiB by construction, and pinned
+host memory within the same bound for the source. For Silesia that is ~102 MB
+pinned and ~102 MB device on the device-output path. One exception is
+deliberate: a single chunk larger than the whole budget still decodes, alone in
+its own wave, because the budget sizes a wave and is not a capacity limit on
+the ABI.
+
+Cold (first decode on a fresh context) moves the other way and is reported for
+the same reason: 241.5 → 152.5 ms on the device path, so the larger allocation
+costs more to make and still finishes ahead of the baseline's submission count.
+
+`stream_twin` - the same input decoded on a reused context is bit-identical to
+a fresh-context decode - stays green, along with the rest of the suite
+(`100% tests passed, 0 tests failed out of 36`).
+
 ## M2: the frame path end to end, swept over block count (issue #132)
 
 The frame entry point had no bench at all, so the per-block choreography
