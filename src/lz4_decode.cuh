@@ -110,10 +110,35 @@ __global__ void __launch_bounds__(kBlockThreads)
                 __syncwarp();
                 if (seq.match_len != 0) {
                     const uint64_t offset = seq.match_dst - seq.match_src;
-                    for (uint64_t i = lane; i < seq.match_len;
-                         i += kWarpSize) {
-                        dst[seq.match_dst + i] =
-                            dst[seq.match_src + (i % offset)];
+                    /* Same closed-form gather at two arithmetic widths.
+                     * sm_86 has no integer-divide hardware, so a modulo by
+                     * a runtime divisor is a software sequence, and the
+                     * 64-bit one costs roughly twice the 32-bit one - paid
+                     * once per match byte per lane. `offset` is the LZ4
+                     * 2-byte offset field and never exceeds 65535, but `i`
+                     * is bounded only by match_len, which the ABI's size_t
+                     * capacities admit above 2^32, so the narrowing is
+                     * sound only under the test. No field is narrowed and
+                     * no bound is taken from the 64 KiB convention: the
+                     * stored sequence stays 64-bit and a match longer than
+                     * 2^32 still decodes, through the other arm. The test
+                     * is warp-uniform (every lane parsed the same bytes),
+                     * so it costs no divergence and cannot strand a lane at
+                     * the __syncwarp() below. */
+                    if (seq.match_len <= UINT32_MAX) {
+                        const uint32_t off32 = static_cast<uint32_t>(offset);
+                        for (uint64_t i = lane; i < seq.match_len;
+                             i += kWarpSize) {
+                            dst[seq.match_dst + i] =
+                                dst[seq.match_src +
+                                    (static_cast<uint32_t>(i) % off32)];
+                        }
+                    } else {
+                        for (uint64_t i = lane; i < seq.match_len;
+                             i += kWarpSize) {
+                            dst[seq.match_dst + i] =
+                                dst[seq.match_src + (i % offset)];
+                        }
                     }
                     /* The next sequence may read bytes this match wrote. */
                     __syncwarp();
