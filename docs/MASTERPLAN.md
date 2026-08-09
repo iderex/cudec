@@ -234,7 +234,23 @@ is not an empty AMD field), and **hackability**.
   and without the project's strict flags; only the translation units the
   oracle's decode path needs, never its build system. For liblz4 that is one
   file; the Snappy oracle needs two, because the source abstraction its
-  exact-consume decode reads through lives in a second one.
+  exact-consume decode reads through lives in a second one; the GDeflate
+  oracle needs six, because it is the only one that also compresses.
+- **The GDeflate oracle deviates from that policy in three named ways**, and
+  they are deliberate rather than oversights. The NVIDIA fork of libdeflate
+  publishes no release asset and no tag at all, so the pin is a commit
+  archive - one step further from the preferred shape than snappy's tag
+  archive. No second packaging ecosystem carries the fork, so the
+  cross-check is the commit sha together with the archive hash rather than a
+  second party's hash. And the fork sits far behind upstream libdeflate,
+  including whatever correctness fixes those commits carry, which is
+  acceptable in a thing whose job is to be where real data came from and is
+  the reason it is never a source to derive from. It is under the manual-bump
+  rule above like every other FetchContent pin: Dependabot cannot see it, and
+  it moves only in a deliberate pull request under the supply-chain sweep.
+  The pin, the deviations and the commands that re-derive them are in
+  `cmake/CudecGDeflateOracle.cmake`, next to the pin they are about;
+  section 11.7 is where they were decided.
 - Fuzzing: mutation-based corpus fuzzing of the host-side parsers, plus
   GPU-vs-oracle diff loops on mutated streams for the kernels.
 - Benchmarks live in `bench/` with recorded methodology; every published
