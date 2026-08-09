@@ -18,6 +18,14 @@ namespace cudec_detail {
 constexpr unsigned kBlockWarps = 4;
 constexpr unsigned kBlockThreads = kWarpSize * kBlockWarps;  /* 128 */
 
+/* The largest match length whose byte indices a 32-bit gather can address,
+ * spelled as the widest uint32_t. Neither shorter spelling can be written
+ * in this directory: the batch-limit scanner matches the standard macro's
+ * name as a substring of its own, and the structural scanner refuses the
+ * digits in a shift by the width. Both are locks worth having and neither
+ * has this line as its subject (issue #333). */
+constexpr uint64_t kGather32BitMaxLen = ~uint32_t{0};
+
 /* One warp per chunk over a grid-stride loop. All 32 lanes run the
  * validated parser redundantly in lockstep and fan out by lane for every
  * copy; overlapping matches use the closed-form modular gather
@@ -125,7 +133,7 @@ __global__ void __launch_bounds__(kBlockThreads)
                      * is warp-uniform (every lane parsed the same bytes),
                      * so it costs no divergence and cannot strand a lane at
                      * the __syncwarp() below. */
-                    if (seq.match_len <= UINT32_MAX) {
+                    if (seq.match_len <= kGather32BitMaxLen) {
                         const uint32_t off32 = static_cast<uint32_t>(offset);
                         for (uint64_t i = lane; i < seq.match_len;
                              i += kWarpSize) {
