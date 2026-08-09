@@ -44,6 +44,17 @@ add_test(NAME bench_worst4b_selfcheck COMMAND bench_lz4 --worst4b --selfcheck)
 add_test(NAME bench_longmatch_selfcheck COMMAND bench_lz4 --longmatch
                                                 --selfcheck)
 
+# The game-asset-like corpus (issue #139). Its source block is generated and
+# its wire is ordinary LZ4_compress_default output, so the round-trip alone
+# would pass on almost any block; the lock is over four quantities that
+# together name the regime - compression ratio, literal share, sequence count
+# and mean match length - because that regime is the whole reason the corpus
+# exists. A generator that lost a noise source drifts toward the compressible
+# corpora and one that lost its structure drifts toward pure noise; both leave
+# a band and red CI rather than a manual bench. CPU-only, like the two above.
+add_test(NAME bench_assetlike_selfcheck COMMAND bench_lz4 --assetlike
+                                                --selfcheck)
+
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
 # sequence-compression entry point and decoded by the reference, so the
@@ -85,6 +96,6 @@ add_test(NAME bench_zstd_worst_selfcheck COMMAND bench_zstd --worst
 # one.
 set_tests_properties(
   bench_selfcheck bench_worst4b_selfcheck bench_longmatch_selfcheck
-  bench_zstd_worst_selfcheck
+  bench_assetlike_selfcheck bench_zstd_worst_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()
