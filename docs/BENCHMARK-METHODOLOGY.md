@@ -145,6 +145,28 @@ an attacker who fully controls a valid input can force. The honest findings:
 - **The GPU advantage holds under the worst input:** 8.1 GB/s worst-case GPU
   is still ~5.4× the CPU worst case and ~2.3× the CPU's Silesia _average_.
 
+### asset-like (generated game-asset model)
+
+Recorded 2026-08-09, same platform and same container digest as the tables
+above. `bench_lz4 --assetlike --gpu --warmup 3 --runs 30`. The corpus is a
+MODEL of the workload and not the workload; nothing here is a measurement on
+real game data.
+
+| Path                                   | Throughput | Share of the decode |
+| -------------------------------------- | ---------- | ------------------- |
+| CPU oracle, liblz4 single thread       | 10.03 GB/s | -                   |
+| GPU decode, device-resident (cudec)    | 44.2 GB/s  | 4.748 ms            |
+| GPU parse-only ceiling (copies elided) | 81.5 GB/s  | 2.574 ms, 54%       |
+
+The right-hand column is the split rather than a comparison against Silesia,
+and that is deliberate: the Silesia rows above predate the gather narrowing
+(issue #58), so a ratio against them would mix two kernels. Within this
+invocation, copies are 2.174 ms of the 4.748 ms decode, and the GPU runs
+~4.4× the CPU oracle - a smaller factor than Silesia's, on an input where the
+oracle also has little to do. Where the regime sits against the other corpora
+on today's kernel is not established by this row and needs them re-measured in
+one session.
+
 ### enwik8 (text-heavy)
 
 Recorded 2026-08-05, same platform and same container digest as the tables
