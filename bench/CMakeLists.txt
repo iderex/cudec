@@ -44,6 +44,51 @@ add_test(NAME bench_worst4b_selfcheck COMMAND bench_lz4 --worst4b --selfcheck)
 add_test(NAME bench_longmatch_selfcheck COMMAND bench_lz4 --longmatch
                                                 --selfcheck)
 
+# The game-asset-like corpus (issue #139). Its source block is generated and
+# its wire is ordinary LZ4_compress_default output, so the round-trip alone
+# would pass on almost any block; the lock is over four quantities that
+# together name the regime - compression ratio, literal share, sequence count
+# and mean match length - because that regime is the whole reason the corpus
+# exists. A generator that lost a noise source drifts toward the compressible
+# corpora and one that lost its structure drifts toward pure noise; both leave
+# a band and red CI rather than a manual bench. CPU-only, like the two above.
+add_test(NAME bench_assetlike_selfcheck COMMAND bench_lz4 --assetlike
+                                                --selfcheck)
+
+# The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
+# are constructed on the host, emitted through the reference's own
+# sequence-compression entry point and decoded by the reference, so the
+# binary needs neither a device nor the cudec kernel.
+#
+# It compiles tests/zstd_corpus.cpp rather than restating it: the frame
+# walker there is what the shape lock reads modes and sequence counts out of,
+# and the forced-mode fixture set beside it is what the table-reuse refusal
+# is proven to still bite on. That file is consumed exactly as the tests
+# consume it, which is the rule this directory follows - it links and
+# compiles what tests/ defines and modifies none of it.
+#
+# zstd_full and never zstd_oracle: this corpus has to PRODUCE frames, and
+# tests/CMakeLists.txt records why a binary reaching for both archives is a
+# link the linker rightly refuses.
+add_executable(bench_zstd bench_zstd.cpp ../tests/zstd_corpus.cpp)
+target_link_libraries(bench_zstd PRIVATE zstd_full)
+target_include_directories(bench_zstd
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tests)
+set_target_properties(bench_zstd PROPERTIES CXX_STANDARD 17
+                                            CXX_STANDARD_REQUIRED ON)
+# -O2 unconditionally for the reason bench_lz4 gives above: the documented
+# container command sets no CMAKE_BUILD_TYPE, and an -O0 decode loop times
+# the marshaling rather than the decoder.
+target_compile_options(bench_zstd PRIVATE -Wall -Wextra -Werror -O2)
+
+# Same rot protection as the two above, and the same reasons: a generator
+# whose frames the oracle stops accepting, or that drifts off the
+# maximum-density / no-table-reuse / repeat-offset shape it is named for,
+# reds CI rather than a manual bench. CPU-only, so it runs on the GPU-less
+# runner.
+add_test(NAME bench_zstd_worst_selfcheck COMMAND bench_zstd --worst
+                                                 --selfcheck)
+
 # Every ctest entry carries a finite TIMEOUT (issue #72): the self-checks run
 # the same corpus construction and CPU decode the decoder is held to, so a
 # non-terminating decode must red them rather than stall the run. The
@@ -51,5 +96,6 @@ add_test(NAME bench_longmatch_selfcheck COMMAND bench_lz4 --longmatch
 # one.
 set_tests_properties(
   bench_selfcheck bench_worst4b_selfcheck bench_longmatch_selfcheck
+  bench_assetlike_selfcheck bench_zstd_worst_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()

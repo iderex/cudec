@@ -72,6 +72,22 @@ workload the GPU path is built for.
   extend the offset-1 run into one long match), so the harness builds the
   block directly and the oracle validates it (round-trips through
   `LZ4_decompress_safe`) before any timing. This is the throughput worst case.
+- **asset-like** - a game-asset-like corpus generated in-harness
+  (`--assetlike`): one 64 KB block tiled by four regions in the proportions of
+  a shipped asset package - BC1-shaped block-compressed texture, interleaved
+  32-byte vertex records, a triangle-list index buffer, and 16-bit stereo PCM
+  audio - replicated to 3200 chunks (~210 MB), the same scale as the two rows
+  above so the throughput numbers are directly comparable. Unlike them the
+  wire is ordinary `LZ4_compress_default` output, because the shape being
+  modelled is the source data and letting the standard compressor decide the
+  sequence structure is the point. The oracle round-trips the block before any
+  timing and the harness locks four quantities that name the regime -
+  compression ratio, literal share, sequence count and mean match length - so
+  a generator that drifts out of it reds CI. **It is a MODEL of the workload,
+  not the workload**: a synthetic texture/mesh/audio mixture reproduces the
+  regime - longer matches, a higher incompressible share, a different sequence
+  density than any other corpus here - and is not a substitute for a
+  measurement on real game data. No number taken on it may be quoted as one.
 - **enwik8** - the first 100 MB of an English Wikipedia dump, so pure
   marked-up text rather than a mixture. 1526 chunks, 100.00 MB original,
   57.00 MB compressed (ratio 0.570). Chunk sizes: min 57600 / median 65536 /
@@ -261,6 +277,7 @@ runs the same measurements - including any nvCOMP comparison - as follows.
    | `bench_lz4 --gpu <files...>`               | + device-resident GPU decode and parse-only |
    | `bench_lz4 --gpu --gpu-stream-ctx <files>` | + streaming end-to-end (reusable context)   |
    | `bench_lz4 --worst4b --gpu`                | the adversarial worst case (self-generated) |
+   | `bench_lz4 --assetlike --gpu`              | the game-asset-like regime (self-generated) |
    | `bench_lz4 --selfcheck`                    | the CI rot check (a few chunks, CPU-only)   |
 
    `--runs N` / `--warmup N` set the run counts (defaults 30 / 3). Every run
@@ -268,7 +285,9 @@ runs the same measurements - including any nvCOMP comparison - as follows.
 
 The construction of the worst-4Bmatch corpus is oracle-validated in-harness
 and locked against rot by the `bench_worst4b_selfcheck` ctest on the GPU-less
-runner, so the adversarial number cannot silently drift.
+runner, so the adversarial number cannot silently drift. The asset-like corpus
+is held the same way by `bench_assetlike_selfcheck`, over the four quantities
+that define its regime rather than over validity alone.
 
 ## The nvCOMP comparison (not published)
 

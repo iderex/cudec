@@ -40,6 +40,16 @@ std::vector<Mutant> MutateStream(const std::vector<unsigned char>& stream,
 bool OracleDecodes(const std::vector<unsigned char>& stream,
                    size_t original_size, std::vector<unsigned char>* decoded);
 
+/* The same verdict at a destination capacity of zero, which liblz4 treats as
+ * its own case: it accepts exactly one stream there, the single byte 0x00.
+ * Separate from OracleDecodes because that one would hand the reference the
+ * data() of an empty vector, which is allowed to be null - the reference
+ * returns before touching the destination, but a real one-byte buffer with a
+ * declared capacity of zero states the same case without asking a sanitizer
+ * build to reason about the null. No output parameter: an accept here
+ * produces no bytes by construction. */
+bool OracleDecodesAtZeroCapacity(const std::vector<unsigned char>& stream);
+
 /* CPU-reference block compression. Fixture generation and the bench
  * harness share it so every compressed stream in the project has a single
  * provenance; aborts on compressor failure (infrastructure, not a test). */

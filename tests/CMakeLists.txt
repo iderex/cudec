@@ -305,6 +305,15 @@ target_compile_definitions(zstd_probes PRIVATE ZSTD_STATIC_LINKING_ONLY)
 # decision and the coverage matrix.
 cudec_add_test(zstd_corpus_selfproof SOURCES zstd_corpus_selfproof.cpp
                zstd_corpus.cpp LIBS zstd_full)
+# The Zstd mutation corpus proving itself (issue #187): the mutants are
+# deterministic and digest-pinned, every fixture yields at least one the
+# reference refuses, and the aimed header-field classes are asserted by name so
+# a walker change cannot drop one in silence. It links zstd_full and compiles
+# zstd_corpus.cpp for the reason zstd_corpus_selfproof gives above - the
+# generator lives beside the corpus rather than in fixtures.cpp, because the
+# decode-only and full zstd archives may never meet in one link.
+cudec_add_test(zstd_mutants SOURCES zstd_mutants.cpp zstd_corpus.cpp LIBS
+               zstd_full)
 cudec_add_test(zstd_bitstream_twin SOURCES zstd_bitstream_twin.cpp)
 target_include_directories(zstd_bitstream_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -322,6 +331,25 @@ cudec_add_test(zstd_frame_twin SOURCES zstd_frame_twin.cpp LIBS zstd_full)
 target_include_directories(zstd_frame_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(zstd_frame_twin PRIVATE ZSTD_STATIC_LINKING_ONLY)
+# The Zstd FSE table description decode and the table it builds (issue #217),
+# held to FSE_readNCount and FSE_buildDTable_wksp cell by cell, plus the state
+# cores that walk that table over a backward bitstream (issue #219), held to
+# the reference's own decode of streams its compress pipeline wrote and of the
+# Huffman weight descriptions the corpus carries. Host-side and
+# GPU-less. It links zstd_full alone for the reason zstd_oracle_smoke gives
+# above and because FSE_writeNCount lives on the compress side: the test
+# writes the descriptions its negatives are mutations of, and proves its own
+# writer against the reference's before using it. It compiles zstd_corpus.cpp
+# for the same reason zstd_corpus_selfproof does - the #185 fixtures are where
+# the Set_Compressed fields this sweeps over come from.
+# FSE_STATIC_LINKING_ONLY is what exposes FSE_buildDTable_wksp and
+# FSE_decode_t; the non-wksp entry point is not exported by the pinned
+# release.
+cudec_add_test(zstd_fse_twin SOURCES zstd_fse_twin.cpp zstd_corpus.cpp LIBS
+               zstd_full)
+target_include_directories(zstd_fse_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(zstd_fse_twin PRIVATE FSE_STATIC_LINKING_ONLY)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
@@ -343,6 +371,15 @@ target_include_directories(batch_limit_parity
 
 cudec_add_test(frame_host_negative SOURCES frame_host_negative.cpp)
 target_include_directories(frame_host_negative
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The GDeflate TileStream envelope's reject branches (issue #174), the same
+# shape and for the same reason: src/tilestream.h is pure host arithmetic over
+# a byte range, so the whole container ladder is gated on the GPU-less runner
+# and gets the ASan/UBSan pass over the pointer arithmetic a hostile envelope
+# drives. No oracle: this is fail-closed coverage, and parity against the real
+# DirectStorage vectors is issues #169 and #179.
+cudec_add_test(tilestream_host_negative SOURCES tilestream_host_negative.cpp)
+target_include_directories(tilestream_host_negative
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # Termination as a tested invariant (issue #72): the parser's liveness
 # contract asserted per call over the truncation ladder, the mutant corpus,
