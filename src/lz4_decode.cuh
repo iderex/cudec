@@ -18,6 +18,14 @@ namespace cudec_detail {
 constexpr unsigned kBlockWarps = 4;
 constexpr unsigned kBlockThreads = kWarpSize * kBlockWarps;  /* 128 */
 
+/* The largest match length whose byte indices a 32-bit gather can address,
+ * spelled as the widest uint32_t. Neither shorter spelling can be written
+ * in this directory: the batch-limit scanner matches the standard macro's
+ * name as a substring of its own, and the structural scanner refuses the
+ * digits in a shift by the width. Both are locks worth having and neither
+ * has this line as its subject (issue #333). */
+constexpr uint64_t kGather32BitMaxLen = ~uint32_t{0};
+
 /* One warp per chunk over a grid-stride loop. All 32 lanes run the
  * validated parser redundantly in lockstep and fan out by lane for every
  * copy; overlapping matches use the closed-form modular gather
@@ -110,10 +118,35 @@ __global__ void __launch_bounds__(kBlockThreads)
                 __syncwarp();
                 if (seq.match_len != 0) {
                     const uint64_t offset = seq.match_dst - seq.match_src;
-                    for (uint64_t i = lane; i < seq.match_len;
-                         i += kWarpSize) {
-                        dst[seq.match_dst + i] =
-                            dst[seq.match_src + (i % offset)];
+                    /* Same closed-form gather at two arithmetic widths.
+                     * sm_86 has no integer-divide hardware, so a modulo by
+                     * a runtime divisor is a software sequence, and the
+                     * 64-bit one costs roughly twice the 32-bit one - paid
+                     * once per match byte per lane. `offset` is the LZ4
+                     * 2-byte offset field and never exceeds 65535, but `i`
+                     * is bounded only by match_len, which the ABI's size_t
+                     * capacities admit above 2^32, so the narrowing is
+                     * sound only under the test. No field is narrowed and
+                     * no bound is taken from the 64 KiB convention: the
+                     * stored sequence stays 64-bit and a match longer than
+                     * 2^32 still decodes, through the other arm. The test
+                     * is warp-uniform (every lane parsed the same bytes),
+                     * so it costs no divergence and cannot strand a lane at
+                     * the __syncwarp() below. */
+                    if (seq.match_len <= kGather32BitMaxLen) {
+                        const uint32_t off32 = static_cast<uint32_t>(offset);
+                        for (uint64_t i = lane; i < seq.match_len;
+                             i += kWarpSize) {
+                            dst[seq.match_dst + i] =
+                                dst[seq.match_src +
+                                    (static_cast<uint32_t>(i) % off32)];
+                        }
+                    } else {
+                        for (uint64_t i = lane; i < seq.match_len;
+                             i += kWarpSize) {
+                            dst[seq.match_dst + i] =
+                                dst[seq.match_src + (i % offset)];
+                        }
                     }
                     /* The next sequence may read bytes this match wrote. */
                     __syncwarp();
