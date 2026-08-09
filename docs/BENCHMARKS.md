@@ -598,6 +598,52 @@ The device-resident M1 row (~18 GB/s, H2D/D2H excluded) remains the kernel
 throughput; the streaming numbers are a different, honest metric (copy +
 per-wave submission included) and are not a regression of it.
 
+## M2: the frame path end to end, swept over block count (issue #132)
+
+The frame entry point had no bench at all, so the per-block choreography
+inside it was unobservable and none of the changes proposed against it could
+be gated on a number. `bench_lz4 --frame` times `cudec_lz4f_decompress` with
+the wall clock around the whole synchronous call, so the H2D, the decode, the
+D2H, the assembly and both checksums are inside the measurement. Excluding the
+transfers here would hide exactly what is being asked about.
+
+The independent variable is the block count. The same Silesia bytes are
+recompressed into one block-independent frame at each of the three block-max
+sizes liblz4's frame format offers below 4 MB, so the block count moves 16x
+over an unchanged corpus. Recorded 2026-08-09 inside the digest-pinned
+`nvidia/cuda:12.6.2-devel-ubuntu24.04` container on the RTX 3080 (sm_86,
+driver 12.6, runtime 12.6), 3 warmup + 30 measured runs, output byte-verified
+against the original once per rung before anything is timed. Reproduce with
+`bench_lz4 --frame bench/corpora/silesia/* --warmup 3 --runs 30`.
+
+| Block max | Blocks decoded | Frame size | Wall p50 / p90 / p99        | End-to-end p50 |
+| --------- | -------------- | ---------- | --------------------------- | -------------- |
+| 64 KB     | 3234           | 102.46 MB  | 557.78 / 684.81 / 711.93 ms | 0.380 GB/s     |
+| 256 KB    | 809            | 101.60 MB  | 455.19 / 611.15 / 782.14 ms | 0.466 GB/s     |
+| 1 MB      | 203            | 101.06 MB  | 453.29 / 484.62 / 488.57 ms | 0.468 GB/s     |
+
+**The block count costs about 34 microseconds a block.** Between the extreme
+rungs, 3031 fewer blocks over the same 211.94 MB take 104.49 ms off the wall,
+which is 19% of the 64 KB rung. That is a per-block cost rather than a
+per-byte one, and it is the shape a per-block synchronous D2H produces. The
+middle rung does not sit exactly on the line the two extremes draw - the fit
+predicts 474 ms against a measured 455 - so 34 microseconds is a two-point
+estimate and not a fitted constant. Its p90 of 611 ms against a p50 of 455 ms
+says most of what the disagreement is: this path's run-to-run spread is wide,
+and it narrows as the block count falls.
+
+**The frame path runs at roughly a fortieth of the kernel it wraps.** The
+device-resident batch row above decodes the same corpus at 16-18 GB/s; through
+the frame entry point the same bytes come out at 0.38-0.47 GB/s. Most of that
+is the transfers, which the device-resident number excludes by design and
+which any end-to-end path has to pay. What the sweep separates out is the part
+that is not the transfers: the ~450 ms all three rungs share, and the ~104 ms
+the 64 KB rung pays on top for having 16x the blocks.
+
+No decoder code moved for these numbers. This is the harness the frame-path
+changes are to be measured against, and it exists so that they can be
+rejected the way perf pass 3 was.
+
 ## Community AMD results
 
 **No community results yet.** Nothing in this section is a measurement; it

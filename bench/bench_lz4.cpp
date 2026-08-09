@@ -10,6 +10,7 @@
 
 #include <cuda_runtime.h>
 #include <lz4.h>
+#include <lz4frame.h>
 
 #include <algorithm>
 #include <chrono>
@@ -825,6 +826,262 @@ bool ParseCount(const char* text, size_t min, size_t max, size_t* out) {
  * bench/bench_stats.h. */
 using cudec_bench::Percentile;
 
+/* ---- the frame mode (issue #132) ----------------------------------------
+ *
+ * Everything above times the BLOCK path with the transfers excluded. The
+ * frame entry point is a different measurement and needs a different one:
+ * cudec_lz4f_decompress takes a host frame and returns host bytes, so H2D,
+ * the decode, the D2H and the assembly are all inside one synchronous call
+ * and the wall around that call is the whole cost. Excluding the transfers
+ * here would hide the thing the frame path is suspected of.
+ *
+ * The independent variable is the block count, which the frame's block-max
+ * setting fixes for a given corpus. LZ4F offers four sizes and the three
+ * below span 16x on the same bytes; the fourth (4 MB) is not swept because
+ * the issue's rungs are these three. Each rung is reported with the block
+ * count actually decoded rather than the setting alone, because a corpus
+ * shorter than one block would silently collapse the sweep. */
+struct FrameRung {
+    const char* name;
+    LZ4F_blockSizeID_t block_size_id;
+    /* The block-max the id names, so the reported block count can be
+     * derived by a reader instead of trusted. */
+    size_t block_max_bytes;
+};
+
+constexpr FrameRung kFrameRungs[] = {
+    {"64 KB", LZ4F_max64KB, 1u << 16},
+    {"256 KB", LZ4F_max256KB, 1u << 18},
+    {"1 MB", LZ4F_max1MB, 1u << 20},
+};
+
+/* Compresses `in` into one block-independent frame with a content checksum.
+ * Block-independent is not a preference: it is the subset src/frame.cpp
+ * accepts, and liblz4's compressor defaults to the linked mode cudec
+ * refuses. The content checksum is left on so the timed call pays the
+ * verification a real .lz4 file carries. */
+bool CompressFrameAt(const std::vector<unsigned char>& in,
+                     const FrameRung& rung,
+                     std::vector<unsigned char>* frame) {
+    LZ4F_preferences_t prefs;
+    std::memset(&prefs, 0, sizeof(prefs));
+    prefs.frameInfo.blockMode = LZ4F_blockIndependent;
+    prefs.frameInfo.blockSizeID = rung.block_size_id;
+    prefs.frameInfo.contentChecksumFlag = LZ4F_contentChecksumEnabled;
+    const size_t bound = LZ4F_compressFrameBound(in.size(), &prefs);
+    frame->assign(bound, 0);
+    const size_t r = LZ4F_compressFrame(frame->data(), bound, in.data(),
+                                        in.size(), &prefs);
+    if (LZ4F_isError(r)) {
+        std::fprintf(stderr, "LZ4F_compressFrame failed at the %s rung: %s\n",
+                     rung.name, LZ4F_getErrorName(r));
+        return false;
+    }
+    frame->resize(r);
+    return true;
+}
+
+/* The block count liblz4 actually emitted, read off the frame rather than
+ * computed from the corpus size: a compressor free to end a block early
+ * would make the derived number a fiction. Walks the block headers, which
+ * is the same walk src/frame.cpp does, and stops at the end mark.
+ * Fail-closed: a header that does not fit, or a size that runs past the
+ * frame, returns false rather than a partial count. */
+bool CountFrameBlocks(const std::vector<unsigned char>& frame,
+                      size_t* blocks) {
+    /* Magic (4) + FLG + BD, then the optional content size and the header
+     * checksum. Only the frames this harness just built are parsed here, so
+     * the descriptor's shape is known: no content size, no dictionary id. */
+    if (frame.size() < 7) {
+        return false;
+    }
+    const unsigned flg = frame[4];
+    const bool content_size = (flg & 0x08) != 0;
+    const bool dict_id = (flg & 0x01) != 0;
+    const bool block_checksum = (flg & 0x10) != 0;
+    size_t pos = 6 + (content_size ? 8u : 0u) + (dict_id ? 4u : 0u) + 1;
+    size_t count = 0;
+    while (true) {
+        if (pos + 4 > frame.size()) {
+            return false;
+        }
+        uint32_t header = 0;
+        std::memcpy(&header, frame.data() + pos, 4);
+        pos += 4;
+        if (header == 0) {
+            break; /* the end mark */
+        }
+        const size_t stored = header & 0x7FFFFFFFu;
+        if (stored > frame.size() - pos) {
+            return false;
+        }
+        pos += stored + (block_checksum ? 4u : 0u);
+        count++;
+    }
+    *blocks = count;
+    return true;
+}
+
+/* One timed decode of the whole frame through the public entry point.
+ * Returns the wall seconds, or a negative value if the decode did not
+ * produce exactly `expected` bytes - a bench must never time a decoder that
+ * is not decoding. */
+double FrameDecodeSeconds(const std::vector<unsigned char>& frame,
+                          unsigned char* out, size_t out_capacity,
+                          size_t expected) {
+    size_t written = 0;
+    const auto start = std::chrono::steady_clock::now();
+    const cudec_status status = cudec_lz4f_decompress(
+        frame.data(), frame.size(), out, out_capacity, &written);
+    const auto end = std::chrono::steady_clock::now();
+    if (status != CUDEC_OK || written != expected) {
+        std::fprintf(stderr,
+                     "frame decode returned status %d and %zu bytes, wanted "
+                     "0 and %zu - refusing to time it\n",
+                     static_cast<int>(status), written, expected);
+        return -1.0;
+    }
+    return std::chrono::duration<double>(end - start).count();
+}
+
+/* Times one rung and prints its report block. */
+bool RunFrameRung(const std::vector<unsigned char>& source,
+                  const std::string& corpus_name, const FrameRung& rung,
+                  size_t warmup, size_t runs) {
+    std::vector<unsigned char> frame;
+    if (!CompressFrameAt(source, rung, &frame)) {
+        return false;
+    }
+    size_t blocks = 0;
+    if (!CountFrameBlocks(frame, &blocks) || blocks == 0) {
+        std::fprintf(stderr, "could not read a block count out of the %s "
+                             "frame\n",
+                     rung.name);
+        return false;
+    }
+
+    /* Verified once against the original bytes before anything is timed. A
+     * bench that skips this can time a silently wrong decode and report a
+     * number for it. */
+    std::vector<unsigned char> out(source.size());
+    if (FrameDecodeSeconds(frame, out.data(), out.size(), source.size()) < 0 ||
+        std::memcmp(out.data(), source.data(), source.size()) != 0) {
+        std::fprintf(stderr, "the %s rung does not round-trip; nothing is "
+                             "timed\n",
+                     rung.name);
+        return false;
+    }
+
+    for (size_t i = 0; i < warmup; i++) {
+        if (FrameDecodeSeconds(frame, out.data(), out.size(),
+                               source.size()) < 0) {
+            return false;
+        }
+    }
+    std::vector<double> times;
+    for (size_t i = 0; i < runs; i++) {
+        const double seconds =
+            FrameDecodeSeconds(frame, out.data(), out.size(), source.size());
+        if (seconds < 0) {
+            return false;
+        }
+        times.push_back(seconds);
+    }
+    std::sort(times.begin(), times.end());
+    const double to_gbps = static_cast<double>(source.size()) / 1e9;
+
+    std::printf("## bench_lz4 frame report\n");
+    std::printf("- decoder: cudec_lz4f_decompress (host frame in, host bytes "
+                "out; H2D, decode, D2H, assembly and checksums are all "
+                "inside the timed call)\n");
+    std::printf("- host CPU: %s\n", HostCpuName().c_str());
+    std::printf("- CUDA device: %s\n", CudaDeviceLine().c_str());
+    std::printf("- cudec: %d\n", cudec_version());
+    std::printf("- corpus: %s, %.2f MB original, %.2f MB frame (ratio "
+                "%.3f), one block-independent frame with a content checksum, "
+                "compressed in-harness via LZ4F_compressFrame (liblz4 %s)\n",
+                corpus_name.c_str(), static_cast<double>(source.size()) / 1e6,
+                static_cast<double>(frame.size()) / 1e6,
+                static_cast<double>(frame.size()) /
+                    static_cast<double>(source.size()),
+                LZ4_versionString());
+    std::printf("- rung: block max %s (%zu bytes), %zu blocks decoded\n",
+                rung.name, rung.block_max_bytes, blocks);
+    std::printf("- method: %zu warmup + %zu measured runs, wall clock around "
+                "the whole synchronous cudec_lz4f_decompress call; output "
+                "byte-verified against the original once before timing; "
+                "percentiles are nearest-rank\n",
+                warmup, runs);
+    std::printf("- wall per run: p50 %.3f ms / p90 %.3f ms / p99 %.3f ms\n",
+                Percentile(times, 50) * 1e3, Percentile(times, 90) * 1e3,
+                Percentile(times, 99) * 1e3);
+    std::printf("- end-to-end throughput: p50 %.3f GB/s / p90 %.3f GB/s / "
+                "p99 %.3f GB/s\n",
+                to_gbps / Percentile(times, 50),
+                to_gbps / Percentile(times, 90),
+                to_gbps / Percentile(times, 99));
+    return true;
+}
+
+/* The frame path reads a corpus file whole rather than in 64 KB pieces:
+ * the frame's own block-max is what cuts it, and pre-cutting it here would
+ * make the block count a property of this harness instead of of the rung. */
+bool AppendFileBytes(const std::string& path,
+                     std::vector<unsigned char>* out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        std::fprintf(stderr, "cannot open corpus file: %s\n", path.c_str());
+        return false;
+    }
+    const size_t before = out->size();
+    char buffer[1 << 16];
+    while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
+        out->insert(out->end(), buffer, buffer + in.gcount());
+    }
+    if (in.bad()) {
+        std::fprintf(stderr, "read error in corpus file: %s\n", path.c_str());
+        return false;
+    }
+    if (out->size() == before) {
+        std::fprintf(stderr, "corpus file contributed no data: %s\n",
+                     path.c_str());
+        return false;
+    }
+    return true;
+}
+
+/* The selfcheck source. Several blocks at every rung and compressible
+ * enough that the frame is not just stored blocks, from a fixed PRNG so a
+ * failure reproduces. */
+constexpr size_t kFrameSelfcheckBytes = 3u << 20;
+
+std::vector<unsigned char> MakeFrameSelfcheckSource(size_t bytes) {
+    std::vector<unsigned char> out(bytes);
+    uint64_t state = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < bytes; i++) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        /* Runs of a repeating alphabet with occasional noise: matches for
+         * the decoder to execute, without collapsing to one long match. */
+        out[i] = (i % 61 == 0) ? static_cast<unsigned char>(state >> 56)
+                               : static_cast<unsigned char>('a' + (i / 7) % 26);
+    }
+    return out;
+}
+
+/* The whole sweep: the same bytes at every rung, so the only variable
+ * between the report blocks is the block count. */
+bool RunFrameSweep(const std::vector<unsigned char>& source,
+                   const std::string& corpus_name, size_t warmup,
+                   size_t runs) {
+    for (const FrameRung& rung : kFrameRungs) {
+        if (!RunFrameRung(source, corpus_name, rung, warmup, runs)) {
+            return false;
+        }
+        std::printf("\n");
+    }
+    return true;
+}
+
 void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
                  size_t warmup, size_t runs) {
     std::vector<size_t> sizes;
@@ -881,6 +1138,7 @@ int main(int argc, char** argv) {
     bool worst4b = false;
     bool longmatch = false;
     bool assetlike = false;
+    bool frame = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -896,6 +1154,8 @@ int main(int argc, char** argv) {
             longmatch = true;
         } else if (arg == "--assetlike") {
             assetlike = true;
+        } else if (arg == "--frame") {
+            frame = true;
         } else if (arg == "--runs" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n",
@@ -915,7 +1175,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: bench_lz4 [--runs N] [--warmup N] [--gpu] "
                          "[--gpu-stream-ctx] [--worst4b] [--longmatch] "
-                         "[--assetlike] [--selfcheck] [corpus files...]\n");
+                         "[--assetlike] [--frame] [--selfcheck] "
+                         "[corpus files...]\n");
             return 2;
         } else {
             files.push_back(arg);
@@ -932,6 +1193,56 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--worst4b, --longmatch and --assetlike each "
                              "build their own corpus; pass at most one\n");
         return 2;
+    }
+
+    /* The frame sweep is a different measurement of a different entry point
+     * and shares none of the block harness below, so it runs on its own and
+     * returns rather than falling through. */
+    if (frame) {
+        if (generated != 0 || gpu || gpu_stream_ctx) {
+            std::fprintf(stderr, "--frame times the frame entry point over "
+                                 "its own sweep; it takes neither the "
+                                 "generated block corpora nor the block "
+                                 "GPU modes\n");
+            return 2;
+        }
+        std::vector<unsigned char> source;
+        std::string name;
+        if (files.empty()) {
+            if (!selfcheck) {
+                std::fprintf(stderr, "--frame needs corpus files (the "
+                                     "recorded rungs use bench/corpora/"
+                                     "silesia/*); --selfcheck runs it on a "
+                                     "generated source instead\n");
+                return 2;
+            }
+            /* Big enough that every rung holds several blocks, so a rung
+             * that collapsed to one block is a failure here rather than in
+             * a recorded run. */
+            source = MakeFrameSelfcheckSource(kFrameSelfcheckBytes);
+            name = "generated (selfcheck)";
+        } else {
+            for (const auto& path : files) {
+                if (!AppendFileBytes(path, &source)) {
+                    return 1;
+                }
+                const size_t slash = path.find_last_of("/\\");
+                name += (name.empty() ? "" : "+") +
+                        path.substr(slash == std::string::npos ? 0
+                                                               : slash + 1);
+            }
+        }
+        if (source.empty()) {
+            std::fprintf(stderr, "corpus is empty - nothing to benchmark\n");
+            return 1;
+        }
+        if (!RunFrameSweep(source, name, warmup, runs)) {
+            return 1;
+        }
+        if (selfcheck) {
+            std::printf("PASS: selfcheck complete\n");
+        }
+        return 0;
     }
 
     Corpus corpus;
