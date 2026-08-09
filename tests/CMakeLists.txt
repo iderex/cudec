@@ -614,32 +614,82 @@ foreach(_tu lz4_decode.cuh stream.cpp)
 endforeach()
 # Every source, not a list somebody has to remember to extend: a new
 # translation unit carrying its own bound is exactly the case this is for.
-file(GLOB_RECURSE _batch_limit_sources RELATIVE
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src CONFIGURE_DEPENDS
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.c
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cc
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cpp
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cu
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cuh
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.h
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.hpp
-     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.inl)
-if(NOT _batch_limit_sources)
-  message(FATAL_ERROR "the batch-limit sweep found no sources under src/ - the "
-                      "glob has stopped matching (issue #39)")
-endif()
-foreach(_source IN LISTS _batch_limit_sources)
-  if(NOT _source STREQUAL "batch_limits.h")
-    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source} _source_src)
-    if(_source_src MATCHES "INT32_MAX")
-      message(
-        FATAL_ERROR
-          "src/${_source} builds its own bound from INT32_MAX - the batch "
-          "launch limit is cudec_detail::kMaxBatchChunks in "
-          "src/batch_limits.h (issue #39)")
+# One function, so the rule can be run against planted sources before it is
+# trusted against the tree - the discipline issue #72's scanner established,
+# and the reason a tightening is showable rather than asserted.
+function(cudec_check_batch_limit_sweep src_dir out_violations)
+  set(_violations "")
+  file(GLOB_RECURSE _sources RELATIVE ${src_dir} CONFIGURE_DEPENDS
+       ${src_dir}/*.c ${src_dir}/*.cc ${src_dir}/*.cpp ${src_dir}/*.cu
+       ${src_dir}/*.cuh ${src_dir}/*.h ${src_dir}/*.hpp ${src_dir}/*.inl)
+  if(NOT _sources)
+    string(APPEND _violations
+           "  the sweep found no sources under ${src_dir} - the glob has "
+           "stopped matching (issue #39)\n")
+  endif()
+  foreach(_source IN LISTS _sources)
+    if(_source STREQUAL "batch_limits.h")
+      continue()
+    endif()
+    file(READ ${src_dir}/${_source} _source_src)
+    # The whole identifier, never a substring. UINT32_MAX carries INT32_MAX
+    # inside it, so a width test on an arithmetic operand was refused with a
+    # message about the batch launch bound - naming something its author had
+    # not done, and leaving "stop writing the standard constant" as the
+    # shortest way past a rule whose subject the line was not (issue #333).
+    if(_source_src MATCHES "(^|[^A-Za-z_0-9])INT32_MAX([^A-Za-z_0-9]|$)")
+      string(APPEND _violations
+             "  ${_source} builds its own bound from INT32_MAX - the batch "
+             "launch limit is cudec_detail::kMaxBatchChunks in "
+             "src/batch_limits.h (issue #39)\n")
+    endif()
+  endforeach()
+  set(${out_violations} "${_violations}" PARENT_SCOPE)
+endfunction()
+
+# Both directions, planted first. The accepted probe must come back silent
+# and the refused one is matched against the TEXT the rule emits rather than
+# against a non-empty result: a rule narrowed without the second probe is a
+# rule nobody can show still bites.
+set(_batch_limit_probe_root ${CMAKE_CURRENT_BINARY_DIR}/batch-limit-probes)
+file(REMOVE_RECURSE ${_batch_limit_probe_root})
+file(WRITE ${_batch_limit_probe_root}/unsigned_constant/probe.cuh
+     "static bool fits32(uint64_t n) { return n <= UINT32_MAX; }\n")
+file(WRITE ${_batch_limit_probe_root}/own_bound/probe.cuh
+     "static const size_t kChunks = (size_t)INT32_MAX * kWarpSize;\n")
+set(_batch_limit_probes
+    "unsigned_constant|"
+    "own_bound|probe.cuh builds its own bound from INT32_MAX")
+foreach(_entry IN LISTS _batch_limit_probes)
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\2" _expected "${_entry}")
+  cudec_check_batch_limit_sweep(${_batch_limit_probe_root}/${_probe}
+                                _probe_result)
+  if(_expected STREQUAL "")
+    # Checked here rather than through string(FIND): an empty needle is found
+    # at position 0 in every string, so the branch below would assert nothing.
+    if(_probe_result)
+      message(FATAL_ERROR "the batch-limit sweep refuses a compliant probe: "
+                          "'${_probe}' must come back silent (issue #333). It "
+                          "reported:\n${_probe_result}")
+    endif()
+  else()
+    string(FIND "${_probe_result}" "${_expected}" _found_at)
+    if(_found_at EQUAL -1)
+      message(FATAL_ERROR "the batch-limit sweep is dead: probe '${_probe}' "
+                          "did not report \"${_expected}\" (issue #333). It "
+                          "reported:\n${_probe_result}")
     endif()
   endif()
 endforeach()
+
+# And now against the tree the rule is for.
+cudec_check_batch_limit_sweep(${CMAKE_CURRENT_SOURCE_DIR}/../src
+                              _batch_limit_violations)
+if(_batch_limit_violations)
+  message(FATAL_ERROR "a source under src/ builds its own batch launch bound "
+                      "(issue #39):\n${_batch_limit_violations}")
+endif()
 
 # Reads a source and hands back its lines with C comments blanked in place,
 # one list element per source line, so a rule can quote the line number a
