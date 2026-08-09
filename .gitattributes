@@ -3,3 +3,11 @@
 
 # Windows PowerShell scripts need CRLF to be safely editable on the host.
 *.ps1 text eol=crlf
+
+# The fuzz seed corpus is bytes, never text. `text=auto` detects binary by
+# looking for a NUL, so a short seed that happens to hold none - a Snappy
+# literal element, say - would be taken for text and line-end-normalised on the
+# way into git, silently editing the input the seed exists to preserve. Its
+# manifest is the one file under there that IS text.
+fuzz/corpus/** -text
+fuzz/corpus/SHA256SUMS text eol=lf

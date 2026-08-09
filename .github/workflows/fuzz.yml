@@ -1,0 +1,240 @@
+# Fuzz - the differential libFuzzer targets, bounded on every pull request and
+# long on a schedule (issue #142).
+#
+# A separate file rather than a job in ci.yml, for one reason: the scheduled
+# run. ci.yml triggers on pull_request only, and adding a `schedule:` there
+# would put the two container builds, the install/consume legs and the format
+# job on the cron as well - none of which the fuzzer needs. One file, two
+# triggers, one job whose budget is derived from the event.
+#
+# NOT a required check. Which contexts a merge requires is branch-ruleset
+# state, which is not changed here; this workflow runs and reports on every
+# pull request, and a red run does not block a merge until the ruleset names
+# it. Said plainly rather than left to be assumed from the file's existence.
+#
+# Toolchain, decided explicitly as the issue asks. libFuzzer ships with Clang
+# and the pinned nvidia/cuda image the build and sanitize jobs use carries GCC,
+# so this job runs on a plain ubuntu-latest runner with the image's own Clang
+# and no CUDA at all. That costs nothing here: fuzz/ has no CUDA sources and
+# links no cudec archive - the parser under test is the single-sourced
+# host/device header, and the driver is the same one the CPU twin test runs.
+
+name: Fuzz
+
+on:
+  pull_request:
+    branches: [main]
+  # Sundays 04:17 UTC. Off the hour because the top of the hour is when
+  # GitHub's scheduler is most oversubscribed and a cron run is delayed
+  # silently rather than skipped.
+  schedule:
+    - cron: "17 4 * * 0"
+
+# One in-flight run per pull request; a newer push cancels the previous run.
+# The scheduled run is never cancelled - there is only ever one, and it is the
+# long one whose findings are the point.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    # Covers the scheduled shape: the build, plus the per-target budget below
+    # times the number of targets, plus room for the seed replay.
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The whole budget question in one line. 60 s per target on a pull
+      # request: the job runs on its own runner in parallel with build and
+      # sanitize, which carry 30-minute timeouts each, so a two-target smoke
+      # adds two minutes to a step nobody is waiting on and no wall-clock to
+      # the gate as a whole. The scheduled run is where depth comes from.
+      CUDEC_FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '900' || '60' }}
+      # Above every seed and above the harnesses' own stream ceilings, so the
+      # ceiling that bounds the run is the one written in the target rather
+      # than one written here.
+      CUDEC_FUZZ_MAX_LEN: 4096
+      # UBSan reports are non-fatal by default: the run prints the diagnostic,
+      # returns 0, and libFuzzer neither records the input nor stops. A fuzz
+      # target whose undefined-behaviour findings exit green is instrumented
+      # for nothing, so this makes them terminal. ASan already aborts.
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Recorded rather than assumed: a fuzzing run's reach depends on the
+      # instrumentation, so which Clang produced it belongs in the log. Absent
+      # tools are an error here and never a skip.
+      - name: The toolchain, and which version of it
+        run: |
+          set -eu
+          command -v clang >/dev/null || { echo "FAIL: no clang on PATH"; exit 1; }
+          command -v clang++ >/dev/null || { echo "FAIL: no clang++ on PATH"; exit 1; }
+          command -v cmake >/dev/null || { echo "FAIL: no cmake on PATH"; exit 1; }
+          clang --version
+          cmake --version | head -n 1
+
+      # Before the build, because a corpus that rotted is the failure this
+      # whole job is most likely to have and least likely to show: libFuzzer
+      # reads an absent or empty corpus directory as a legal start-from-scratch
+      # run and exits 0. The script argues its own refusals and proves them on
+      # a planted defect every time it runs.
+      - name: The seed corpus is the corpus its manifest describes
+        run: scripts/check-fuzz-corpus.sh
+
+      # The target list is derived from fuzz/CMakeLists.txt, not written here.
+      # A list in this file would drift against the build that decides it, and
+      # the drift is silent in the dangerous direction - the target the list
+      # forgot is the one that never gets fuzzed while the check reads green.
+      # Empty is refused: it would turn every loop below into a no-op.
+      - name: Derive the targets from the build
+        run: |
+          set -eu
+          targets="$(sed -n 's/^cudec_add_fuzz_target(\([A-Za-z0-9_]*\).*/\1/p' \
+            fuzz/CMakeLists.txt | grep -v '_selftest$' | LC_ALL=C sort -u)"
+          if [ -z "$targets" ]; then
+            echo "FAIL: no cudec_add_fuzz_target(...) in fuzz/CMakeLists.txt"
+            exit 1
+          fi
+          echo "targets: $(echo $targets)"
+          echo "CUDEC_FUZZ_TARGETS=$(echo $targets)" >> "$GITHUB_ENV"
+
+      # CUDEC_FUZZ refuses a non-Clang toolchain and refuses -fsanitize=fuzzer
+      # without sanitizers, both in CMakeLists.txt, so those two conditions are
+      # gated by the configure rather than restated here. The sanitizer set is
+      # CUDEC_SANITIZE's, which is the same one the sanitize job uses.
+      #
+      # Fail-closed on the output: every derived target must have produced both
+      # binaries. A renamed target, a subdirectory that stopped being added, or
+      # a link that quietly dropped one reds here rather than shrinking the
+      # loops below to nothing.
+      - name: Build the fuzz targets with Clang, ASan and UBSan
+        run: |
+          set -eu
+          cmake -B build-fuzz -DCUDEC_FUZZ=ON \
+            -DCUDEC_SANITIZE=address,undefined \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build-fuzz -j
+          for t in $CUDEC_FUZZ_TARGETS; do
+            test -x "build-fuzz/fuzz/$t" || {
+              echo "FAIL: build-fuzz/fuzz/$t was not built"; exit 1; }
+            test -x "build-fuzz/fuzz/${t}_selftest" || {
+              echo "FAIL: build-fuzz/fuzz/${t}_selftest was not built"; exit 1; }
+          done
+
+      # Every committed seed, executed once, before anything explores. This is
+      # the regression leg: an input that ever crashed or diverged is kept as a
+      # seed forever, so a defect that comes back is caught here in seconds
+      # rather than by a fuzzer that may take a very long time to rediscover
+      # it. Individual files rather than the directory, which is libFuzzer's
+      # deterministic reproduce mode: each named file is run exactly once.
+      #
+      # The seed count is asserted rather than assumed, even though the corpus
+      # check above already refuses an empty directory. An empty find would
+      # leave xargs running the target with no arguments at all, and a
+      # libFuzzer binary called with no arguments does not replay - it starts
+      # an unbounded fuzzing session and this step would hang to the job
+      # timeout instead of failing.
+      - name: Replay every committed seed
+        run: |
+          set -eu
+          for t in $CUDEC_FUZZ_TARGETS; do
+            seeds="$(find "fuzz/corpus/$t" -type f | wc -l)"
+            if [ "$seeds" -eq 0 ]; then
+              echo "FAIL: no seed under fuzz/corpus/$t to replay"
+              exit 1
+            fi
+            echo "--- $t: $seeds seed(s)"
+            find "fuzz/corpus/$t" -type f -print0 |
+              xargs -0 -r "$PWD/build-fuzz/fuzz/$t"
+          done
+
+      # The leg that says the verdicts above mean something. Each _selftest
+      # twin is the same source with CUDEC_FUZZ_SELFTEST_BREAK defined, which
+      # perturbs an accepted reference output so the parity comparison MUST
+      # fire. A harness that had silently stopped comparing - a dropped
+      # memcmp, a corpus with no accepted stream left in it - passes as the
+      # real binary does and is caught only here.
+      #
+      # Exiting non-zero is not the claim. The claim is that it trapped on the
+      # comparison it was broken at, so the message is matched too: a twin that
+      # died on an unrelated sanitizer report would satisfy a bare exit-code
+      # check while proving nothing.
+      - name: Every selftest twin traps on the seed corpus
+        run: |
+          set -eu
+          for t in $CUDEC_FUZZ_TARGETS; do
+            log="$RUNNER_TEMP/$t-selftest.log"
+            if find "fuzz/corpus/$t" -type f -print0 |
+                 xargs -0 -r "$PWD/build-fuzz/fuzz/${t}_selftest" \
+                 > "$log" 2>&1; then
+              echo "FAIL: ${t}_selftest ran the whole seed corpus without" \
+                   "trapping - the parity comparison is not live, or the" \
+                   "corpus holds no stream the parser accepts"
+              tail -n 40 "$log"
+              exit 1
+            fi
+            grep -q "DIVERGENCE" "$log" || {
+              echo "FAIL: ${t}_selftest failed, but not on the perturbed" \
+                   "comparison it was built to fail on"
+              tail -n 40 "$log"
+              exit 1
+            }
+            echo "PASS: ${t}_selftest trapped on the perturbed comparison"
+            grep -m 1 "DIVERGENCE" "$log"
+          done
+
+      # The exploration itself. New units are written into a scratch directory
+      # given first, with the committed seeds read-only behind it, so a run
+      # cannot quietly rewrite the corpus the manifest pins. A crash lands as
+      # an artifact under RUNNER_TEMP and is uploaded by the step below.
+      - name: Fuzz each target for the event's budget
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/crashes"
+          for t in $CUDEC_FUZZ_TARGETS; do
+            work="$RUNNER_TEMP/corpus/$t"
+            mkdir -p "$work"
+            echo "--- $t for ${CUDEC_FUZZ_SECONDS}s"
+            "$PWD/build-fuzz/fuzz/$t" "$work" "fuzz/corpus/$t" \
+              -max_total_time="$CUDEC_FUZZ_SECONDS" \
+              -max_len="$CUDEC_FUZZ_MAX_LEN" \
+              -print_final_stats=1 \
+              -artifact_prefix="$RUNNER_TEMP/crashes/$t-"
+          done
+
+      # A crashing input is the finding, and it is worthless if it is not
+      # carried out of the runner: the regression policy in fuzz/README.md
+      # turns it into a permanent seed and a pinned negative in tests/, and
+      # neither is possible from a log line.
+      - name: Upload the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crashes-${{ github.run_id }}
+          path: ${{ runner.temp }}/crashes/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # The scheduled run's coverage corpus, so a long run's reach is not
+      # thrown away with the runner. Not uploaded on a pull request: a
+      # 60-second smoke adds nothing worth keeping.
+      - name: Upload the scheduled run's corpus
+        if: github.event_name == 'schedule'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-corpus-${{ github.run_id }}
+          path: ${{ runner.temp }}/corpus/
+          if-no-files-found: warn
+          retention-days: 30

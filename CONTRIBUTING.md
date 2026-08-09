@@ -106,6 +106,36 @@ the sweep is owed and currently cannot be produced on that route. Say that in
 the pull request, with the command that shows it, rather than leaving the block
 looking answered.
 
+### The fuzz gate
+
+The differential libFuzzer targets under `fuzz/` run in CI from a committed,
+hash-pinned seed corpus: `.github/workflows/fuzz.yml`, bounded on every pull
+request and longer on a weekly schedule. It is not a required check - which
+contexts a merge requires is branch-ruleset state and the workflow does not set
+it - so read its result rather than assuming a merge waited for it.
+
+The build is Clang-only (libFuzzer ships with Clang) and needs no GPU: `fuzz/`
+has no CUDA sources and links no cudec archive, so it runs on a plain runner
+while the rest of the gate runs in the CUDA container.
+
+```sh
+cmake -B build-fuzz -DCUDEC_FUZZ=ON -DCUDEC_SANITIZE=address,undefined \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build-fuzz
+build-fuzz/fuzz/fuzz_lz4_block work-dir fuzz/corpus/fuzz_lz4_block \
+  -max_total_time=60 -max_len=4096
+```
+
+**Every finding is kept forever, in two places.** An input that crashed a
+target, tripped a sanitizer, or diverged from a reference becomes a permanent
+seed in `fuzz/corpus/<target>/` with its hash in `fuzz/corpus/SHA256SUMS`, AND
+the same bytes become a negative in `tests/` pinning the exact status the
+parser now returns. Neither alone is enough: a corpus entry is covered only
+while the fuzz job runs, and a pinned negative alone loses the bytes that found
+the defect. `scripts/check-fuzz-corpus.sh` refuses a corpus that no longer
+matches its manifest and an emptied target directory - the shape libFuzzer
+otherwise reads as a legal start-from-scratch run and exits 0 on.
+
 `-DCUDEC_ENABLE_HIP=ON` exists and currently refuses on every machine: there
 are no HIP device sources yet, so the option fails the configure rather than
 handing back a host-only library that looks like a working port. The two
