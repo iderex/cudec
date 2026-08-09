@@ -341,8 +341,8 @@ matches, a higher incompressible share, a different sequence density - and is
 expressly not a substitute for a measurement on real game data. That sentence
 sits beside the corpus entry in
 [BENCHMARK-METHODOLOGY.md](BENCHMARK-METHODOLOGY.md), and the baseline block
-in [BENCHMARKS.md](BENCHMARKS.md) carries it too once that block is recorded,
-so anyone quoting a number from the corpus sees what it was measured against.
+in [BENCHMARKS.md](BENCHMARKS.md) carries it too, so anyone quoting a number
+from the corpus sees what it was measured against.
 
 A hash-pinned asset pack would have been more representative, and for
 benchmarking that is what counts - the argument against the decision at full

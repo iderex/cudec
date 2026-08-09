@@ -408,6 +408,66 @@ counted one. Stated as the reading it is.
 Reproduce with `bench/get-corpora.sh` followed by
 `bench_lz4 bench/corpora/enwik8 --gpu --warmup 3 --runs 30`.
 
+### Game-asset-like: the generated asset corpus (issue #139)
+
+The regime the README leads with, and the only corpus here whose source data
+is barely compressible. One 64 KB block tiled by four regions in the
+proportions of a shipped asset package - BC1-shaped block-compressed texture,
+interleaved 32-byte vertex records, a triangle-list index buffer, 16-bit
+stereo PCM audio - replicated to 3200 chunks. Unlike `--worst4b` and
+`--longmatch` the wire is ordinary `LZ4_compress_default` output: the shape
+being modelled is the source data, and letting the standard compressor decide
+the sequence structure is the point. Oracle-validated before any timing and
+regime-locked by the CPU-only `bench_assetlike_selfcheck` ctest.
+
+**It is a MODEL of the workload, not the workload.** A synthetic
+texture/mesh/audio mixture reproduces the regime and is not a measurement on
+real game data. No number below may be quoted as one.
+
+Recorded 2026-08-09 in the digest-pinned dev container
+(`nvidia/cuda:12.6.2-devel-ubuntu24.04`) on the same RTX 3080 as every row
+above, `--assetlike --gpu --warmup 3 --runs 30`.
+
+```
+## bench_lz4 report
+- decoder: CPU oracle, LZ4_decompress_safe (liblz4 1.10.0), single thread
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 12.6, runtime 12.6
+- cudec: 100 (the CPU rows time the liblz4 oracle baseline; the GPU rows below, when --gpu is set, time cudec's decoder)
+- corpus: asset-like, 3200 chunks, 209.72 MB original, 169.56 MB compressed (ratio 0.809), generated in-harness, a MODEL of a game asset package (BC1 texture, interleaved geometry, 16-bit PCM audio) and not a measurement on real game data; compressed by LZ4_compress_default and oracle-validated
+- chunk sizes: min 65536 / median 65536 / max 65536 bytes
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is LZ4_decompress_safe only (no clears, no allocation); output byte-verified once before timing; percentiles are nearest-rank
+- wall per run: p50 20.914 ms / p90 22.437 ms / p99 24.521 ms
+- decode throughput: p50 10.028 GB/s / p90 9.347 GB/s / p99 8.552 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs): p50 4.748 ms, 44.2 GB/s
+- GPU parse-only ceiling (copies elided): p50 2.574 ms, 81.5 GB/s - ceilings this design AND any two-phase phase-1 (shared parse)
+```
+
+Three consecutive invocations of that command gave GPU decode p50 4.748,
+4.756 and 4.307 ms (44.2, 44.1, 48.7 GB/s). The block above is the first of
+them; the spread is the session drift perf pass 4 measured on this host and
+is why the paragraphs below read only what one invocation says about itself.
+
+**No comparison against the Silesia row is drawn here, and the omission is
+deliberate.** The Silesia figures in this document were taken before the
+gather narrowing landed (perf pass 4, issue #58), so a ratio against them
+would mix two kernels and one GPU's drift into a single number. What the
+asset-like invocation says about itself, from its own timings:
+
+- The copy half is 4.748 - 2.574 = 2.174 ms, about 46% of the decode. That is
+  a copy-heavier split than the corpus's compressibility suggests: at ratio
+  0.809 there is little to decode, and most of the output is literal bytes
+  moved rather than matches gathered.
+- The GPU-over-CPU factor is ~4.4× (44.2 against 10.028 GB/s), the two
+  measured in the same invocation. The CPU oracle is fast here for the same
+  reason: a barely-compressible input gives `LZ4_decompress_safe` little work
+  per output byte.
+
+What this row does **not** establish is where the asset-like regime sits
+relative to the other corpora on today's kernel. That needs the other rows
+re-measured in one session, which is a separate piece of work and is not
+claimed here.
+
 ### Cost of the termination fuel cap (issue #72)
 
 The sequence loop in `src/lz4_decode.cuh` now carries an explicit decrementing
