@@ -73,7 +73,7 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
      * scope exit. The shared grow-only DevBuf serves this by a single ensure()
      * from cap 0 - every size below is non-zero (guarded by n != 0), so the
      * first ensure allocates exactly once, identical to a bare cudaMalloc. */
-    cudec_cuda::DevBuf d_src, d_dst, dd_src, dd_dst, dd_ssz, dd_dcp, dd_res;
+    cudec_cuda::DevBuf d_src, d_dst, dd_meta, dd_res;
     if (n != 0) {
         /* One destination slot of block_max per compressed block. Guard the
          * product against size_t overflow before asking the driver. */
@@ -104,25 +104,46 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
                                   cudaMemcpyHostToDevice));
         }
 
-        FRAME_CUDA(dd_src.ensure(n * sizeof(void*)));
-        FRAME_CUDA(dd_dst.ensure(n * sizeof(void*)));
-        FRAME_CUDA(dd_ssz.ensure(n * sizeof(size_t)));
-        FRAME_CUDA(dd_dcp.ensure(n * sizeof(size_t)));
+        /* The four metadata arrays go up in ONE transfer out of one packed
+         * allocation, in the layout src/stream.cpp already uses:
+         * [src_ptrs][src_sizes][dst_ptrs][dst_caps], each n elements wide at
+         * a uniform stride. Four separate uploads is four submissions per
+         * decode where one will do, and this path pays that per frame. The
+         * stride is written in units of void* for every section, including
+         * the two that hold size_t, so the assert below is what keeps that
+         * from being a silent misalignment on a host where the two differ. */
+        static_assert(sizeof(size_t) == sizeof(void*),
+                      "the packed metadata gives every section a void*-sized "
+                      "stride; a host where size_t is narrower would "
+                      "misalign the two size sections");
+        /* Packing multiplies the request by four, so the product gets the
+         * same treatment n * block_max already gets above: checked before
+         * the driver sees it, rejected rather than wrapped. */
+        if (n > SIZE_MAX / (4 * sizeof(void*))) {
+            return CUDEC_ERR_CORRUPT_INPUT;
+        }
+        const size_t meta_stride = n * sizeof(void*);
+        FRAME_CUDA(dd_meta.ensure(4 * meta_stride));
         FRAME_CUDA(dd_res.ensure(n * sizeof(cudec_chunk_result)));
-        FRAME_CUDA(cudaMemcpy(dd_src.p, h_src.data(), n * sizeof(void*),
-                              cudaMemcpyHostToDevice));
-        FRAME_CUDA(cudaMemcpy(dd_dst.p, h_dst.data(), n * sizeof(void*),
-                              cudaMemcpyHostToDevice));
-        FRAME_CUDA(cudaMemcpy(dd_ssz.p, h_ssz.data(), n * sizeof(size_t),
-                              cudaMemcpyHostToDevice));
-        FRAME_CUDA(cudaMemcpy(dd_dcp.p, h_dcp.data(), n * sizeof(size_t),
+
+        /* One host staging buffer in the same layout, filled section by
+         * section, so the upload is a straight copy of it. */
+        std::vector<unsigned char> h_meta(4 * meta_stride);
+        std::memcpy(h_meta.data(), h_src.data(), meta_stride);
+        std::memcpy(h_meta.data() + meta_stride, h_ssz.data(), meta_stride);
+        std::memcpy(h_meta.data() + 2 * meta_stride, h_dst.data(),
+                    meta_stride);
+        std::memcpy(h_meta.data() + 3 * meta_stride, h_dcp.data(),
+                    meta_stride);
+        FRAME_CUDA(cudaMemcpy(dd_meta.p, h_meta.data(), 4 * meta_stride,
                               cudaMemcpyHostToDevice));
 
+        unsigned char* const d_meta = static_cast<unsigned char*>(dd_meta.p);
         const cudec_status launched = cudec_lz4_decompress_batch(
-            static_cast<const void* const*>(dd_src.p),
-            static_cast<const size_t*>(dd_ssz.p),
-            static_cast<void* const*>(dd_dst.p),
-            static_cast<const size_t*>(dd_dcp.p), n,
+            reinterpret_cast<const void* const*>(d_meta),
+            reinterpret_cast<const size_t*>(d_meta + meta_stride),
+            reinterpret_cast<void* const*>(d_meta + 2 * meta_stride),
+            reinterpret_cast<const size_t*>(d_meta + 3 * meta_stride), n,
             static_cast<cudec_chunk_result*>(dd_res.p), nullptr);
         if (launched != CUDEC_OK) {
             return launched;
