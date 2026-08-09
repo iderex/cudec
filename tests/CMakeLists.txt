@@ -183,12 +183,12 @@ endif()
 # worth more than parallel wall time. A GPU test never self-skips - the
 # banned pattern is recorded in docs/MASTERPLAN.md section 5.
 function(cudec_add_test name)
-  cmake_parse_arguments(T "GPU" "" "SOURCES;LIBS" ${ARGN})
+  cmake_parse_arguments(T "GPU;HUGE" "" "SOURCES;LIBS" ${ARGN})
   # The host-only sanitizer gate (issue #42) builds only the GPU-less,
   # host-instrumentable subset: a GPU test is a .cu binary linked by nvcc,
   # which cannot pull in the ASan-instrumented cudec without sanitizing the
   # device link. Skip them so the sanitizer build stays pure host.
-  if(T_GPU AND CUDEC_SANITIZE)
+  if((T_GPU OR T_HUGE) AND CUDEC_SANITIZE)
     return()
   endif()
   add_executable(${name} ${T_SOURCES})
@@ -208,10 +208,23 @@ function(cudec_add_test name)
       ${name} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:${CUDEC_SANITIZE_COMPILE_FLAGS}>)
     target_link_options(${name} PRIVATE ${CUDEC_SANITIZE_LINK_FLAGS})
   endif()
+  # HUGE is built by every CUDA configure - a target nobody compiles rots
+  # unnoticed - and registered as a ctest entry only when asked for, because
+  # ctest offers no build-side way to keep an entry out of a bare `ctest`
+  # run: CONFIGURATIONS is ignored when no -C is given, and DISABLED hides
+  # the entry from -L as well. So the registration is the gate.
+  if(T_HUGE AND NOT CUDEC_HUGE_TESTS)
+    return()
+  endif()
   add_test(NAME ${name} COMMAND ${name})
   set_tests_properties(${name} PROPERTIES TIMEOUT
                                           ${CUDEC_TEST_TIMEOUT_SECONDS})
-  if(T_GPU)
+  if(T_HUGE)
+    # Its own label rather than gpu: scripts/sanitize-gpu.sh sweeps every
+    # gpu-labelled target with all four tools, and a multi-gigabyte
+    # single-warp decode under memcheck is not that sweep's business.
+    set_tests_properties(${name} PROPERTIES LABELS huge RUN_SERIAL TRUE)
+  elseif(T_GPU)
     set_tests_properties(${name} PROPERTIES LABELS gpu RUN_SERIAL TRUE)
   endif()
 endfunction()
@@ -450,6 +463,22 @@ if(TARGET determinism_gpu)
   target_include_directories(determinism_gpu
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 endif()
+
+# The one arm of the decode kernel no ordinary fixture reaches: a match past
+# 2^32, which selects the 64-bit gather (issue #331). Deleting the test that
+# selects it leaves the rest of the suite green, so without this the guard
+# cannot be shown to do anything. It allocates 4 GiB and walks it with a
+# single warp, which is why the entry exists only under the option, and why
+# the test refuses rather than skips on a device that cannot hold it.
+#
+#     cmake -B build-huge -DCUDEC_ENABLE_CUDA=ON -DCUDEC_HUGE_TESTS=ON
+#     cmake --build build-huge -j
+#     ctest --test-dir build-huge -L huge --output-on-failure
+option(CUDEC_HUGE_TESTS
+       "Register the ctest entries that allocate over 4 GiB on the device"
+       OFF)
+cudec_add_test(huge_match_gpu SOURCES huge_match_gpu.cu LIBS
+               cudec_test_fixtures HUGE)
 
 # ---- Structural conformance, configure time: a violation reds every CI
 # build. These are drift detectors, not tamper-proofing - the honest limits

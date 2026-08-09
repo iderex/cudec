@@ -71,6 +71,29 @@ and need a CUDA 12.x toolchain plus a GPU for the tests - see the README's
 container command for the maintained path (build directory `build-cuda`,
 `ctest --test-dir build-cuda`).
 
+### The tests that allocate over 4 GiB
+
+Some arms of the decoder are selected by a capacity test and nothing smaller
+reaches them: `src/lz4_decode.cuh` picks a 64-bit overlap gather for a match
+longer than 2^32, and no ordinary fixture is that large. `huge_match_gpu`
+reaches that one with a single 4 GiB decode. It is built by every CUDA
+configure, so it cannot rot, and it is registered as a ctest entry only under
+`-DCUDEC_HUGE_TESTS=ON`, because 4 GiB walked by one warp is not a shape every
+run should carry. Its label is `huge` rather than `gpu`, which keeps it out of
+the sanitizer sweep:
+
+```sh
+cmake -B build-huge -DCUDEC_ENABLE_CUDA=ON -DCUDEC_HUGE_TESTS=ON
+cmake --build build-huge -j
+ctest --test-dir build-huge -L huge --output-on-failure
+```
+
+On a device that cannot hold the allocation it FAILS with the shortfall in the
+message, and does not skip. A skip on the only test that reaches an arm reads
+exactly like a pass, and the guard was unprovable for as long as no test
+selected it. Write the next capacity-selected arm the same way: reach it, or
+say in the pull request that nothing does.
+
 ### The GPU sanitizer gate
 
 Any change that touches device code carries a Compute Sanitizer sweep, from M1
