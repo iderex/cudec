@@ -187,6 +187,86 @@ recovers the Silesia +9–10% without touching the worst case would be accepted 
 none is known under the single-loop structure, since the predicate is
 inherently per-match).
 
+### Perf pass 4 (issue #58): narrowing the gather modulo to 32 bits is accepted
+
+The match-copy gather computes `i mod offset` once per match byte per lane.
+Both operands provably fit in 32 bits at run time - `offset` is the LZ4
+2-byte offset field, and `i` is below `match_len` - but nvcc cannot prove the
+second, so it emits the 64-bit software modulo. sm_86 has no integer-divide
+hardware, and the width shows up in the loop body rather than in an estimate:
+
+```
+nvcc -arch=sm_86 -std=c++17 -Iinclude -Isrc -Xptxas -v -c src/batch.cu -o /tmp/batch.o
+cuobjdump -sass /tmp/batch.o
+```
+
+| Gather loop (SASS, `lz4_decode_batch<false>`) | Body            | Instructions per iteration |
+| --------------------------------------------- | --------------- | -------------------------- |
+| Baseline, 64-bit modulo                       | `0x1520-0x17a0` | 41                         |
+| Patched, 32-bit arm                           | `0x18c0-0x19e0` | 19                         |
+| Patched, 64-bit fallback arm                  | `0x1530-0x17b0` | 41                         |
+
+The literal-copy loop is 11 instructions on both builds, and ptxas reports
+`Used 48 registers, 0 bytes stack frame` on both, so the narrowing buys the
+gather without moving occupancy - which is what sank perf pass 2.
+
+Measured 2026-08-09, same pinned container and RTX 3080. **Both binaries are
+built once, up front, and then alternated**, baseline and patched, pass after
+pass. That method is the finding underneath the numbers and is worth stating
+before them: an A/B/A that rebuilds between arms was run first and it read
+`--worst4b` at +7.7%, which the alternation does not reproduce. Over minutes
+this GPU drifts by more than the effect on two of the three corpora, so
+whichever arm is measured later carries the drift. Alternating moves both arms
+through the same drift. 3 warmup + 30 CUDA-event-timed runs per number.
+
+| Corpus              | Baseline p50, five passes                     | Patched p50, five passes                      |
+| ------------------- | --------------------------------------------- | --------------------------------------------- |
+| `--worst4b --gpu`   | 26.632 / 26.383 / 26.149 / 26.298 / 26.507 ms | 26.213 / 25.974 / 26.284 / 25.981 / 25.965 ms |
+| `--longmatch --gpu` | 1.281 / 1.422 / 1.347 / 1.422 / 1.422 ms      | 0.984 / 1.032 / 1.087 / 1.089 / 1.087 ms      |
+
+Silesia over four alternations, with its parse-only ceiling read from the same
+invocations. The ceiling elides the copies, so the gather cannot reach it:
+
+| Pass | Baseline full / parse | Patched full / parse |
+| ---- | --------------------- | -------------------- |
+| 1    | 12.597 / 6.787 ms     | 12.272 / 7.145 ms    |
+| 2    | 12.669 / 7.188 ms     | 12.470 / 7.284 ms    |
+| 3    | 13.014 / 6.785 ms     | 12.451 / 7.135 ms    |
+| 4    | 12.575 / 7.258 ms     | 12.245 / 7.258 ms    |
+
+Throughput speedup on the medians, and the pairwise count, because with an
+effect this size the count says more than the ratio:
+
+| Corpus              | Baseline / patched median | Delta      | Passes won |
+| ------------------- | ------------------------- | ---------- | ---------- |
+| `--longmatch --gpu` | 1.422 / 1.087 ms          | **+30.8%** | 5 of 5     |
+| Silesia `--gpu`     | 12.633 / 12.361 ms        | **+2.2%**  | 4 of 4     |
+| `--worst4b --gpu`   | 26.383 / 25.981 ms        | **+1.5%**  | 4 of 5     |
+
+**The worst case gains least, and that refutes what this lever was expected to
+do.** #58 named `--worst4b` as the primary target, on the reasoning that every
+one of its match bytes takes the overlap modulo. Every one does, but there are
+only four of them per match: at match length 4 the gather loop runs a single
+iteration on four of the thirty-two lanes, so the cheaper iteration is
+amortized against a parse that is 59% of that corpus's wall
+(15.5 ms of 26.4 ms parse-only). `--longmatch`'s 255-byte matches run the loop
+eight times per lane and there the gather is the wall. The lever is a
+match-length lever, not an overlap lever, and the corpus that exposes it is
+the one perf pass 3 built for the opposite purpose.
+
+Silesia's copy half, full minus the ceiling from the same invocation, is
+5.810 / 5.481 / 6.229 / 5.317 ms against 5.127 / 5.186 / 5.316 / 4.987 ms.
+Perf pass 1 concluded that Silesia's short copies are latency-bound and that
+a cheaper modulo would not help them; +2.2% on the whole decode is small
+enough to leave that conclusion standing rather than overturn it.
+
+**Accepted.** Every corpus improves or holds, nothing regresses, and the axis
+perf pass 3 was rejected on is unmoved in the wrong direction: `--worst4b` is
+the adversarial worst case and the DoS-resistance margin, and it gains here
+rather than paying. The 32-bit arm is entered under a warp-uniform
+`match_len <= kGather32BitMaxLen`, so it costs no divergence, and a match
+longer than 2^32 still decodes through the unchanged 64-bit arm.
+
 ### Best case: the longmatch corpus (issue #36)
 
 The shipped kernel's baseline on the new `--longmatch` corpus - long
