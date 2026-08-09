@@ -241,6 +241,13 @@ cudec_add_test(oracle_snappy SOURCES oracle_snappy.cpp LIBS
 # headers in front of every test that includes fixtures.h.
 cudec_add_test(oracle_gdeflate SOURCES oracle_gdeflate.cpp LIBS
                gdeflate_oracle)
+# The dossier's format facts executed against that oracle (issue #170), the
+# GDeflate counterpart of snappy_probes below. It links gdeflate_oracle alone
+# for the reason oracle_gdeflate gives above, and it is GPU-less because the
+# facts are measured through the reference's public API rather than on a
+# device.
+cudec_add_test(gdeflate_probes SOURCES gdeflate_probes.cpp LIBS
+               gdeflate_oracle)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.
