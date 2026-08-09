@@ -1,13 +1,20 @@
-# Build output - reproducible from the sources via CMake.
-build/
-build-cuda/
-build-san/
-# The out-of-tree consumer's own build trees and the prefix they consume, all
-# produced by the install proof in ci.yml and reproducible the same way.
-build-consumer/
-build-consumer-badver/
-build-consumer-cuda/
-build-consumer-nocuda/
+# Build output - reproducible from the sources via CMake. A pattern rather
+# than a list of names: the list was per-directory-name and went stale by
+# construction, once per documented build configuration. fuzz/README.md tells
+# a reader to configure into build-fuzz, which no name here covered, so a
+# sanitizer-instrumented binary and its corpus sat untracked and visible in
+# `git status` where one wide `git add` would have taken them. CUDEC_ENABLE_HIP
+# is real in CMakeLists.txt and build-hip is the next name that would have been
+# missing.
+#
+# What the width costs, stated rather than discovered later: a directory whose
+# name starts with `build` can no longer be added to the tree without -f. No
+# tracked path starts with `build` today (`git ls-files | grep -cE '^build'`
+# is 0), and none is planned; if one is ever wanted, the negation belongs here
+# beside this comment rather than a return to the enumeration.
+build*/
+# The prefix the out-of-tree consumer install proof in ci.yml consumes, and
+# its log. Both reproducible the same way; neither starts with `build`.
 prefix-host/
 prefix-cuda/
 badver.log
