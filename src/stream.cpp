@@ -17,12 +17,15 @@
  * bought almost no overlap. Measuring a context that allocates nothing in steady
  * state also corrected #24's own diagnosis: the per-call allocation is NOT the
  * dominant cost - reuse saves only ~8 ms (cold - steady) of the ~230 ms wall.
- * The dominant streaming cost is the per-wave serial submission (~51 waves for
- * Silesia), tracked as the real lever in issue #33. Under correctness > measured
- * performance > minimal code, the N-stream ring is therefore dropped for a
- * single stream whose one reusable staging set is grown on demand and reused;
- * the amortization this context buys is real but small. See docs/BENCHMARKS.md
- * for the corrected overlap analysis and the output-D2H future lever. */
+ * The dominant streaming cost was the per-wave serial submission (~51 waves for
+ * Silesia at the fixed 64-chunk wave), and issue #33 took that lever: the wave
+ * is now sized by the staging it costs, Silesia submits once on the
+ * device-output path, and the steady-state device wall is 27.7 ms against
+ * 235.4 ms. Under correctness > measured performance > minimal code, the
+ * N-stream ring is therefore dropped for a single stream whose one reusable
+ * staging set is grown on demand and reused. See docs/BENCHMARKS.md for the
+ * corrected overlap analysis, the wave measurement, and the output-D2H future
+ * lever. */
 #include "batch_limits.h"
 #include "cudec.h"
 
@@ -36,18 +39,70 @@
 
 namespace cudec_stream_detail {
 
-constexpr size_t kWaveChunks = 64; /* chunks per wave: amortizes launch cost */
+/* The wave is what one submission carries, and the submission count is the
+ * streaming wall on this platform: issue #33 measured Silesia's ~230 ms
+ * steady-state against a ~12 ms device-resident decode and a ~4 ms compressed
+ * H2D, and attributed the ~213 ms residual to the 51 serial submissions a
+ * fixed 64-chunk wave produced. So the wave is sized by the staging it costs
+ * rather than by a chunk count, and both bounds below are needed.
+ *
+ * The byte budget bounds peak staging: pinned + device compressed source, and
+ * (host-output only) the device destination arena. It is charged against the
+ * LARGEST chunk in the call rather than the mean, so the bound holds for any
+ * distribution including a hostile one - a batch of tiny chunks with one huge
+ * one cannot talk the sizer into a wave that allocates far past the budget.
+ *
+ * The chunk ceiling bounds the metadata staging independently, at
+ * 4 * kWaveChunksMax * 8 bytes. Without it a batch of zero-length chunks
+ * divides the budget by one and asks for a wave of kMaxBatchChunks entries. */
+constexpr size_t kWaveStagingBudget = size_t{384} << 20;
+constexpr size_t kWaveChunksMax = 4096;
 
 /* The batch entry's launch limit bounds a stream batch too, and it is
  * cudec_detail::kMaxBatchChunks in src/batch_limits.h for both of them - the
  * duplicate that used to live here is what issue #39 was about. */
 using cudec_detail::kMaxBatchChunks;
 
-/* Metadata layout inside p_meta/d_meta for a wave of up to kWaveChunks chunks:
- * [src_ptrs][src_sizes][dst_ptrs][dst_caps], each kWaveChunks wide, 8-byte
- * elements. Fixed size, so the metadata staging never grows past this. */
-constexpr size_t kMetaStride = kWaveChunks * sizeof(void*);
-constexpr size_t kMetaBytes = 4 * kMetaStride;
+/* Metadata layout inside p_meta/d_meta for a wave of `wave_chunks` chunks:
+ * [src_ptrs][src_sizes][dst_ptrs][dst_caps], each `wave_chunks` wide, 8-byte
+ * elements. The stride is per call because the wave size is. */
+inline size_t MetaStride(size_t wave_chunks) {
+    return wave_chunks * sizeof(void*);
+}
+
+/* Chunks per wave for this call. Never zero: a single chunk larger than the
+ * budget still has to be decoded, and it goes alone rather than being
+ * refused - the budget sizes a wave, it is not a capacity limit on the ABI. */
+inline size_t ChooseWaveChunks(const size_t* h_src_sizes,
+                               const size_t* dst_caps, size_t chunk_count,
+                               bool host_out) {
+    size_t per_chunk_max = 1;
+    for (size_t i = 0; i < chunk_count; i++) {
+        size_t bytes = h_src_sizes[i];
+        if (host_out) {
+            /* Saturating: the sum only feeds a division that picks a wave
+             * size, so clamping it costs one chunk per wave and never a
+             * wrong bound. The real per-wave totals are summed exactly
+             * below, where an overflow is a reject. */
+            bytes = (SIZE_MAX - bytes < dst_caps[i]) ? SIZE_MAX
+                                                     : bytes + dst_caps[i];
+        }
+        if (bytes > per_chunk_max) {
+            per_chunk_max = bytes;
+        }
+    }
+    size_t wave = kWaveStagingBudget / per_chunk_max;
+    if (wave == 0) {
+        wave = 1;
+    }
+    if (wave > kWaveChunksMax) {
+        wave = kWaveChunksMax;
+    }
+    if (wave > chunk_count) {
+        wave = chunk_count;
+    }
+    return wave;
+}
 
 inline bool MulOverflows(size_t a, size_t b) {
     return a != 0 && b > SIZE_MAX / a;
@@ -187,7 +242,12 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
                              cudec_mem_space dst_space,
                              cudec_chunk_result* h_results) {
     const bool host_out = (dst_space == CUDEC_MEM_HOST);
-    const size_t wave_count = (chunk_count + kWaveChunks - 1) / kWaveChunks;
+    const size_t wave_chunks =
+        ChooseWaveChunks(h_src_sizes, dst_caps, chunk_count, host_out);
+    const size_t wave_count =
+        (chunk_count + wave_chunks - 1) / wave_chunks;
+    const size_t meta_stride = MetaStride(wave_chunks);
+    const size_t meta_bytes = 4 * meta_stride;
 
     /* Fail-closed the per-chunk channel up front: any post-validation early
      * return below (a size-overflow reject or a staging-grow failure) then
@@ -202,9 +262,9 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
     size_t max_wave_src = 0;
     size_t max_wave_dst = 0;
     for (size_t w = 0; w < wave_count; w++) {
-        const size_t begin = w * kWaveChunks;
-        const size_t end = (begin + kWaveChunks < chunk_count)
-                               ? begin + kWaveChunks
+        const size_t begin = w * wave_chunks;
+        const size_t end = (begin + wave_chunks < chunk_count)
+                               ? begin + wave_chunks
                                : chunk_count;
         size_t wsrc = 0, wdst = 0;
         for (size_t i = begin; i < end; i++) {
@@ -246,8 +306,8 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
     CUDEC_CUDA_CHECK(call, { ctx.poisoned = true; return CUDEC_ERR_CUDA; })
     GROW(ctx.p_src.ensure(max_wave_src));
     GROW(ctx.d_src.ensure(max_wave_src));
-    GROW(ctx.p_meta.ensure(kMetaBytes));
-    GROW(ctx.d_meta.ensure(kMetaBytes));
+    GROW(ctx.p_meta.ensure(meta_bytes));
+    GROW(ctx.d_meta.ensure(meta_bytes));
     if (host_out) {
         GROW(ctx.d_dst.ensure(max_wave_dst));
     }
@@ -278,9 +338,9 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
     }
 
     for (size_t w = 0; w < wave_count; w++) {
-        const size_t begin = w * kWaveChunks;
-        const size_t end = (begin + kWaveChunks < chunk_count)
-                               ? begin + kWaveChunks
+        const size_t begin = w * wave_chunks;
+        const size_t end = (begin + wave_chunks < chunk_count)
+                               ? begin + wave_chunks
                                : chunk_count;
         const size_t wn = end - begin;
 
@@ -303,11 +363,11 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
         const void** m_src = reinterpret_cast<const void**>(
             static_cast<unsigned char*>(ctx.p_meta.p));
         size_t* m_ssz = reinterpret_cast<size_t*>(
-            static_cast<unsigned char*>(ctx.p_meta.p) + kMetaStride);
+            static_cast<unsigned char*>(ctx.p_meta.p) + meta_stride);
         void** m_dst = reinterpret_cast<void**>(
-            static_cast<unsigned char*>(ctx.p_meta.p) + 2 * kMetaStride);
+            static_cast<unsigned char*>(ctx.p_meta.p) + 2 * meta_stride);
         size_t* m_cap = reinterpret_cast<size_t*>(
-            static_cast<unsigned char*>(ctx.p_meta.p) + 3 * kMetaStride);
+            static_cast<unsigned char*>(ctx.p_meta.p) + 3 * meta_stride);
 
         size_t src_off = 0;
         size_t dst_off = 0;
@@ -333,18 +393,18 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
         unsigned char* dm = static_cast<unsigned char*>(ctx.d_meta.p);
         const void* const* dd_src = reinterpret_cast<const void* const*>(dm);
         const size_t* dd_ssz =
-            reinterpret_cast<const size_t*>(dm + kMetaStride);
+            reinterpret_cast<const size_t*>(dm + meta_stride);
         void* const* dd_dst =
-            reinterpret_cast<void* const*>(dm + 2 * kMetaStride);
+            reinterpret_cast<void* const*>(dm + 2 * meta_stride);
         const size_t* dd_cap =
-            reinterpret_cast<const size_t*>(dm + 3 * kMetaStride);
+            reinterpret_cast<const size_t*>(dm + 3 * meta_stride);
 
         if (src_off != 0 &&
             cudaMemcpyAsync(d_src, p_src, src_off, cudaMemcpyHostToDevice,
                             stream) != cudaSuccess) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
-        if (cudaMemcpyAsync(ctx.d_meta.p, ctx.p_meta.p, kMetaBytes,
+        if (cudaMemcpyAsync(ctx.d_meta.p, ctx.p_meta.p, meta_bytes,
                             cudaMemcpyHostToDevice, stream) != cudaSuccess) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
