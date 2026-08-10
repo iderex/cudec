@@ -1005,6 +1005,83 @@ same host with the timed region held to the decode call alone, so the
 comparison is between the two references and says nothing about either GPU
 path.
 
+## M3: the Snappy adversarial denominators (issue #119)
+
+Two constructed corpora rather than one, because the format reaches its
+maximum element rate in two different regimes and a lock on one says nothing
+about the other. Both decode to the same 64 KiB block of a single repeated
+byte, at the same 3200-chunk scale as the LZ4 worst-case rows, and both carry
+one element per two compressed bytes. They differ only in what an element
+costs to produce: the copy chain emits four decoded bytes per element, the
+literal chain emits one.
+
+Neither is anything the reference compressor emits. A block of one repeated
+byte is exactly what it collapses into a single long copy, which is the best
+case rather than the worst, so both streams are built byte by byte in the
+harness and the reference passes verdict on every one of them before anything
+is timed. The construction is locked twice besides: the copy chain on its
+compressed share and its element rate, the literal chain on its element rate
+and its decoded bytes per element. A corpus that drifts off its shape reds
+`bench_snappy_worst_selfcheck` or `bench_snappy_worstlit_selfcheck` rather
+than quietly reporting a worst case it no longer measures.
+
+There is still no Snappy kernel, so these are denominators and carry no cudec
+number. Recorded 2026-08-10 inside the digest-pinned
+`nvidia/cuda:12.6.2-devel-ubuntu24.04` container. Reproduce with
+`bench_snappy --worstlit --warmup 3 --runs 30` and
+`bench_snappy --worst --warmup 3 --runs 30`.
+
+```
+## bench_snappy report
+- decoder: CPU oracle, snappy::RawUncompress (google/snappy 1.2.2), single thread. cudec has no Snappy kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- cudec: 100
+- corpus: max parse work per output byte (constructed), 64 KiB-chunked streams, 3200 streams, 209.72 MB original, 419.44 MB compressed (ratio 2.000), hand-constructed in-harness as one length-1 literal element per output byte, which the reference compressor never emits; every stream validated by the pinned snappy oracle before timing
+- corpus digest: a475ef89da01c0e4 (XXH64 over per-stream length and XXH64, little-endian, in corpus order)
+- stream sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is snappy::RawUncompress only (no allocation, no length parse); every stream round-trip-verified against the original once before timing; percentiles are nearest-rank
+- wall per run: p50 971.992 ms / p90 993.018 ms / p99 1138.249 ms
+- decode throughput: p50 0.216 GB/s / p90 0.211 GB/s / p99 0.184 GB/s
+- element density: 209715200 elements, 0.5000 per compressed byte, 1.0000 decoded bytes each
+```
+
+```
+## bench_snappy report
+- decoder: CPU oracle, snappy::RawUncompress (google/snappy 1.2.2), single thread. cudec has no Snappy kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- cudec: 100
+- corpus: max element density (constructed), 64 KiB-chunked streams, 3200 streams, 209.72 MB original, 104.88 MB compressed (ratio 0.500), hand-constructed in-harness as back-to-back minimum-cost copies at offset 1, which the reference compressor never emits; every stream validated by the pinned snappy oracle before timing
+- corpus digest: 1a7d7e76546da248 (XXH64 over per-stream length and XXH64, little-endian, in corpus order)
+- stream sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is snappy::RawUncompress only (no allocation, no length parse); every stream round-trip-verified against the original once before timing; percentiles are nearest-rank
+- wall per run: p50 1222.377 ms / p90 1328.367 ms / p99 1423.007 ms
+- decode throughput: p50 0.172 GB/s / p90 0.158 GB/s / p99 0.147 GB/s
+- element density: 52432000 elements, 0.4999 per compressed byte, 3.9998 decoded bytes each
+```
+
+**Both adversarial corpora cost the reference decoder between five and seven
+times what Silesia does, per output byte.** 0.216 and 0.172 GB/s p50 against
+1.195 GB/s on the 64 KiB-chunked Silesia rows above, over the same 64 KiB unit
+and a comparable total. That is the margin these corpora exist to measure, and
+it is the number a later device row on the same corpora is read against.
+
+**The parse-bound corpus is the faster of the two per output byte, which is
+the opposite of what its element count predicts.** It carries four times the
+elements per decoded byte (209,715,200 against 52,432,000 for the same 209.72
+MB) and still finishes 20% sooner. Per element the ordering reverses and the
+gap is wide: 215.8 M elements/s on the literal chain against 42.9 M on the
+copy chain, five times apart. The reference's offset-1 copy is the cost, not
+its parse, and a stream of the cheapest possible copies is a stream of
+byte-at-a-time overlapping copies.
+
+**That ordering belongs to this decoder and must not be carried over to the
+device rows.** A warp-cooperative decoder attacks the two regimes with
+different machinery: the offset-1 gather is a closed-form modular read rather
+than a serial copy, while the parse chain stays serial per chunk. Which corpus
+floors the GPU is a measurement nobody has taken, and neither this section nor
+the element counts settle it. It is recorded here so that whoever takes it has
+the CPU ordering in front of them rather than an assumption.
+
 ## Community AMD results
 
 **No community results yet.** Nothing in this section is a measurement; it

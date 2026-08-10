@@ -107,6 +107,15 @@ add_test(NAME bench_snappy_selfcheck COMMAND bench_snappy --selfcheck)
 add_test(NAME bench_snappy_worst_selfcheck COMMAND bench_snappy --worst
                                                    --selfcheck)
 
+# The parse-bound corpus (issue #119). Separate from the entry above because
+# the two lock different quantities: that one is bounded by elements per
+# decoded byte at four bytes each, this one at one, and throughput is reported
+# per decoded byte. A density lock on the copy chain says nothing about this
+# margin, so it gets its own construction, its own two locks and its own
+# entry. CPU-only, like the entries above.
+add_test(NAME bench_snappy_worstlit_selfcheck COMMAND bench_snappy --worstlit
+                                                      --selfcheck)
+
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
 # sequence-compression entry point and decoded by the reference, so the
@@ -150,5 +159,6 @@ set_tests_properties(
   bench_selfcheck bench_worst4b_selfcheck bench_longmatch_selfcheck
   bench_assetlike_selfcheck bench_zstd_worst_selfcheck bench_frame_selfcheck
   bench_snappy_selfcheck bench_snappy_worst_selfcheck
+  bench_snappy_worstlit_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()
