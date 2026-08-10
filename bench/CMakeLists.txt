@@ -97,6 +97,16 @@ target_compile_options(bench_snappy PRIVATE -Wall -Wextra -Werror -O2)
 # CPU-only, so it runs on the GPU-less runner.
 add_test(NAME bench_snappy_selfcheck COMMAND bench_snappy --selfcheck)
 
+# The maximum-element-density corpus (issue #166). Kept separate from the
+# Silesia path above because the two rot differently: that one rots on shape
+# and digests, this one rots on adversariality. Its construction is checked
+# twice before anything is timed - the oracle on validity, the density floors
+# on whether it is still the worst case it reports - and this entry runs the
+# identical construction on a handful of chunks. CPU-only, like the entry
+# above.
+add_test(NAME bench_snappy_worst_selfcheck COMMAND bench_snappy --worst
+                                                   --selfcheck)
+
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
 # sequence-compression entry point and decoded by the reference, so the
@@ -139,6 +149,6 @@ add_test(NAME bench_zstd_worst_selfcheck COMMAND bench_zstd --worst
 set_tests_properties(
   bench_selfcheck bench_worst4b_selfcheck bench_longmatch_selfcheck
   bench_assetlike_selfcheck bench_zstd_worst_selfcheck bench_frame_selfcheck
-  bench_snappy_selfcheck
+  bench_snappy_selfcheck bench_snappy_worst_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()
