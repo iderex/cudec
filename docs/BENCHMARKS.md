@@ -588,6 +588,77 @@ record shipping exactly that bug class in its Snappy decoder. Recovering the
 throughput later is legitimate measurement-gated perf work, but not at the
 price of the guarantee.
 
+#### Recovery attempt: the counted trip count (issue #75)
+
+**Measured-negative. No kernel code shipped.**
+
+The cost above is a per-sequence decrement and its counter. The shape measured
+here removes the counter and spends the same budget as the trip count of a
+counted loop instead, so the bound becomes the loop's own induction variable:
+`for (uint64_t left = budget; left != 0; --left)` around the sequence loop,
+with the `done` test left where it was and the fuel test gone. The budget is
+`src_size + 2` rather than `src_size + 1`, saturating at the top of the range,
+because the decrementing spelling tested its counter after the call and so
+admitted one more call than it was initialized with. Matching that exactly is
+what keeps the accept set unmoved.
+
+This is the fourth formulation measured against this cap. Three were measured
+when it landed, and this is not among them: they were a top-of-loop test, the
+folded exit-branch test that shipped, and a 32-bit counter, all of them counter
+shapes. It is also the only remaining shape the configure-time loop scanner
+admits, since that scanner requires a `while` or a condition-less `for` to name
+an explicit decrementing `fuel` counter, and a counted `for` with a visible
+condition satisfies it by construction rather than by naming anything.
+
+Three interleaved passes, after / before / after / before / after / before in
+one session, both binaries built from the same tree, recorded 2026-08-10 inside
+the digest-pinned `nvidia/cuda:12.6.2-devel-ubuntu24.04` container on the RTX
+3080 (sm_86, driver 560.94, CUDA 12.6, nvcc V12.6.77), device-resident and
+CUDA-event timed, 3 warmup + 30 measured runs. Baseline is `40a9f54`.
+Reproduce with `bench_lz4 --gpu bench/corpora/silesia/*` and
+`bench_lz4 --gpu --worst4b`, both `--warmup 3 --runs 30`.
+
+| Corpus        | Metric         | Before (samples)            | After (samples)             | Change |
+| ------------- | -------------- | --------------------------- | --------------------------- | ------ |
+| Silesia       | GPU decode p50 | 11.834 / 11.544 / 11.588 ms | 11.643 / 12.314 / 12.032 ms | +2.9 % |
+| Silesia       | Parse-only p50 | 6.724 / 6.724 / 6.717 ms    | 6.682 / 6.685 / 6.686 ms    | -0.6 % |
+| worst-4Bmatch | GPU decode p50 | 24.401 / 24.511 / 24.518 ms | 24.445 / 24.619 / 24.630 ms | +0.4 % |
+| worst-4Bmatch | Parse-only p50 | 14.500 / 14.582 / 14.592 ms | 14.451 / 14.474 / 14.558 ms | -0.4 % |
+
+Registers, from `cuobjdump --dump-resource-usage` on the built archive rather
+than from a compile log: **sm_80 54 to 47, sm_86 48 to 47**. On sm_86 that is
+inside the 41-48 bucket recorded above, so it moves no occupancy step and buys
+nothing there. The change stays inside the 48-register budget this issue set.
+
+**The verdict, and it is not the same on both rows.** The parse-only ceiling
+does improve, by about half a percent, and it is the one row here worth
+trusting: its four samples per side are within 0.005 ms of each other and the
+two sides do not overlap. That says the counted form genuinely costs slightly
+less per sequence.
+
+It says nothing that reaches the shipped decoder. The decode rows show no
+improvement on either corpus; Silesia reads +2.9 % off samples that overlap the
+before side, and worst-4Bmatch +0.4 % well inside its own spread. The
+pre-registered accept rule needs a recorded improvement on at least one corpus
+with zero regression on the worst case, and there is no improvement to weigh,
+so the change is refused.
+
+**What this closes and what it does not.** The cap costs 14-17 % of the
+parse-only ceiling; this recovers half a percent of it, roughly a thirtieth,
+and none of the 2.0 % on the decode path. Together with the three formulations
+measured when the cap landed, that is every counter shape the scanner admits,
+and the per-block-precondition direction is separately closed off: the budget
+is already derived once per chunk from the source size, and what remains per
+iteration is enforcing a limit on iterations, which means counting them. So the
+answer to the question this issue asked is that the cap's decode cost is not in
+the counter's shape and cannot be reformulated away.
+
+That is narrower than saying it is unrecoverable. Nothing here measures a
+change to the parser's liveness argument, which is what would remove the need
+for a budget rather than re-spell it, and nothing here touches the second
+budget inside `AccumulateLength`, which runs only on a length extension and is
+therefore invisible on a corpus without them.
+
 ## M2: reusable streaming context, end-to-end (Silesia)
 
 The streaming decode path is now a reusable context
