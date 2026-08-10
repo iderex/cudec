@@ -774,20 +774,6 @@ double DecodeAllSeconds(const Corpus& corpus, unsigned char* scratch) {
     return std::chrono::duration<double>(end - start).count();
 }
 
-std::string HostCpuName() {
-    std::ifstream in("/proc/cpuinfo");
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.rfind("model name", 0) == 0) {
-            const size_t colon = line.find(':');
-            if (colon != std::string::npos) {
-                return line.substr(colon + 2);
-            }
-        }
-    }
-    return "unknown host CPU";
-}
-
 std::string CudaDeviceLine() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
@@ -994,7 +980,7 @@ bool RunFrameRung(const std::vector<unsigned char>& source,
     std::printf("- decoder: cudec_lz4f_decompress (host frame in, host bytes "
                 "out; H2D, decode, D2H, assembly and checksums are all "
                 "inside the timed call)\n");
-    std::printf("- host CPU: %s\n", HostCpuName().c_str());
+    std::printf("- host CPU: %s\n", cudec_bench::HostCpuName().c_str());
     std::printf("- CUDA device: %s\n", CudaDeviceLine().c_str());
     std::printf("- cudec: %d\n", cudec_version());
     std::printf("- corpus: %s, %.2f MB original, %.2f MB frame (ratio "
@@ -1095,7 +1081,7 @@ void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
     std::printf("- decoder: CPU oracle, LZ4_decompress_safe (liblz4 %s), "
                 "single thread\n",
                 LZ4_versionString());
-    std::printf("- host CPU: %s\n", HostCpuName().c_str());
+    std::printf("- host CPU: %s\n", cudec_bench::HostCpuName().c_str());
     std::printf("- CUDA device: %s\n", CudaDeviceLine().c_str());
     std::printf("- cudec: %d (the CPU rows time the liblz4 oracle baseline; "
                 "the GPU rows below, when --gpu is set, time cudec's "
