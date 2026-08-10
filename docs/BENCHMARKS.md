@@ -829,6 +829,49 @@ is the merge. The ~450 ms floor all three rungs share is untouched and is still
 the transfers plus the host-side checksum, so the frame path still runs far
 below the kernel it wraps.
 
+### Frame source gather: pinned staging does not pay (issue #135)
+
+**Measured-negative. No decoder code shipped.**
+
+The frame path gathers the non-contiguous compressed blocks into one host
+buffer and pushes them up in a single H2D. That buffer is a pageable
+`std::vector`, so the driver stages it through pinned memory of its own before
+the DMA. The claim under test was that gathering straight into pinned staging
+skips that bounce copy and shows up in the end-to-end wall time.
+
+It does not. Three interleaved passes, after / before / after / before / after /
+before in one session, both binaries built from the same tree, recorded
+2026-08-10 inside the digest-pinned `nvidia/cuda:12.6.2-devel-ubuntu24.04`
+container on the RTX 3080 (sm_86, driver 560.94, CUDA 12.6, nvcc V12.6.77),
+3 warmup + 30 measured runs per rung, output byte-verified once per rung before
+timing. Baseline is `2962282`. Reproduce with
+`bench_lz4 --frame bench/corpora/silesia/* --warmup 3 --runs 30`.
+
+| Block max | Before p50 (3 samples)         | After p50 (3 samples)          | Change |
+| --------- | ------------------------------ | ------------------------------ | ------ |
+| 64 KB     | 399.628 / 433.568 / 424.567 ms | 432.287 / 441.727 / 433.930 ms | +4.0 % |
+| 256 KB    | 425.677 / 416.421 / 422.092 ms | 419.494 / 431.301 / 414.693 ms | +0.1 % |
+| 1 MB      | 472.230 / 441.407 / 452.914 ms | 444.834 / 450.241 / 443.524 ms | -2.0 % |
+
+The two sides overlap at every rung, and they overlap in both directions: the
+64 KB column reads as a regression and the 1 MB column as a win, off samples
+that interleave with each other. That is one distribution, not two, so the
+honest reading is flat and the percentages are noise rather than effects.
+
+Flat is enough to refuse it under this issue's pre-registered rule, and the
+reason it is flat is worth keeping. The bounce copy this removes is one pass
+over 102 MB. What the timed call also pays is the gather's own memcpy over the
+same bytes, the content checksum over the 212 MB of output, and the transfers
+in both directions, which is the ~450 ms floor every rung shares. Pinning
+102 MB is not free either, and `cudaHostAlloc` is paid per call here because
+the frame entry point owns no reusable context.
+
+Only the shape this issue names was measured: one pinned buffer of `total_src`,
+one H2D. A bounded pinned wave that overlaps the gather with the transfer is a
+different mechanism and is not evaluated here; overlap belongs to the streaming
+context work, which owns a buffer across calls and so does not pay the pinning
+per call.
+
 ## Community AMD results
 
 **No community results yet.** Nothing in this section is a measurement; it
