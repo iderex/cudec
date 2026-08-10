@@ -41,6 +41,32 @@ constexpr size_t kMaxRuns = 1000000;
  * so a failure reproduces. */
 constexpr size_t kSelfcheckBytes = 3u << 20;
 
+/* The maximum-element-density corpus (issue #166). Same 64 KiB unit and the
+ * same ~200 MB scale as the LZ4 worst-4Bmatch rows, so the two adversarial
+ * numbers are directly comparable once a Snappy kernel exists. */
+constexpr size_t kWorstChunks = 3200;
+constexpr size_t kWorstSelfcheckChunks = 4;
+
+/* Two floors, because the corpus can stop being adversarial in two ways and
+ * neither of them stops it decoding.
+ *
+ * A generator whose copies grew longer still emits one element per two
+ * compressed bytes, so the element rate alone would not notice; what moves is
+ * the compressed share, from a half toward a fifth. A generator that switched
+ * to a costlier element form keeps the compressed share and loses the element
+ * rate. The ideal stream sits at 0.500 on both, and the slack below is there
+ * for the preamble and the tail literal rather than for drift. */
+constexpr double kWorstMinCompressedShare = 0.49;
+constexpr double kWorstMinElementsPerByte = 0.49;
+
+/* The minimum-cost Snappy element: a one-byte tag plus one offset byte, four
+ * output bytes. Tag 0x01 is kind 01 (copy, 1-byte offset) with the length
+ * field zero, which the format reads as 4, and the three high bits zero, so
+ * the offset is the following byte alone. */
+constexpr unsigned char kMinCopyTag = 0x01;
+constexpr unsigned char kMinCopyOffset = 0x01;
+constexpr size_t kMinCopyOutput = 4;
+
 enum class Shape {
     /* One Snappy raw stream per input file. */
     kWhole,
@@ -149,9 +175,144 @@ bool AppendFile(const std::string& path, Shape shape, Corpus* corpus) {
 void CompressAll(Corpus* corpus) {
     for (const auto& original : corpus->originals) {
         corpus->compressed.push_back(SnappyCompressBlock(original));
-        corpus->original_bytes += original.size();
-        corpus->compressed_bytes += corpus->compressed.back().size();
     }
+}
+
+/* The byte counts every report line divides by, taken from the streams that
+ * are actually there. Separate from CompressAll because one corpus is not
+ * compressed by the reference at all: the adversarial stream below is
+ * constructed byte by byte, and a tally that only ran inside the compressor
+ * would report zeroes for it. */
+void Tally(Corpus* corpus) {
+    corpus->original_bytes = 0;
+    corpus->compressed_bytes = 0;
+    for (size_t i = 0; i < corpus->originals.size(); i++) {
+        corpus->original_bytes += corpus->originals[i].size();
+        corpus->compressed_bytes += corpus->compressed[i].size();
+    }
+}
+
+void AppendVarint32(size_t value, std::vector<unsigned char>* out) {
+    while (value >= 0x80) {
+        out->push_back(static_cast<unsigned char>((value & 0x7f) | 0x80));
+        value >>= 7;
+    }
+    out->push_back(static_cast<unsigned char>(value));
+}
+
+/* Builds one adversarial-but-valid Snappy stream: back-to-back minimum-cost
+ * copies at offset 1. That is the maximum element density the format can
+ * carry, one element per two compressed bytes and one per four decoded
+ * bytes, and it is where a per-element decoder floors.
+ *
+ * The reference compressor never emits it - it extends an offset-1 run into
+ * one long copy, which is the best case rather than the worst - so the stream
+ * is constructed here and the oracle passes verdict on it before anything is
+ * timed.
+ *
+ * Wire layout: the varint preamble, one literal byte to give the first copy
+ * something to read, then {tag, offset} pairs, then a literal tail of
+ * whatever the four-byte copies could not reach. Every byte of the output is
+ * the same seed, so the whole block is one run and the decode is bounded by
+ * element count rather than by bytes moved. */
+bool BuildWorstDensityBlock(size_t out_bytes,
+                            std::vector<unsigned char>* original,
+                            std::vector<unsigned char>* compressed,
+                            size_t* elements) {
+    constexpr unsigned char kSeed = 0xA5;
+    /* The literal seed plus one copy is the smallest stream that is still the
+     * shape this corpus is named for. Below it the tail would be the whole
+     * block, so refuse loudly rather than return something that is not
+     * adversarial. */
+    constexpr size_t kMinBytes = 256;
+    /* A literal run of at most this many bytes is encoded by the one-byte
+     * literal tag alone, which is what the tail below relies on. */
+    constexpr size_t kMaxTailLiteral = 60;
+
+    if (out_bytes < kMinBytes) {
+        std::fprintf(stderr, "the max-density block needs at least %zu output "
+                             "bytes, got %zu\n",
+                     kMinBytes, out_bytes);
+        return false;
+    }
+
+    original->assign(out_bytes, kSeed);
+
+    std::vector<unsigned char>& c = *compressed;
+    c.clear();
+    AppendVarint32(out_bytes, &c);
+    c.push_back(0x00); /* literal, length 1 */
+    c.push_back(kSeed);
+    size_t produced = 1;
+    *elements = 1;
+
+    while (produced + kMinCopyOutput <= out_bytes) {
+        c.push_back(kMinCopyTag);
+        c.push_back(kMinCopyOffset);
+        produced += kMinCopyOutput;
+        (*elements)++;
+    }
+
+    const size_t tail = out_bytes - produced;
+    if (tail > kMaxTailLiteral) {
+        std::fprintf(stderr, "the max-density tail is %zu bytes, which this "
+                             "construction does not encode\n",
+                     tail);
+        return false;
+    }
+    if (tail != 0) {
+        c.push_back(static_cast<unsigned char>((tail - 1) << 2));
+        c.insert(c.end(), tail, kSeed);
+        (*elements)++;
+    }
+    return true;
+}
+
+/* Refuses the corpus if it stopped being adversarial. Validity is the
+ * oracle's job and happens separately; this is the other half, because a
+ * valid-but-easy stream round-trips and would leave the report claiming a
+ * worst case it no longer measures. */
+bool CheckDensity(const Corpus& corpus, size_t elements) {
+    const double share = static_cast<double>(corpus.compressed_bytes) /
+                         static_cast<double>(corpus.original_bytes);
+    const double per_byte = static_cast<double>(elements) /
+                            static_cast<double>(corpus.compressed_bytes);
+    if (share < kWorstMinCompressedShare) {
+        std::fprintf(stderr,
+                     "the max-density corpus compressed to %.4f of its "
+                     "output, below the %.2f floor: its elements are "
+                     "producing more bytes each than the minimum copy, so "
+                     "this is no longer the worst case it reports\n",
+                     share, kWorstMinCompressedShare);
+        return false;
+    }
+    if (per_byte < kWorstMinElementsPerByte) {
+        std::fprintf(stderr,
+                     "the max-density corpus carries %.4f elements per "
+                     "compressed byte, below the %.2f floor: its elements "
+                     "cost more than the minimum copy encoding\n",
+                     per_byte, kWorstMinElementsPerByte);
+        return false;
+    }
+    return true;
+}
+
+/* Replicates the adversarial block to `chunks` identical chunks. The block is
+ * the same whatever the replica count, so the selfcheck exercises the
+ * identical construction on a handful of them. */
+bool BuildWorstDensityCorpus(size_t chunks, Corpus* corpus, size_t* elements) {
+    std::vector<unsigned char> original, compressed;
+    size_t per_block = 0;
+    if (!BuildWorstDensityBlock(kChunkBytes, &original, &compressed,
+                                &per_block)) {
+        return false;
+    }
+    for (size_t i = 0; i < chunks; i++) {
+        corpus->originals.push_back(original);
+        corpus->compressed.push_back(compressed);
+    }
+    *elements = per_block * chunks;
+    return true;
 }
 
 /* The oracle is the sole authority on validity, and it says so before any
@@ -262,7 +423,7 @@ void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
 }
 
 bool RunCorpus(Corpus* corpus, size_t warmup, size_t runs) {
-    CompressAll(corpus);
+    Tally(corpus);
     if (corpus->original_bytes == 0) {
         std::fprintf(stderr, "corpus is empty - nothing to benchmark\n");
         return false;
@@ -349,6 +510,7 @@ int main(int argc, char** argv) {
     bool selfcheck = false;
     bool whole = false;
     bool chunked = false;
+    bool worst = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -358,6 +520,8 @@ int main(int argc, char** argv) {
             whole = true;
         } else if (arg == "--chunked") {
             chunked = true;
+        } else if (arg == "--worst") {
+            worst = true;
         } else if (arg == "--runs" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n", kMaxRuns);
@@ -374,22 +538,66 @@ int main(int argc, char** argv) {
             return 2;
         } else if (!arg.empty() && arg[0] == '-') {
             std::fprintf(stderr, "usage: bench_snappy [--runs N] [--warmup N] "
-                                 "[--whole] [--chunked] [--selfcheck] "
-                                 "[corpus files...]\n");
+                                 "[--whole] [--chunked] [--worst] "
+                                 "[--selfcheck] [corpus files...]\n");
             return 2;
         } else {
             files.push_back(arg);
         }
     }
+    if (selfcheck) {
+        warmup = 1;
+        runs = 3;
+    }
+
+    /* The adversarial corpus is constructed rather than compressed, and its
+     * shape is the whole point of it, so it takes neither corpus files nor a
+     * shape flag and runs on its own. */
+    if (worst) {
+        if (!files.empty() || whole || chunked) {
+            std::fprintf(stderr, "--worst builds its own corpus and has one "
+                                 "shape; it takes no files and no shape "
+                                 "flag\n");
+            return 2;
+        }
+        Corpus corpus;
+        corpus.shape = Shape::kChunked;
+        corpus.name = "max element density (constructed)";
+        corpus.provenance =
+            "hand-constructed in-harness as back-to-back minimum-cost copies "
+            "at offset 1, which the reference compressor never emits; every "
+            "stream validated by the pinned snappy oracle before timing";
+        size_t elements = 0;
+        if (!BuildWorstDensityCorpus(
+                selfcheck ? kWorstSelfcheckChunks : kWorstChunks, &corpus,
+                &elements)) {
+            return 1;
+        }
+        Tally(&corpus);
+        /* Before the report and before any timing: an easy corpus must not
+         * reach a run that would print "worst case" over it. */
+        if (!CheckDensity(corpus, elements)) {
+            return 1;
+        }
+        if (!RunCorpus(&corpus, warmup, runs)) {
+            return 1;
+        }
+        std::printf("- element density: %zu elements, %.4f per compressed "
+                    "byte, %.4f decoded bytes each\n",
+                    elements,
+                    static_cast<double>(elements) /
+                        static_cast<double>(corpus.compressed_bytes),
+                    static_cast<double>(corpus.original_bytes) /
+                        static_cast<double>(elements));
+        return 0;
+    }
+
     /* Neither shape named means both, which is the recorded run. */
     if (!whole && !chunked) {
         whole = true;
         chunked = true;
     }
-    if (selfcheck) {
-        warmup = 1;
-        runs = 3;
-    }
+
     if (files.empty() && !selfcheck) {
         std::fprintf(stderr, "bench_snappy needs corpus files (the recorded "
                              "run uses bench/corpora/silesia/*); --selfcheck "
@@ -439,6 +647,7 @@ int main(int argc, char** argv) {
                     path.substr(slash == std::string::npos ? 0 : slash + 1);
             }
         }
+        CompressAll(&corpus);
         if (!RunCorpus(&corpus, warmup, runs)) {
             return 1;
         }
