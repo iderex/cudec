@@ -766,6 +766,69 @@ No decoder code moved for these numbers. This is the harness the frame-path
 changes are to be measured against, and it exists so that they can be
 rejected the way perf pass 3 was.
 
+### Frame assembly: merging the per-block device-to-host copies (issue #133)
+
+The sweep above priced the block count at roughly 34 microseconds a block, and
+the shape that produces it is one blocking `cudaMemcpy` per compressed block in
+the assembly loop. Assembly now issues those copies on one non-default stream
+with a single terminal synchronization, and merges consecutive blocks that are
+contiguous on both the device side and the output side into one copy before
+issuing anything.
+
+**Three shapes were measured and two were rejected.** The issue proposed the
+first two and neither pays:
+
+| Shape                                                            | 64 KB   | 256 KB  | 1 MB   |
+| ---------------------------------------------------------------- | ------- | ------- | ------ |
+| Async copies straight into the caller's `out`, one terminal sync | -1.9 %  | +3.0 %  | +1.8 % |
+| Async copies through a 32 MiB pinned bounce buffer, in waves     | -2.5 %  | +25.5 % | +10.8% |
+| Merge contiguous runs, async on one stream, one terminal sync    | -29.9 % | -11.1 % | -3.1 % |
+
+The first is the naive swap, and it is flat because `out` is the caller's
+buffer and is pageable: a device-to-pageable `cudaMemcpyAsync` is synchronous
+with respect to the host by specification, so the stall it was meant to remove
+is still paid. The second removes the stall for real, and loses anyway - it
+adds one host memcpy of the whole output, and past the 64 KB rung there are too
+few submissions left for the saved latency to cover that.
+
+The third wins because it removes submissions instead of relocating them, and
+what lets it is a property of the format rather than of this corpus: every data
+block but the last decodes to exactly the frame's block max, which is also the
+device slot stride, so a run of full blocks is one contiguous device range.
+Silesia's 3234-block frame becomes a handful of copies. Both sides of the
+adjacency are tested per block, so a frame that breaks either just gets more
+copies.
+
+**Numbers.** Three interleaved passes, after / before / after / before / after /
+before in one session, both binaries built from the same tree, recorded
+2026-08-10 inside the digest-pinned `nvidia/cuda:12.6.2-devel-ubuntu24.04`
+container (`sha256:738fba0f...`) on the RTX 3080 (sm_86, driver 560.94, CUDA
+12.6, nvcc V12.6.77), 3 warmup + 30 measured runs per rung, output
+byte-verified against the original once per rung before timing. Reproduce with
+`bench_lz4 --frame bench/corpora/silesia/* --warmup 3 --runs 30`. Every sample
+is listed rather than averaged away.
+
+| Block max | Before p50 (3 samples)         | After p50 (3 samples)          | Change      |
+| --------- | ------------------------------ | ------------------------------ | ----------- |
+| 64 KB     | 549.923 / 519.201 / 545.261 ms | 374.037 / 375.946 / 381.386 ms | **-29.9 %** |
+| 256 KB    | 440.591 / 438.248 / 441.267 ms | 393.992 / 389.628 / 390.543 ms | **-11.1 %** |
+| 1 MB      | 448.822 / 440.027 / 442.964 ms | 429.779 / 438.233 / 423.059 ms | -3.1 %      |
+
+The two sides do not overlap at any rung, and the gap widens with the block
+count, which is what a per-block cost being removed looks like. The 1 MB rung
+has only 203 blocks and correspondingly little to win.
+
+A first attempt at this A/B was discarded rather than reported: two of its
+twelve rung measurements came out near three times their neighbours, which is
+host contention and not a property of either binary. The table above is a
+second session with no other container running.
+
+**What this does not claim.** The single terminal synchronization is not what
+paid - that shape is the first row of the first table, and it is flat. The win
+is the merge. The ~450 ms floor all three rungs share is untouched and is still
+the transfers plus the host-side checksum, so the frame path still runs far
+below the kernel it wraps.
+
 ## Community AMD results
 
 **No community results yet.** Nothing in this section is a measurement; it

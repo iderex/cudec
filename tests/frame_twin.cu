@@ -253,6 +253,113 @@ int main() {
         REQUIRE(seam_rejects > 0); /* the kernel-status seam is actually hit */
     }
 
+    /* 2d. A stored block BETWEEN two compressed ones.
+     *
+     * Assembly merges decoded blocks that are adjacent in device memory into
+     * one copy, and only COMPRESSED blocks occupy device slots. So this is the
+     * frame where the two sides of that adjacency disagree: blocks 0 and 2 sit
+     * back to back in device memory and 64 KiB apart in the output, because
+     * the stored block 1 lands between them there and nowhere else. A merge
+     * that checked only the device side would write block 2 over block 1's
+     * bytes. Nothing above builds this shape - every case there is all
+     * compressed or all stored - so without it that half of the check is
+     * unproven, and it was: deleting it left this suite green.
+     *
+     * The block table is asserted rather than assumed, because the fixture is
+     * only worth its name while liblz4 still stores the middle block. LZ4F
+     * stores a block it cannot shrink, and the top bit of the 4-byte block
+     * size is what says it did. */
+    {
+        const size_t bm = size_t{64} << 10;
+        std::vector<unsigned char> mixed;
+        for (int part = 0; part < 3; part++) {
+            /* Part 1 is PRNG bytes, which LZ4F cannot shrink; 0 and 2 are the
+             * repeating-text mode and compress. */
+            const auto p = MakeData(bm, 0x900 + part, part == 1 ? 1 : 0);
+            mixed.insert(mixed.end(), p.begin(), p.end());
+        }
+        const auto frame = CompressFrame(mixed, true, false, false);
+
+        size_t pos = 7; /* magic(4) FLG(1) BD(1) HC(1), then the block table */
+        int compressed_before = 0;
+        int stored = 0;
+        int compressed_after = 0;
+        for (int b = 0; b < 3; b++) {
+            REQUIRE_CTX(pos + 4 <= frame.size(), "mixed table block %d", b);
+            const uint32_t bs = static_cast<uint32_t>(frame[pos]) |
+                                (static_cast<uint32_t>(frame[pos + 1]) << 8) |
+                                (static_cast<uint32_t>(frame[pos + 2]) << 16) |
+                                (static_cast<uint32_t>(frame[pos + 3]) << 24);
+            if ((bs >> 31) != 0) {
+                stored++;
+            } else if (stored == 0) {
+                compressed_before++;
+            } else {
+                compressed_after++;
+            }
+            pos += 4 + (bs & 0x7FFFFFFFu);
+        }
+        REQUIRE_CTX(compressed_before == 1 && stored == 1 &&
+                        compressed_after == 1,
+                    "stored-between-compressed fixture is %d/%d/%d, not 1/1/1",
+                    compressed_before, stored, compressed_after);
+
+        REQUIRE(CheckFrameOk("stored-between-compressed", frame, mixed) == 0);
+    }
+
+    /* 2e. A SHORT compressed block followed by a full one.
+     *
+     * The other half of the same adjacency test. Device slots are strided by
+     * the frame's block max whatever a block actually decodes to, so a block
+     * that decodes short leaves a hole before the next slot, and merging
+     * across it would copy the hole into the output. LZ4F never emits a short
+     * block anywhere but last, so no compressor-built frame reaches this; the
+     * frame format permits it and liblz4 accepts it, which makes it exactly
+     * the crafted-input case this decoder is supposed to survive. Built by
+     * splicing one frame's block record in front of another's, both frames
+     * carrying the same descriptor, so the header stays the one LZ4F wrote.
+     *
+     * Deleting the device-side test leaves this red and the rest of the suite
+     * green. */
+    {
+        const auto short_data = MakeData(1000, 0xA01, 0);
+        const auto full_data = MakeData(size_t{64} << 10, 0xA02, 0);
+        const auto fa = CompressFrame(short_data, true, false, false);
+        const auto fb = CompressFrame(full_data, true, false, false);
+
+        /* magic(4) FLG(1) BD(1) HC(1) | size(4) payload | end mark(4). */
+        auto record = [](const std::vector<unsigned char>& f) {
+            const uint32_t bs = static_cast<uint32_t>(f[7]) |
+                                (static_cast<uint32_t>(f[8]) << 8) |
+                                (static_cast<uint32_t>(f[9]) << 16) |
+                                (static_cast<uint32_t>(f[10]) << 24);
+            return std::vector<unsigned char>(
+                f.begin() + 7, f.begin() + 7 + 4 + (bs & 0x7FFFFFFFu));
+        };
+        REQUIRE((static_cast<uint32_t>(fa[10]) >> 7) == 0); /* both compressed */
+        REQUIRE((static_cast<uint32_t>(fb[10]) >> 7) == 0);
+        REQUIRE(fa[5] == fb[5] && fa[6] == fb[6]); /* same FLG and BD */
+
+        std::vector<unsigned char> spliced(fa.begin(), fa.begin() + 7);
+        const auto ra = record(fa);
+        const auto rb = record(fb);
+        spliced.insert(spliced.end(), ra.begin(), ra.end());
+        spliced.insert(spliced.end(), rb.begin(), rb.end());
+        spliced.insert(spliced.end(), 4, 0); /* end mark */
+
+        std::vector<unsigned char> expect = short_data;
+        expect.insert(expect.end(), full_data.begin(), full_data.end());
+
+        /* The oracle has to accept it, or the fixture is proving a reject
+         * rather than a placement. */
+        std::vector<unsigned char> oout(expect.size() + 4096);
+        REQUIRE(Lz4fDecode(spliced, &oout) == true);
+        REQUIRE(oout.size() == expect.size());
+        REQUIRE(equal_bytes(oout.data(), expect.data(), expect.size()));
+
+        REQUIRE(CheckFrameOk("short-then-full", spliced, expect) == 0);
+    }
+
     /* 3. Reject branches. */
     const auto data = MakeData(200000, 0x999, 2);
 
