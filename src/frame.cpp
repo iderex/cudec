@@ -161,8 +161,57 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
     }
 
     /* Place each block at its prefix offset: uncompressed blocks copied from
-     * the frame, compressed blocks copied straight from device to `out` (no
-     * intermediate host buffer, no second copy). */
+     * the frame, compressed blocks copied from the device.
+     *
+     * Each compressed block used to cost its own blocking cudaMemcpy, which is
+     * one host stall per block; the block-count sweep in docs/BENCHMARKS.md is
+     * what made that visible, at roughly 34 microseconds a block. The copies
+     * are now issued on one stream and drained once, and consecutive blocks
+     * that are contiguous on BOTH sides are merged into a single copy first,
+     * so the submission count follows the frame's layout instead of its block
+     * count.
+     *
+     * The merge is what makes this pay, and what makes it pay is a property of
+     * the format rather than of the corpus: every data block of a frame except
+     * the last decodes to exactly block_max, which is the device stride, so a
+     * run of full blocks is contiguous in device memory; and compressed blocks
+     * land at consecutive output offsets wherever no uncompressed block
+     * separates them. Both are tested per block below rather than assumed, so
+     * a frame that breaks either just gets more copies, never wrong bytes.
+     *
+     * Every destination range written here is disjoint from every other one -
+     * they are prefix offsets into `out` - so the copies may complete in any
+     * order, and the interleaved host memcpy for an uncompressed block touches
+     * bytes no copy is targeting. That disjointness is what makes the order
+     * free; nothing here depends on a D2H into pageable memory happening to be
+     * synchronous.
+     *
+     * The drain has to happen before d_dst is freed - an in-flight copy out of
+     * freed device memory is a use-after-free that does not fail loudly - so
+     * the guard below runs it on EVERY exit path from here on, including the
+     * error returns, and the ordinary path checks its status as well. */
+    cudec_cuda::StreamOwner asm_stream;
+    if (n != 0) {
+        FRAME_CUDA(asm_stream.create());
+    }
+    struct AsmDrain {
+        cudaStream_t s;
+        ~AsmDrain() {
+            if (s != nullptr) {
+                (void)cudaStreamSynchronize(s);
+            }
+        }
+    } asm_drain{asm_stream.s};
+
+    /* The open run of merged blocks; run_len == 0 means no run is open.
+     * Neither sum below can overflow: a run that started at block k0 holds at
+     * most one block_max per block, so run_dev + run_len is at most
+     * n * block_max, which the guard above already refused an overflow of; and
+     * run_out + run_len is at most `total`, which the capacity walk computed
+     * without one. */
+    size_t run_dev = 0;
+    size_t run_out = 0;
+    size_t run_len = 0;
     size_t off = 0;
     size_t k = 0;
     for (size_t i = 0; i < blocks.size(); i++) {
@@ -174,15 +223,32 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
             off += blocks[i].src_len;
         } else {
             const size_t len = decoded_len[i];
-            if (len != 0) {
-                const unsigned char* dsrc =
-                    static_cast<unsigned char*>(d_dst.p) + k * block_max;
-                FRAME_CUDA(cudaMemcpy(out + off, dsrc, len,
-                                      cudaMemcpyDeviceToHost));
+            const size_t dev = k * block_max;
+            if (run_len != 0 && run_dev + run_len == dev &&
+                run_out + run_len == off) {
+                run_len += len;
+            } else {
+                if (run_len != 0) {
+                    FRAME_CUDA(cudaMemcpyAsync(
+                        out + run_out,
+                        static_cast<unsigned char*>(d_dst.p) + run_dev, run_len,
+                        cudaMemcpyDeviceToHost, asm_stream.s));
+                }
+                run_dev = dev;
+                run_out = off;
+                run_len = len;
             }
             off += len;
             k++;
         }
+    }
+    if (run_len != 0) {
+        FRAME_CUDA(cudaMemcpyAsync(
+            out + run_out, static_cast<unsigned char*>(d_dst.p) + run_dev,
+            run_len, cudaMemcpyDeviceToHost, asm_stream.s));
+    }
+    if (n != 0) {
+        FRAME_CUDA(cudaStreamSynchronize(asm_stream.s));
     }
 
     *total_out = total;
