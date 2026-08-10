@@ -12,6 +12,8 @@
 #define CUDEC_BENCH_STATS_H
 
 #include <cstddef>
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace cudec_bench {
@@ -38,6 +40,24 @@ T Percentile(const std::vector<T>& sorted, int pct) {
  * report 0 rather than inf. */
 inline double GbpsFromMs(double gb, double ms) {
     return ms > 0.0 ? gb / (ms / 1e3) : 0.0;
+}
+
+/* The host the numbers were taken on, read from the kernel rather than
+ * configured, so a report cannot attest a CPU the run did not happen on.
+ * Here rather than in one harness because every report block names it and a
+ * second hand-matched copy is what this header exists to prevent. */
+inline std::string HostCpuName() {
+    std::ifstream in("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("model name", 0) == 0) {
+            const size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                return line.substr(colon + 2);
+            }
+        }
+    }
+    return "unknown host CPU";
 }
 
 }  // namespace cudec_bench

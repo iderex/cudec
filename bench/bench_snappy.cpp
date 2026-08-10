@@ -1,0 +1,453 @@
+/* The Snappy benchmark harness: the CPU denominator every later GPU number
+ * is read against. There is no Snappy kernel yet, so this measures the
+ * reference decoder alone, and it says so in its own report rather than
+ * leaving a reader to infer it (docs/MASTERPLAN.md section 5, honest
+ * numbers).
+ *
+ * Two corpus shapes, because the batch API and the format disagree about
+ * what a unit is. Snappy's own framing is a whole stream per file; the
+ * shape this library decodes is a page, which the columnar formats emit at
+ * 64 KiB. A denominator taken on one shape does not transfer to the other,
+ * so both are built from the same bytes and reported separately.
+ *
+ * Every corpus carries a digest of what was actually built, so a run that
+ * silently compressed something else cannot be mistaken for a comparable
+ * one. */
+#include "bench_stats.h"
+#include "cudec.h"
+#include "fixtures.h"
+#include "xxhash64.h"
+
+#include <snappy.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+/* The page size the columnar formats emit and the batch API targets. */
+constexpr size_t kChunkBytes = 65536;
+
+constexpr size_t kMaxRuns = 1000000;
+
+/* The selfcheck source. Compressible enough that the streams are not all
+ * literals, several chunks long at the chunked shape, and from a fixed PRNG
+ * so a failure reproduces. */
+constexpr size_t kSelfcheckBytes = 3u << 20;
+
+enum class Shape {
+    /* One Snappy raw stream per input file. */
+    kWhole,
+    /* One Snappy raw stream per 64 KiB of input. */
+    kChunked,
+};
+
+struct Corpus {
+    std::string name;
+    Shape shape = Shape::kWhole;
+    std::vector<std::vector<unsigned char>> originals;
+    std::vector<std::vector<unsigned char>> compressed;
+    size_t original_bytes = 0;
+    size_t compressed_bytes = 0;
+    /* Printed verbatim in the methodology block, so it must stay true for
+     * whichever corpus ran. */
+    std::string provenance =
+        "compressed in-harness by the pinned snappy oracle";
+};
+
+const char* ShapeName(Shape shape) {
+    return shape == Shape::kWhole ? "whole-file streams"
+                                  : "64 KiB-chunked streams";
+}
+
+/* The corpus lock.
+ *
+ * What has to be caught is drift: a compressor pin that moved, a chunking
+ * rule that changed, an input file that is not the one the report names.
+ * All three change the produced streams, so the digest runs over those and
+ * not over the inputs - the inputs are already pinned by the manifest
+ * bench/get-corpora.sh writes, and adding a second fetch path or a second
+ * input lock here would be two authorities on one fact.
+ *
+ * The digest is a fold rather than one hash over the concatenation, so it
+ * costs 16 bytes per stream instead of a second copy of the corpus: each
+ * stream contributes its length and its own XXH64, little-endian, in
+ * corpus order, and the reported digest is the XXH64 of that array.
+ * Reordering, retruncating or recompressing any stream moves it.
+ *
+ * XXH64 and not SHA-256, stated so nobody reads more into it than is
+ * there: this is a drift detector over data the harness just built, not a
+ * defence against a chosen collision, and it is the hash already in the
+ * tree (src/xxhash64.h) rather than a new dependency for a bench. */
+void AppendLe64(uint64_t value, std::vector<unsigned char>* out) {
+    for (unsigned i = 0; i < 8; i++) {
+        out->push_back(static_cast<unsigned char>(value >> (i * 8)));
+    }
+}
+
+uint64_t CorpusDigest(const Corpus& corpus) {
+    std::vector<unsigned char> fold;
+    fold.reserve(corpus.compressed.size() * 16);
+    for (const auto& stream : corpus.compressed) {
+        AppendLe64(stream.size(), &fold);
+        AppendLe64(cudec_detail::Xxh64(stream.data(), stream.size()), &fold);
+    }
+    return cudec_detail::Xxh64(fold.data(), fold.size());
+}
+
+bool AppendFile(const std::string& path, Shape shape, Corpus* corpus) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        std::fprintf(stderr, "cannot open corpus file: %s\n", path.c_str());
+        return false;
+    }
+    const size_t before = corpus->originals.size();
+    if (shape == Shape::kChunked) {
+        while (true) {
+            std::vector<unsigned char> chunk(kChunkBytes);
+            in.read(reinterpret_cast<char*>(chunk.data()),
+                    static_cast<std::streamsize>(kChunkBytes));
+            const std::streamsize got = in.gcount();
+            if (got <= 0) {
+                break;
+            }
+            chunk.resize(static_cast<size_t>(got));
+            corpus->originals.push_back(std::move(chunk));
+        }
+    } else {
+        std::vector<unsigned char> whole;
+        char buffer[1 << 16];
+        while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
+            whole.insert(whole.end(), buffer, buffer + in.gcount());
+        }
+        if (!whole.empty()) {
+            corpus->originals.push_back(std::move(whole));
+        }
+    }
+    /* Fail closed on I/O trouble and on zero contribution, per FILE rather
+     * than over the accumulated corpus: the accumulated test goes vacuous
+     * from the second argument on, and a file that contributed nothing must
+     * never end up attested in the methodology block. */
+    if (in.bad()) {
+        std::fprintf(stderr, "read error in corpus file: %s\n", path.c_str());
+        return false;
+    }
+    if (corpus->originals.size() == before) {
+        std::fprintf(stderr, "corpus file contributed no data: %s\n",
+                     path.c_str());
+        return false;
+    }
+    return true;
+}
+
+void CompressAll(Corpus* corpus) {
+    for (const auto& original : corpus->originals) {
+        corpus->compressed.push_back(SnappyCompressBlock(original));
+        corpus->original_bytes += original.size();
+        corpus->compressed_bytes += corpus->compressed.back().size();
+    }
+}
+
+/* The oracle is the sole authority on validity, and it says so before any
+ * timing: a number taken on a stream the reference refuses, or on one that
+ * does not round-trip, is a number about nothing. */
+bool VerifyCorpus(const Corpus& corpus) {
+    for (size_t i = 0; i < corpus.compressed.size(); i++) {
+        std::vector<unsigned char> decoded;
+        if (!SnappyOracleDecodes(corpus.compressed[i], &decoded)) {
+            std::fprintf(stderr, "the oracle refuses stream %zu of %s\n", i,
+                         corpus.name.c_str());
+            return false;
+        }
+        if (decoded != corpus.originals[i]) {
+            std::fprintf(stderr, "stream %zu of %s does not round-trip\n", i,
+                         corpus.name.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+/* One timed pass over the whole corpus. The timed region is
+ * snappy::RawUncompress alone: the destination buffers are allocated and
+ * the declared lengths read outside it, so the number is the decoder's and
+ * not the allocator's.
+ *
+ * Returns a negative duration if any stream fails, so a broken decode can
+ * never be reported as a fast one. */
+double DecodeAllSeconds(const Corpus& corpus,
+                        std::vector<std::vector<char>>* buffers) {
+    const auto start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < corpus.compressed.size(); i++) {
+        const auto& stream = corpus.compressed[i];
+        if (!snappy::RawUncompress(reinterpret_cast<const char*>(stream.data()),
+                                   stream.size(), (*buffers)[i].data())) {
+            return -1.0;
+        }
+    }
+    const auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(end - start).count();
+}
+
+bool MakeBuffers(const Corpus& corpus,
+                 std::vector<std::vector<char>>* buffers) {
+    buffers->clear();
+    for (const auto& stream : corpus.compressed) {
+        size_t declared = 0;
+        if (!snappy::GetUncompressedLength(
+                reinterpret_cast<const char*>(stream.data()), stream.size(),
+                &declared)) {
+            std::fprintf(stderr, "no declared length in a %s stream\n",
+                         corpus.name.c_str());
+            return false;
+        }
+        buffers->push_back(std::vector<char>(declared));
+    }
+    return true;
+}
+
+void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
+                 size_t warmup, size_t runs) {
+    std::vector<size_t> sizes;
+    for (const auto& original : corpus.originals) {
+        sizes.push_back(original.size());
+    }
+    std::sort(sizes.begin(), sizes.end());
+    const double to_gbps = static_cast<double>(corpus.original_bytes) / 1e9;
+
+    std::printf("## bench_snappy report\n");
+    std::printf("- decoder: CPU oracle, snappy::RawUncompress (google/snappy "
+                "%d.%d.%d), single thread. cudec has no Snappy kernel yet, so "
+                "this report is the denominator and carries no cudec "
+                "number\n",
+                SNAPPY_MAJOR, SNAPPY_MINOR, SNAPPY_PATCHLEVEL);
+    std::printf("- host CPU: %s\n", cudec_bench::HostCpuName().c_str());
+    std::printf("- cudec: %d\n", cudec_version());
+    std::printf("- corpus: %s, %s, %zu streams, %.2f MB original, %.2f MB "
+                "compressed (ratio %.3f), %s\n",
+                corpus.name.c_str(), ShapeName(corpus.shape),
+                corpus.originals.size(),
+                static_cast<double>(corpus.original_bytes) / 1e6,
+                static_cast<double>(corpus.compressed_bytes) / 1e6,
+                static_cast<double>(corpus.compressed_bytes) /
+                    static_cast<double>(corpus.original_bytes),
+                corpus.provenance.c_str());
+    std::printf("- corpus digest: %016llx (XXH64 over per-stream length and "
+                "XXH64, little-endian, in corpus order)\n",
+                static_cast<unsigned long long>(CorpusDigest(corpus)));
+    std::printf("- stream sizes: min %zu / median %zu / max %zu bytes "
+                "uncompressed\n",
+                sizes.front(), sizes[sizes.size() / 2], sizes.back());
+    std::printf("- method: %zu warmup + %zu measured runs, wall clock per "
+                "whole-corpus decode; the timed region is "
+                "snappy::RawUncompress only (no allocation, no length "
+                "parse); every stream round-trip-verified against the "
+                "original once before timing; percentiles are nearest-rank\n",
+                warmup, runs);
+    std::printf("- wall per run: p50 %.3f ms / p90 %.3f ms / p99 %.3f ms\n",
+                cudec_bench::Percentile(sorted, 50) * 1e3,
+                cudec_bench::Percentile(sorted, 90) * 1e3,
+                cudec_bench::Percentile(sorted, 99) * 1e3);
+    std::printf("- decode throughput: p50 %.3f GB/s / p90 %.3f GB/s / p99 "
+                "%.3f GB/s\n",
+                to_gbps / cudec_bench::Percentile(sorted, 50),
+                to_gbps / cudec_bench::Percentile(sorted, 90),
+                to_gbps / cudec_bench::Percentile(sorted, 99));
+}
+
+bool RunCorpus(Corpus* corpus, size_t warmup, size_t runs) {
+    CompressAll(corpus);
+    if (corpus->original_bytes == 0) {
+        std::fprintf(stderr, "corpus is empty - nothing to benchmark\n");
+        return false;
+    }
+    if (!VerifyCorpus(*corpus)) {
+        return false;
+    }
+    std::vector<std::vector<char>> buffers;
+    if (!MakeBuffers(*corpus, &buffers)) {
+        return false;
+    }
+    for (size_t i = 0; i < warmup; i++) {
+        if (DecodeAllSeconds(*corpus, &buffers) < 0) {
+            std::fprintf(stderr, "a warmup decode failed\n");
+            return false;
+        }
+    }
+    std::vector<double> times;
+    for (size_t i = 0; i < runs; i++) {
+        const double seconds = DecodeAllSeconds(*corpus, &buffers);
+        if (seconds < 0) {
+            std::fprintf(stderr, "a measured decode failed\n");
+            return false;
+        }
+        times.push_back(seconds);
+    }
+    std::sort(times.begin(), times.end());
+    PrintReport(*corpus, times, warmup, runs);
+    return true;
+}
+
+std::vector<unsigned char> MakeSelfcheckSource(size_t bytes) {
+    std::vector<unsigned char> out(bytes);
+    uint64_t state = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < bytes; i++) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        /* Runs of a repeating alphabet with occasional noise: copies for the
+         * decoder to execute, without collapsing to one long copy. */
+        out[i] = (i % 61 == 0) ? static_cast<unsigned char>(state >> 56)
+                               : static_cast<unsigned char>('a' + (i / 7) % 26);
+    }
+    return out;
+}
+
+/* The selfcheck's corpus is generated from a fixed PRNG and compressed by
+ * the pinned oracle, so both shapes are reproducible byte for byte and
+ * their digests are constants. Asserting them is what makes this a rot
+ * check rather than a run: a compressor pin that moved, a chunk size that
+ * changed, or a generator that lost its noise source all move a digest,
+ * and none of them would stop the corpus round-tripping. */
+constexpr uint64_t kSelfcheckWholeDigest = 0x82b0f9596c1b94e8ull;
+constexpr uint64_t kSelfcheckChunkedDigest = 0xe7c9cffbc38ed2e4ull;
+
+bool CheckDigest(const Corpus& corpus, uint64_t expected) {
+    const uint64_t actual = CorpusDigest(corpus);
+    if (actual == expected) {
+        return true;
+    }
+    std::fprintf(stderr,
+                 "the %s selfcheck corpus digest moved: expected %016llx, "
+                 "built %016llx - the corpus this harness constructs is not "
+                 "the one its numbers were recorded on\n",
+                 ShapeName(corpus.shape),
+                 static_cast<unsigned long long>(expected),
+                 static_cast<unsigned long long>(actual));
+    return false;
+}
+
+bool ParseCount(const char* text, size_t low, size_t high, size_t* out) {
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || value < low || value > high) {
+        return false;
+    }
+    *out = static_cast<size_t>(value);
+    return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    size_t runs = 30;
+    size_t warmup = 3;
+    bool selfcheck = false;
+    bool whole = false;
+    bool chunked = false;
+    std::vector<std::string> files;
+    for (int i = 1; i < argc; i++) {
+        const std::string arg = argv[i];
+        if (arg == "--selfcheck") {
+            selfcheck = true;
+        } else if (arg == "--whole") {
+            whole = true;
+        } else if (arg == "--chunked") {
+            chunked = true;
+        } else if (arg == "--runs" && i + 1 < argc) {
+            if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
+                std::fprintf(stderr, "--runs must be in [1, %zu]\n", kMaxRuns);
+                return 2;
+            }
+        } else if (arg == "--warmup" && i + 1 < argc) {
+            if (!ParseCount(argv[++i], 0, kMaxRuns, &warmup)) {
+                std::fprintf(stderr, "--warmup must be in [0, %zu]\n",
+                             kMaxRuns);
+                return 2;
+            }
+        } else if (arg == "--runs" || arg == "--warmup") {
+            std::fprintf(stderr, "%s needs a value\n", arg.c_str());
+            return 2;
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::fprintf(stderr, "usage: bench_snappy [--runs N] [--warmup N] "
+                                 "[--whole] [--chunked] [--selfcheck] "
+                                 "[corpus files...]\n");
+            return 2;
+        } else {
+            files.push_back(arg);
+        }
+    }
+    /* Neither shape named means both, which is the recorded run. */
+    if (!whole && !chunked) {
+        whole = true;
+        chunked = true;
+    }
+    if (selfcheck) {
+        warmup = 1;
+        runs = 3;
+    }
+    if (files.empty() && !selfcheck) {
+        std::fprintf(stderr, "bench_snappy needs corpus files (the recorded "
+                             "run uses bench/corpora/silesia/*); --selfcheck "
+                             "runs it on a generated source instead\n");
+        return 2;
+    }
+
+    const std::vector<unsigned char> generated =
+        selfcheck ? MakeSelfcheckSource(kSelfcheckBytes)
+                  : std::vector<unsigned char>();
+
+    const Shape shapes[] = {Shape::kWhole, Shape::kChunked};
+    for (Shape shape : shapes) {
+        if (shape == Shape::kWhole && !whole) {
+            continue;
+        }
+        if (shape == Shape::kChunked && !chunked) {
+            continue;
+        }
+        Corpus corpus;
+        corpus.shape = shape;
+        if (selfcheck) {
+            corpus.name = "generated (selfcheck)";
+            corpus.provenance = "generated in-harness from a fixed PRNG, "
+                                "compressed by the pinned snappy oracle";
+            if (shape == Shape::kChunked) {
+                for (size_t off = 0; off < generated.size();
+                     off += kChunkBytes) {
+                    const size_t take =
+                        std::min(kChunkBytes, generated.size() - off);
+                    const auto first =
+                        generated.begin() + static_cast<std::ptrdiff_t>(off);
+                    corpus.originals.push_back(std::vector<unsigned char>(
+                        first, first + static_cast<std::ptrdiff_t>(take)));
+                }
+            } else {
+                corpus.originals.push_back(generated);
+            }
+        } else {
+            for (const auto& path : files) {
+                if (!AppendFile(path, shape, &corpus)) {
+                    return 1;
+                }
+                const size_t slash = path.find_last_of("/\\");
+                corpus.name +=
+                    (corpus.name.empty() ? "" : "+") +
+                    path.substr(slash == std::string::npos ? 0 : slash + 1);
+            }
+        }
+        if (!RunCorpus(&corpus, warmup, runs)) {
+            return 1;
+        }
+        if (selfcheck && !CheckDigest(corpus, shape == Shape::kWhole
+                                                  ? kSelfcheckWholeDigest
+                                                  : kSelfcheckChunkedDigest)) {
+            return 1;
+        }
+        std::printf("\n");
+    }
+    return 0;
+}

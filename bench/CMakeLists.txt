@@ -70,6 +70,33 @@ add_test(NAME bench_frame_selfcheck COMMAND bench_lz4 --frame --selfcheck)
 set_tests_properties(bench_frame_selfcheck PROPERTIES LABELS gpu RUN_SERIAL
                                                       TRUE)
 
+# The Snappy CPU denominator (issue #164). No CUDA in it at all: there is no
+# Snappy kernel yet, so the only decoder this times is the reference, and the
+# binary needs neither a device nor a kernel header. It links the same
+# oracle target tests/ pins and the same fixture library, because the Snappy
+# streams in this project have ONE provenance (tests/fixtures.h) and a bench
+# that compressed its own would be a second one nobody reconciles.
+add_executable(bench_snappy bench_snappy.cpp)
+target_link_libraries(bench_snappy PRIVATE cudec cudec_test_fixtures
+                                           snappy_oracle)
+# The corpus digest reads src/xxhash64.h, the hash already in the tree.
+target_include_directories(bench_snappy PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+set_target_properties(bench_snappy PROPERTIES CXX_STANDARD 17
+                                              CXX_STANDARD_REQUIRED ON)
+# -O2 unconditionally for the reason bench_lz4 gives above: the documented
+# container command sets no CMAKE_BUILD_TYPE, and an -O0 reference decoder
+# would be timed instead of the reference decoder.
+target_compile_options(bench_snappy PRIVATE -Wall -Wextra -Werror -O2)
+
+# Same rot protection as the entries above, and one more thing besides. The
+# selfcheck builds both corpus shapes from a fixed PRNG and asserts the
+# digest of each, so a moved compressor pin, a changed chunk size or a
+# generator that lost its noise source reds CI - none of which would stop the
+# corpus round-tripping, which is why the round trip alone is not the check.
+# CPU-only, so it runs on the GPU-less runner.
+add_test(NAME bench_snappy_selfcheck COMMAND bench_snappy --selfcheck)
+
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
 # sequence-compression entry point and decoded by the reference, so the
@@ -112,5 +139,6 @@ add_test(NAME bench_zstd_worst_selfcheck COMMAND bench_zstd --worst
 set_tests_properties(
   bench_selfcheck bench_worst4b_selfcheck bench_longmatch_selfcheck
   bench_assetlike_selfcheck bench_zstd_worst_selfcheck bench_frame_selfcheck
+  bench_snappy_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()

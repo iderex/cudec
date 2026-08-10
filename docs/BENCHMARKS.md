@@ -943,6 +943,68 @@ different mechanism and is not evaluated here; overlap belongs to the streaming
 context work, which owns a buffer across calls and so does not pay the pinning
 per call.
 
+## M3: the Snappy CPU denominator (issue #164)
+
+There is no Snappy kernel yet. This entry is the denominator a later device
+number will be read against, and the harness says so in its own report rather
+than leaving a reader to infer it from the absence of a GPU row.
+
+Two corpus shapes, because the format and the batch API disagree about what a
+unit is. Snappy's own framing is one stream per file; the shape this library
+decodes is a page, which the columnar formats emit at 64 KiB. Both are built
+from the same Silesia bytes by the pinned snappy 1.2.2 compressor, verified
+stream by stream against the reference decoder before anything is timed, and
+reported separately.
+
+Each report carries a digest of the corpus that was actually built, folded
+over the produced streams rather than over the inputs (the inputs are already
+pinned by the manifest `bench/get-corpora.sh` writes). It is order-sensitive,
+so the digests below belong to the file order a glob produces. Recorded
+2026-08-10 inside the digest-pinned `nvidia/cuda:12.6.2-devel-ubuntu24.04`
+container, on the host CPU named in the blocks. Reproduce with
+`bench_snappy --warmup 3 --runs 30 bench/corpora/silesia/*`.
+
+```
+## bench_snappy report
+- decoder: CPU oracle, snappy::RawUncompress (google/snappy 1.2.2), single thread. cudec has no Snappy kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, whole-file streams, 12 streams, 211.94 MB original, 101.35 MB compressed (ratio 0.478), compressed in-harness by the pinned snappy oracle
+- corpus digest: 7bd83d9e3b24fd44 (XXH64 over per-stream length and XXH64, little-endian, in corpus order)
+- stream sizes: min 5345280 / median 10085684 / max 51220480 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is snappy::RawUncompress only (no allocation, no length parse); every stream round-trip-verified against the original once before timing; percentiles are nearest-rank
+- wall per run: p50 177.088 ms / p90 181.655 ms / p99 186.636 ms
+- decode throughput: p50 1.197 GB/s / p90 1.167 GB/s / p99 1.136 GB/s
+```
+
+```
+## bench_snappy report
+- decoder: CPU oracle, snappy::RawUncompress (google/snappy 1.2.2), single thread. cudec has no Snappy kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 64 KiB-chunked streams, 3239 streams, 211.94 MB original, 101.36 MB compressed (ratio 0.478), compressed in-harness by the pinned snappy oracle
+- corpus digest: be088850546d917c (XXH64 over per-stream length and XXH64, little-endian, in corpus order)
+- stream sizes: min 8066 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is snappy::RawUncompress only (no allocation, no length parse); every stream round-trip-verified against the original once before timing; percentiles are nearest-rank
+- wall per run: p50 177.413 ms / p90 184.445 ms / p99 187.988 ms
+- decode throughput: p50 1.195 GB/s / p90 1.149 GB/s / p99 1.127 GB/s
+```
+
+**Cutting the corpus into 64 KiB pages costs the reference decoder nothing
+measurable.** 177.088 ms whole against 177.413 ms chunked is 0.18% apart, well
+inside the p50-to-p99 spread of either row, and the compressed size moves by
+10 KB in 101 MB. That matters for what comes later: a device number quoted
+against the chunked denominator is not being flattered by a handicapped
+baseline, because the two baselines are the same number.
+
+**Snappy's reference decoder is about 2.8x slower than liblz4's on these
+bytes, at the same ratio.** The LZ4 CPU-oracle row further down this file
+reports 3.410 GB/s p50 over the same 211.94 MB at ratio 0.483; this one
+reports 1.197 GB/s at ratio 0.478. Both are single-thread wall clock on the
+same host with the timed region held to the decode call alone, so the
+comparison is between the two references and says nothing about either GPU
+path.
+
 ## Community AMD results
 
 **No community results yet.** Nothing in this section is a measurement; it
