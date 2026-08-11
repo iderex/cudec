@@ -124,8 +124,11 @@ add_test(NAME bench_snappy_worst_selfcheck COMMAND bench_snappy --worst
 # link the linker rightly refuses.
 add_executable(bench_zstd bench_zstd.cpp ../tests/zstd_corpus.cpp)
 target_link_libraries(bench_zstd PRIVATE zstd_full)
-target_include_directories(bench_zstd
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tests)
+# ../src for the corpus digest, which reads src/xxhash64.h - the hash already
+# in the tree rather than a new dependency for a bench.
+target_include_directories(
+  bench_zstd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tests
+                     ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 set_target_properties(bench_zstd PROPERTIES CXX_STANDARD 17
                                             CXX_STANDARD_REQUIRED ON)
 # -O2 unconditionally for the reason bench_lz4 gives above: the documented
@@ -141,6 +144,23 @@ target_compile_options(bench_zstd PRIVATE -Wall -Wextra -Werror -O2)
 add_test(NAME bench_zstd_worst_selfcheck COMMAND bench_zstd --worst
                                                  --selfcheck)
 
+# The standard Zstd corpus path (issue #227). The recorded run reads the
+# fetched Silesia files, which the CI runner does not have, so the selfcheck
+# runs the identical grid - both granularity endpoints, the whole level set -
+# over a source generated from a fixed PRNG, and asserts the digest of each
+# cell. That is what makes it a rot check rather than a run: a moved
+# compressor pin, a changed granularity or a generator that lost its noise
+# source all move a digest, and none of them would stop the frames
+# round-tripping. CPU-only, so it runs on the GPU-less runner.
+add_test(NAME bench_zstd_selfcheck COMMAND bench_zstd --selfcheck)
+
+# The forced-mode corpus as a coverage run (issue #227). It consumes the
+# fixture generator tests/ pins rather than building a second one, and it
+# reports which decode surfaces were reached instead of a throughput number -
+# fixtures sized to reach a surface each cannot carry one. CPU-only.
+add_test(NAME bench_zstd_coverage_selfcheck COMMAND bench_zstd --coverage
+                                                    --selfcheck)
+
 # Every ctest entry carries a finite TIMEOUT (issue #72): the self-checks run
 # the same corpus construction and CPU decode the decoder is held to, so a
 # non-terminating decode must red them rather than stall the run. The
@@ -148,7 +168,8 @@ add_test(NAME bench_zstd_worst_selfcheck COMMAND bench_zstd --worst
 # one.
 set_tests_properties(
   bench_selfcheck bench_worst4b_selfcheck bench_longmatch_selfcheck
-  bench_assetlike_selfcheck bench_zstd_worst_selfcheck bench_frame_selfcheck
-  bench_snappy_selfcheck bench_snappy_worst_selfcheck
+  bench_assetlike_selfcheck bench_zstd_worst_selfcheck bench_zstd_selfcheck
+  bench_zstd_coverage_selfcheck bench_frame_selfcheck bench_snappy_selfcheck
+  bench_snappy_worst_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()

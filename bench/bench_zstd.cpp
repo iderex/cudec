@@ -1,7 +1,25 @@
-/* The Zstd worst-case bench corpus (issue #229): a hand-constructed frame
- * family that is adversarial on all three axes the M5 design named, gated by
- * libzstd for validity and locked on shape, plus the libzstd CPU decode of
- * that corpus.
+/* The Zstd benchmark harness. Two corpora live here, and they are separate
+ * because they rot differently.
+ *
+ * THE STANDARD PATH (issue #227) builds the fetched corpora as independent
+ * frames at production granularity across a recorded level set, and times the
+ * reference decoder over them. That is the CPU denominator every later GPU
+ * number is read against. There is no Zstd kernel yet, so this measures the
+ * reference alone and says so in its own report rather than leaving a reader
+ * to infer it (docs/MASTERPLAN.md section 5, honest numbers). It rots on
+ * corpus shape and digests.
+ *
+ * THE WORST-CASE PATH (issue #229) is a hand-constructed frame family that is
+ * adversarial on all three axes the M5 design named, gated by libzstd for
+ * validity and locked on shape. It rots on adversariality, which a digest
+ * would not notice.
+ *
+ * Neither path builds its own compressor. The frames both consume come from
+ * the corpus generator in tests/zstd_corpus.h, which is compiled in here
+ * exactly as the tests compile it - this directory links and consumes what
+ * tests/ defines and modifies none of it.
+ *
+ * Everything below the next paragraph is the worst-case path.
  *
  * WHY IT IS HAND-CONSTRUCTED. The reference compressor never emits this
  * shape. Its match finder extends a run into one long match, picks whatever
@@ -50,12 +68,15 @@
 #include <zstd.h>
 
 #include "zstd_corpus.h"
+#include "xxhash64.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -653,31 +674,548 @@ void PrintReport(const ZstdCorpus& corpus, const SequenceCensus& census,
                 GbpsFromMs(gb, p99 * 1e3));
 }
 
+/* ------------------------------------------------------------------------
+ * The standard corpus path (issue #227): the CPU denominator.
+ * ---------------------------------------------------------------------- */
+
+constexpr size_t kMaxRuns = 1000000;
+
+/* The frame granularity range the M5 batch model names (docs/MASTERPLAN.md,
+ * the Zstd chunk model): 64 KiB to 512 KiB, every frame independent, which is
+ * the geometry cudec_zstd_decompress_batch will consume. Both ENDPOINTS are
+ * recorded rather than one figure, because the two ends of the range are not
+ * one measurement: at 64 KiB the per-frame envelope and table builds are paid
+ * eight times as often over the same bytes, and a denominator taken at one end
+ * does not transfer to the other.
+ *
+ * A GRANULARITY ADDED HERE MUST STAY UNDER THE ORACLE'S OUTPUT CEILING.
+ * ZstdOracleDecodes bounds its destination at 4 MiB, deliberately, so a
+ * mutated content-size field cannot drive an allocation; a frame declaring
+ * more comes back refused. Both sizes below are far under it, but a future
+ * entry above 4 MiB would fail as "the oracle refuses frame 0" rather than as
+ * the size mistake it is. */
+constexpr size_t kFrameSizes[] = {65536, 524288};
+
+/* Fast, default, and the high-search family. Level 19 is not optional: it is
+ * where the reference's own search changes shape, and the interop defects the
+ * M4/M5 dossiers record were in that family rather than in the fast one. */
+constexpr int kLevels[] = {1, 3, 19};
+
+/* The selfcheck source. Several frames long at the 512 KiB rung, compressible
+ * enough that the frames are not all raw blocks, and from a fixed PRNG so a
+ * failure reproduces byte for byte. */
+constexpr size_t kSelfcheckBytes = 3u << 20;
+
+/* The corpus lock, on the model bench_snappy.cpp records in full: a fold of
+ * each frame's length and XXH64 in corpus order, hashed again. What it has to
+ * catch is drift - a compressor pin that moved, a chunking rule that changed,
+ * an input file that is not the one the report names - and all three change
+ * the produced frames, so the digest runs over those. The fetched inputs are
+ * already pinned by the manifest bench/get-corpora.sh writes, and a second
+ * input lock here would be two authorities on one fact.
+ *
+ * XXH64 and not SHA-256, said plainly so nobody reads more into it: this is a
+ * drift detector over data the harness just built, not a defence against a
+ * chosen collision, and it is the hash already in the tree. */
+void AppendLe64(uint64_t value, std::vector<unsigned char>* out) {
+    for (unsigned i = 0; i < 8; i++) {
+        out->push_back(static_cast<unsigned char>(value >> (i * 8)));
+    }
+}
+
+uint64_t CorpusDigest(const ZstdCorpus& corpus) {
+    std::vector<unsigned char> fold;
+    fold.reserve(corpus.compressed.size() * 16);
+    for (const auto& frame : corpus.compressed) {
+        AppendLe64(frame.size(), &fold);
+        AppendLe64(cudec_detail::Xxh64(frame.data(), frame.size()), &fold);
+    }
+    return cudec_detail::Xxh64(fold.data(), fold.size());
+}
+
+/* Reads one corpus file onto the end of `source`. Fails closed on I/O trouble
+ * and on a file that contributed nothing, per FILE rather than over the
+ * accumulated source: the accumulated test goes vacuous from the second
+ * argument on, and a file that contributed no bytes must never end up attested
+ * in the methodology block. */
+bool AppendFile(const std::string& path, std::vector<unsigned char>* source) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        std::fprintf(stderr, "cannot open corpus file: %s\n", path.c_str());
+        return false;
+    }
+    const size_t before = source->size();
+    char buffer[1 << 16];
+    while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
+        source->insert(source->end(), buffer, buffer + in.gcount());
+    }
+    if (in.bad()) {
+        std::fprintf(stderr, "read error in corpus file: %s\n", path.c_str());
+        return false;
+    }
+    if (source->size() == before) {
+        std::fprintf(stderr, "corpus file contributed no data: %s\n",
+                     path.c_str());
+        return false;
+    }
+    return true;
+}
+
+std::vector<unsigned char> MakeSelfcheckSource(size_t bytes) {
+    std::vector<unsigned char> out(bytes);
+    uint64_t state = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < bytes; i++) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        /* Runs of a repeating alphabet with occasional noise: matches for the
+         * decoder to execute, without collapsing into one long match. */
+        out[i] = (i % 61 == 0) ? static_cast<unsigned char>(state >> 56)
+                               : static_cast<unsigned char>('a' + (i / 7) % 26);
+    }
+    return out;
+}
+
+/* Cuts the source into independent frames through the corpus generator and
+ * fills in the decoded side by decoding what came back.
+ *
+ * The originals are DECODED rather than re-sliced from the source on purpose.
+ * Re-slicing would restate the generator's chunking rule here, and the two
+ * copies would then have to be kept in agreement by hand; decoding asks the
+ * reference what the frames actually contain, and the identity check below
+ * turns that into a proof that the frame set reconstructs the corpus exactly.
+ * A chunking rule that changed would fail that check rather than pass a
+ * matching pair of mistakes. */
+bool BuildStandardCorpus(const std::vector<unsigned char>& source,
+                         size_t frame_bytes, int level, ZstdCorpus* corpus) {
+    corpus->compressed = MakeZstdBatchFrames(source, frame_bytes, level);
+    if (corpus->compressed.empty()) {
+        std::fprintf(stderr,
+                     "the corpus generator produced no frames at %zu bytes, "
+                     "level %d\n",
+                     frame_bytes, level);
+        return false;
+    }
+    for (size_t i = 0; i < corpus->compressed.size(); i++) {
+        std::vector<unsigned char> decoded;
+        if (!ZstdOracleDecodes(corpus->compressed[i], &decoded)) {
+            std::fprintf(stderr, "the oracle refuses frame %zu of %s\n", i,
+                         corpus->name.c_str());
+            return false;
+        }
+        corpus->originals.push_back(std::move(decoded));
+    }
+    corpus->original_bytes = 0;
+    corpus->compressed_bytes = 0;
+    for (size_t i = 0; i < corpus->originals.size(); i++) {
+        corpus->original_bytes += corpus->originals[i].size();
+        corpus->compressed_bytes += corpus->compressed[i].size();
+    }
+    return true;
+}
+
+/* The identity check: the frames, decoded in order and concatenated, must be
+ * the source byte for byte. A number taken on a frame set that dropped,
+ * reordered or truncated part of the corpus is a number about a different
+ * corpus, and the ratio it reports would still look plausible. */
+bool StandardCorpusReconstructs(const std::vector<unsigned char>& source,
+                                const ZstdCorpus& corpus) {
+    if (corpus.original_bytes != source.size()) {
+        std::fprintf(stderr,
+                     "the frames decode to %zu bytes but the source is %zu - "
+                     "the corpus is not the one the report would name\n",
+                     corpus.original_bytes, source.size());
+        return false;
+    }
+    size_t at = 0;
+    for (size_t i = 0; i < corpus.originals.size(); i++) {
+        const std::vector<unsigned char>& frame = corpus.originals[i];
+        if (std::memcmp(source.data() + at, frame.data(), frame.size()) != 0) {
+            std::fprintf(stderr, "frame %zu does not round-trip\n", i);
+            return false;
+        }
+        at += frame.size();
+    }
+    return true;
+}
+
+/* Destination buffers, allocated outside the timed region so the number is the
+ * decoder's and not the allocator's. */
+std::vector<std::vector<unsigned char>> MakeStandardBuffers(
+    const ZstdCorpus& corpus) {
+    std::vector<std::vector<unsigned char>> buffers;
+    buffers.reserve(corpus.originals.size());
+    for (const auto& original : corpus.originals) {
+        buffers.push_back(std::vector<unsigned char>(original.size()));
+    }
+    return buffers;
+}
+
+/* One timed pass. The timed region is ZSTD_decompress alone. Returns a
+ * negative duration if any frame fails, so a broken decode can never be
+ * reported as a fast one. */
+double DecodeStandardSeconds(const ZstdCorpus& corpus,
+                             std::vector<std::vector<unsigned char>>* buffers) {
+    const auto start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < corpus.compressed.size(); i++) {
+        const size_t rc = ZSTD_decompress(
+            (*buffers)[i].data(), (*buffers)[i].size(),
+            corpus.compressed[i].data(), corpus.compressed[i].size());
+        if (ZSTD_isError(rc)) {
+            return -1.0;
+        }
+    }
+    const auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(end - start).count();
+}
+
+void PrintStandardReport(const ZstdCorpus& corpus, size_t frame_bytes,
+                         int level, const std::vector<double>& sorted,
+                         size_t warmup, size_t runs) {
+    std::vector<size_t> sizes;
+    sizes.reserve(corpus.originals.size());
+    for (const auto& original : corpus.originals) {
+        sizes.push_back(original.size());
+    }
+    std::sort(sizes.begin(), sizes.end());
+    const double gb = static_cast<double>(corpus.original_bytes) / 1e9;
+
+    std::printf("## bench_zstd report\n");
+    std::printf("- decoder: CPU oracle, ZSTD_decompress (libzstd %s), single "
+                "thread. cudec has no Zstd kernel yet, so this report is the "
+                "denominator and carries no cudec number\n",
+                ZSTD_versionString());
+    std::printf("- host CPU: %s\n", cudec_bench::HostCpuName().c_str());
+    std::printf("- corpus: %s, %zu frames, %.2f MB original, %.2f MB "
+                "compressed (ratio %.4f), %s\n",
+                corpus.name.c_str(), corpus.originals.size(),
+                static_cast<double>(corpus.original_bytes) / 1e6,
+                static_cast<double>(corpus.compressed_bytes) / 1e6,
+                static_cast<double>(corpus.compressed_bytes) /
+                    static_cast<double>(corpus.original_bytes),
+                corpus.provenance.c_str());
+    std::printf("- granularity: %zu KiB frames, compression level %d\n",
+                frame_bytes / 1024, level);
+    std::printf("- corpus digest: %016llx (XXH64 over per-frame length and "
+                "XXH64, little-endian, in corpus order)\n",
+                static_cast<unsigned long long>(CorpusDigest(corpus)));
+    std::printf("- frame sizes: min %zu / median %zu / max %zu bytes "
+                "uncompressed\n",
+                sizes.front(), sizes[sizes.size() / 2], sizes.back());
+    std::printf("- method: %zu warmup + %zu measured runs, wall clock per "
+                "whole-corpus decode; the timed region is ZSTD_decompress "
+                "only (destinations allocated outside it); every frame "
+                "round-trip-verified and the concatenation compared against "
+                "the source once before timing; percentiles are "
+                "nearest-rank\n",
+                warmup, runs);
+    const double p50 = Percentile(sorted, 50);
+    const double p90 = Percentile(sorted, 90);
+    const double p99 = Percentile(sorted, 99);
+    std::printf("- wall per run: p50 %.3f ms / p90 %.3f ms / p99 %.3f ms\n",
+                p50 * 1e3, p90 * 1e3, p99 * 1e3);
+    std::printf("- decode throughput: p50 %.3f GB/s / p90 %.3f GB/s / p99 "
+                "%.3f GB/s\n",
+                GbpsFromMs(gb, p50 * 1e3), GbpsFromMs(gb, p90 * 1e3),
+                GbpsFromMs(gb, p99 * 1e3));
+}
+
+/* The selfcheck's corpus is generated from a fixed PRNG and compressed by the
+ * pinned reference, so every frame set is reproducible byte for byte and its
+ * digest is a constant. Asserting them is what makes this a rot check rather
+ * than a run: a compressor pin that moved, a granularity that changed, or a
+ * generator that lost its noise source all move a digest, and none of them
+ * would stop the corpus round-tripping.
+ *
+ * One digest per (granularity, level) cell, in the order the loop walks them.
+ * Measured on the run recorded in docs/BENCHMARKS.md; a cell that moves is
+ * either a pin that moved or a generator that changed, and both are the thing
+ * this is for. */
+constexpr uint64_t kSelfcheckDigests[2][3] = {
+    /* 64 KiB frames, levels 1 / 3 / 19 */
+    {0x24921f467ca2abc6ull, 0xf42c518918be1546ull, 0x525b593d46eb3753ull},
+    /* 512 KiB frames, levels 1 / 3 / 19 */
+    {0xd3ed77175094c5d4ull, 0xf7667d9a0a862a2cull, 0x9f5f7a972eb54828ull},
+};
+
+/* The grid and the pin table are indexed by the same two loop variables, so a
+ * granularity or a level added to one and not the other reads off the end of
+ * this array. Refused at compile time rather than left to the run, because the
+ * read would be in the selfcheck - the one place a wrong answer looks like a
+ * verdict. */
+static_assert(sizeof(kSelfcheckDigests) / sizeof(kSelfcheckDigests[0]) ==
+                  sizeof(kFrameSizes) / sizeof(kFrameSizes[0]),
+              "one digest row per frame granularity");
+static_assert(sizeof(kSelfcheckDigests[0]) / sizeof(kSelfcheckDigests[0][0]) ==
+                  sizeof(kLevels) / sizeof(kLevels[0]),
+              "one digest column per compression level");
+
+bool CheckDigest(uint64_t actual, size_t frame_bytes, int level,
+                 uint64_t expected) {
+    if (actual == expected) {
+        return true;
+    }
+    std::fprintf(stderr,
+                 "the selfcheck corpus digest moved at %zu KiB frames, level "
+                 "%d: expected %016llx, built %016llx - the corpus this "
+                 "harness constructs is not the one its numbers were recorded "
+                 "on\n",
+                 frame_bytes / 1024, level,
+                 static_cast<unsigned long long>(expected),
+                 static_cast<unsigned long long>(actual));
+    return false;
+}
+
+/* Reports the digest of the corpus it built through `digest_out` rather than
+ * judging it here, so the caller can walk every cell of the grid and name all
+ * of the ones that moved. Stopping at the first would report one drifted cell
+ * and leave the rest unexamined, which reads as "only that one moved". */
+bool RunStandardCorpus(const std::vector<unsigned char>& source,
+                       const std::string& name, size_t frame_bytes, int level,
+                       size_t warmup, size_t runs, uint64_t* digest_out) {
+    ZstdCorpus corpus;
+    corpus.name = name;
+    corpus.provenance =
+        "cut into independent frames and compressed by the pinned libzstd "
+        "through the corpus generator in tests/zstd_corpus.h; every frame "
+        "decoded back by the reference and the concatenation compared "
+        "against the source before timing";
+    if (!BuildStandardCorpus(source, frame_bytes, level, &corpus)) {
+        return false;
+    }
+    if (!StandardCorpusReconstructs(source, corpus)) {
+        return false;
+    }
+
+    std::vector<std::vector<unsigned char>> buffers =
+        MakeStandardBuffers(corpus);
+    for (size_t i = 0; i < warmup; i++) {
+        if (DecodeStandardSeconds(corpus, &buffers) < 0) {
+            std::fprintf(stderr, "a warmup decode failed\n");
+            return false;
+        }
+    }
+    std::vector<double> times;
+    for (size_t i = 0; i < runs; i++) {
+        const double seconds = DecodeStandardSeconds(corpus, &buffers);
+        if (seconds < 0) {
+            std::fprintf(stderr, "a measured decode failed\n");
+            return false;
+        }
+        times.push_back(seconds);
+    }
+    std::sort(times.begin(), times.end());
+    PrintStandardReport(corpus, frame_bytes, level, times, warmup, runs);
+    std::printf("\n");
+    *digest_out = CorpusDigest(corpus);
+    return true;
+}
+
+/* The forced-mode corpora, run as COVERAGE rather than as a number. Each
+ * fixture exists to reach one decode surface - a literals class, a table mode,
+ * an envelope shape - and they are tiny and wildly unequal in size, so a
+ * throughput figure over them measures the fixture list and nothing else. What
+ * this reports is which surfaces were reached and that the reference decodes
+ * every one of them, and it says so in the same breath so no reader lifts a
+ * number out of it.
+ *
+ * The generator is consumed, never duplicated: these are the same fixtures
+ * tests/zstd_corpus_selfproof.cpp pins. */
+bool RunForcedModeCoverage() {
+    const std::vector<ZstdFixture> fixtures = MakeZstdFixtures();
+    if (fixtures.empty()) {
+        std::fprintf(stderr, "the forced-mode corpus generator produced "
+                             "nothing\n");
+        return false;
+    }
+    size_t original_bytes = 0;
+    size_t compressed_bytes = 0;
+    std::vector<std::string> families;
+    for (const ZstdFixture& fixture : fixtures) {
+        std::vector<unsigned char> decoded;
+        if (!ZstdOracleDecodes(fixture.compressed, &decoded) ||
+            decoded != fixture.original) {
+            std::fprintf(stderr,
+                         "forced-mode fixture %s does not round-trip through "
+                         "the reference\n",
+                         fixture.name.c_str());
+            return false;
+        }
+        std::string why;
+        ZstdFrameShape shape;
+        if (!ParseZstdFrameShape(fixture.compressed, &shape, &why) ||
+            !ZstdShapeSatisfies(shape, fixture.demand, &why)) {
+            std::fprintf(stderr,
+                         "forced-mode fixture %s did not get the shape it "
+                         "asked for: %s\n",
+                         fixture.name.c_str(), why.c_str());
+            return false;
+        }
+        original_bytes += fixture.original.size();
+        compressed_bytes += fixture.compressed.size();
+        if (std::find(families.begin(), families.end(), fixture.family) ==
+            families.end()) {
+            families.push_back(fixture.family);
+        }
+    }
+    std::printf("## bench_zstd coverage run\n");
+    std::printf("- forced-mode corpus: %zu fixtures over %zu families, %.3f "
+                "MB original, %.3f MB compressed (ratio %.4f)\n",
+                fixtures.size(), families.size(),
+                static_cast<double>(original_bytes) / 1e6,
+                static_cast<double>(compressed_bytes) / 1e6,
+                static_cast<double>(compressed_bytes) /
+                    static_cast<double>(original_bytes));
+    std::printf("- families:");
+    for (size_t i = 0; i < families.size(); i++) {
+        std::printf("%s %s", i == 0 ? "" : ",", families[i].c_str());
+    }
+    std::printf("\n");
+    std::printf("- NOT A THROUGHPUT MEASUREMENT: these fixtures are sized to "
+                "reach a decode surface each, not to be timed. Every one was "
+                "decoded by the reference and checked against the shape it "
+                "was built to demand; no number here is a denominator\n\n");
+    return true;
+}
+
+bool ParseCount(const char* text, size_t low, size_t high, size_t* out) {
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || value < low || value > high) {
+        return false;
+    }
+    *out = static_cast<size_t>(value);
+    return true;
+}
+
+void Usage(const char* argv0) {
+    std::fprintf(stderr,
+                 "usage: %s [--runs N] [--warmup N] [--worst] [--coverage] "
+                 "[--selfcheck] [corpus files...]\n"
+                 "  no flag and files given: the standard corpus path over "
+                 "the recorded granularity and level set\n",
+                 argv0);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     bool worst = false;
+    bool coverage = false;
     bool selfcheck = false;
     size_t warmup = 3;
     size_t runs = 30;
+    std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--worst") {
             worst = true;
+        } else if (arg == "--coverage") {
+            coverage = true;
         } else if (arg == "--selfcheck") {
             selfcheck = true;
+        } else if (arg == "--runs" && i + 1 < argc) {
+            if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
+                std::fprintf(stderr, "--runs must be in [1, %zu]\n", kMaxRuns);
+                return 2;
+            }
+        } else if (arg == "--warmup" && i + 1 < argc) {
+            if (!ParseCount(argv[++i], 0, kMaxRuns, &warmup)) {
+                std::fprintf(stderr, "--warmup must be in [0, %zu]\n",
+                             kMaxRuns);
+                return 2;
+            }
+        } else if (arg == "--runs" || arg == "--warmup") {
+            std::fprintf(stderr, "%s needs a value\n", arg.c_str());
+            return 2;
+        } else if (!arg.empty() && arg[0] == '-') {
+            Usage(argv[0]);
+            return 2;
         } else {
-            std::fprintf(stderr, "usage: %s --worst [--selfcheck]\n", argv[0]);
-            return 1;
+            files.push_back(arg);
         }
     }
-    if (!worst) {
-        std::fprintf(stderr, "usage: %s --worst [--selfcheck]\n", argv[0]);
-        return 1;
+    if (worst && coverage) {
+        std::fprintf(stderr, "--worst and --coverage are separate runs\n");
+        return 2;
     }
+
+    if (coverage) {
+        if (!files.empty()) {
+            std::fprintf(stderr, "--coverage builds its own fixtures and takes "
+                                 "no files\n");
+            return 2;
+        }
+        if (!RunForcedModeCoverage()) {
+            return 1;
+        }
+        if (selfcheck) {
+            std::printf("PASS: selfcheck complete\n");
+        }
+        return 0;
+    }
+
+    if (!worst) {
+        /* The standard path. The recorded run walks both granularity
+         * endpoints across the whole level set; the selfcheck walks the same
+         * grid over a generated source, so the construction under test is the
+         * one the recorded numbers came from rather than a reduced stand-in. */
+        if (files.empty() && !selfcheck) {
+            std::fprintf(stderr,
+                         "bench_zstd needs corpus files (the recorded run "
+                         "uses bench/corpora/silesia/*); --selfcheck runs it "
+                         "on a generated source instead\n");
+            return 2;
+        }
+        std::vector<unsigned char> source;
+        std::string name;
+        if (selfcheck) {
+            warmup = 0;
+            runs = 1;
+            source = MakeSelfcheckSource(kSelfcheckBytes);
+            name = "generated (selfcheck)";
+        } else {
+            for (const std::string& path : files) {
+                if (!AppendFile(path, &source)) {
+                    return 1;
+                }
+                const size_t slash = path.find_last_of("/\\");
+                name += (name.empty() ? "" : "+") +
+                        path.substr(slash == std::string::npos ? 0
+                                                               : slash + 1);
+            }
+        }
+        bool digests_hold = true;
+        for (size_t f = 0; f < sizeof(kFrameSizes) / sizeof(kFrameSizes[0]);
+             f++) {
+            for (size_t l = 0; l < sizeof(kLevels) / sizeof(kLevels[0]); l++) {
+                uint64_t digest = 0;
+                if (!RunStandardCorpus(source, name, kFrameSizes[f], kLevels[l],
+                                       warmup, runs, &digest)) {
+                    return 1;
+                }
+                if (selfcheck && !CheckDigest(digest, kFrameSizes[f],
+                                              kLevels[l],
+                                              kSelfcheckDigests[f][l])) {
+                    digests_hold = false;
+                }
+            }
+        }
+        if (!digests_hold) {
+            return 1;
+        }
+        if (selfcheck) {
+            std::printf("PASS: selfcheck complete\n");
+        }
+        return 0;
+    }
+
     if (selfcheck) {
         warmup = 0;
         runs = 1;
+    }
+    if (!files.empty()) {
+        std::fprintf(stderr,
+                     "--worst builds its own corpus and takes no files\n");
+        return 2;
     }
 
     ZstdCorpus corpus;

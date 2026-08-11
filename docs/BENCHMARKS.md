@@ -1005,6 +1005,169 @@ same host with the timed region held to the decode call alone, so the
 comparison is between the two references and says nothing about either GPU
 path.
 
+## M5: the Zstd CPU denominator (issue #227)
+
+There is no Zstd kernel yet. This entry is the denominator a later device
+number will be read against, and the harness says so in its own report rather
+than leaving a reader to infer it from the absence of a GPU row.
+
+Six cells, because the M5 batch model has two axes and a denominator taken at
+one point on them does not transfer to another. The frame granularity is the
+range that model names, 64 KiB to 512 KiB with every frame independent, and
+both endpoints are recorded. The level set is fast, default and the high-search
+family: level 19 is not optional here, because it is where the reference's own
+search changes shape.
+
+Every cell is cut from the same Silesia bytes by the pinned libzstd 1.5.7
+through the corpus generator in `tests/zstd_corpus.h`, which the harness
+consumes rather than duplicating. Before anything is timed, every frame is
+decoded back by the reference and the concatenation of the decoded frames is
+compared against the source, so a frame set that dropped, reordered or
+truncated part of the corpus fails instead of reporting a plausible ratio over
+different bytes.
+
+Each report carries a digest of the corpus that was actually built, folded over
+the produced frames rather than over the inputs (the inputs are already pinned
+by the manifest `bench/get-corpora.sh` writes). It is order-sensitive, so the
+digests below belong to the file order listed in the corpus line. Recorded
+2026-08-11 inside the digest-pinned `nvidia/cuda:12.6.2-devel-ubuntu24.04`
+container, on the host CPU named in the blocks. Reproduce with
+`bench_zstd --warmup 3 --runs 30 bench/corpora/silesia/*`.
+
+| granularity | level | compressed | ratio  | p50 decode | corpus digest      |
+| ----------- | ----- | ---------- | ------ | ---------- | ------------------ |
+| 64 KiB      | 1     | 76.70 MB   | 0.3619 | 1.281 GB/s | `f95ac5fe65483030` |
+| 64 KiB      | 3     | 73.52 MB   | 0.3469 | 1.301 GB/s | `c7171e665a1888c6` |
+| 64 KiB      | 19    | 65.04 MB   | 0.3069 | 1.086 GB/s | `748220fb33f7ee01` |
+| 512 KiB     | 1     | 73.95 MB   | 0.3489 | 1.510 GB/s | `ed6b1bc51f66d81f` |
+| 512 KiB     | 3     | 68.23 MB   | 0.3219 | 1.404 GB/s | `4983cbc86cd8255b` |
+| 512 KiB     | 19    | 58.65 MB   | 0.2767 | 1.262 GB/s | `4242734974b3b0d5` |
+
+The table is a reading aid. The six blocks below are the record, and each one
+carries the methodology its own numbers were taken under.
+
+```
+## bench_zstd report
+- decoder: CPU oracle, ZSTD_decompress (libzstd 1.5.7), single thread. cudec has no Zstd kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 frames, 211.94 MB original, 76.70 MB compressed (ratio 0.3619), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before timing
+- granularity: 64 KiB frames, compression level 1
+- corpus digest: f95ac5fe65483030 (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- frame sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is ZSTD_decompress only (destinations allocated outside it); every frame round-trip-verified and the concatenation compared against the source once before timing; percentiles are nearest-rank
+- wall per run: p50 165.439 ms / p90 175.127 ms / p99 187.601 ms
+- decode throughput: p50 1.281 GB/s / p90 1.210 GB/s / p99 1.130 GB/s
+```
+
+```
+## bench_zstd report
+- decoder: CPU oracle, ZSTD_decompress (libzstd 1.5.7), single thread. cudec has no Zstd kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 frames, 211.94 MB original, 73.52 MB compressed (ratio 0.3469), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before timing
+- granularity: 64 KiB frames, compression level 3
+- corpus digest: c7171e665a1888c6 (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- frame sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is ZSTD_decompress only (destinations allocated outside it); every frame round-trip-verified and the concatenation compared against the source once before timing; percentiles are nearest-rank
+- wall per run: p50 162.906 ms / p90 180.539 ms / p99 184.608 ms
+- decode throughput: p50 1.301 GB/s / p90 1.174 GB/s / p99 1.148 GB/s
+```
+
+```
+## bench_zstd report
+- decoder: CPU oracle, ZSTD_decompress (libzstd 1.5.7), single thread. cudec has no Zstd kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 frames, 211.94 MB original, 65.04 MB compressed (ratio 0.3069), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before timing
+- granularity: 64 KiB frames, compression level 19
+- corpus digest: 748220fb33f7ee01 (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- frame sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is ZSTD_decompress only (destinations allocated outside it); every frame round-trip-verified and the concatenation compared against the source once before timing; percentiles are nearest-rank
+- wall per run: p50 195.213 ms / p90 199.905 ms / p99 204.529 ms
+- decode throughput: p50 1.086 GB/s / p90 1.060 GB/s / p99 1.036 GB/s
+```
+
+```
+## bench_zstd report
+- decoder: CPU oracle, ZSTD_decompress (libzstd 1.5.7), single thread. cudec has no Zstd kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 405 frames, 211.94 MB original, 73.95 MB compressed (ratio 0.3489), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before timing
+- granularity: 512 KiB frames, compression level 1
+- corpus digest: ed6b1bc51f66d81f (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- frame sizes: min 126228 / median 524288 / max 524288 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is ZSTD_decompress only (destinations allocated outside it); every frame round-trip-verified and the concatenation compared against the source once before timing; percentiles are nearest-rank
+- wall per run: p50 140.329 ms / p90 145.805 ms / p99 161.570 ms
+- decode throughput: p50 1.510 GB/s / p90 1.454 GB/s / p99 1.312 GB/s
+```
+
+```
+## bench_zstd report
+- decoder: CPU oracle, ZSTD_decompress (libzstd 1.5.7), single thread. cudec has no Zstd kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 405 frames, 211.94 MB original, 68.23 MB compressed (ratio 0.3219), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before timing
+- granularity: 512 KiB frames, compression level 3
+- corpus digest: 4983cbc86cd8255b (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- frame sizes: min 126228 / median 524288 / max 524288 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is ZSTD_decompress only (destinations allocated outside it); every frame round-trip-verified and the concatenation compared against the source once before timing; percentiles are nearest-rank
+- wall per run: p50 150.955 ms / p90 159.339 ms / p99 167.337 ms
+- decode throughput: p50 1.404 GB/s / p90 1.330 GB/s / p99 1.267 GB/s
+```
+
+```
+## bench_zstd report
+- decoder: CPU oracle, ZSTD_decompress (libzstd 1.5.7), single thread. cudec has no Zstd kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 405 frames, 211.94 MB original, 58.65 MB compressed (ratio 0.2767), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before timing
+- granularity: 512 KiB frames, compression level 19
+- corpus digest: 4242734974b3b0d5 (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- frame sizes: min 126228 / median 524288 / max 524288 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is ZSTD_decompress only (destinations allocated outside it); every frame round-trip-verified and the concatenation compared against the source once before timing; percentiles are nearest-rank
+- wall per run: p50 167.914 ms / p90 174.506 ms / p99 181.758 ms
+- decode throughput: p50 1.262 GB/s / p90 1.215 GB/s / p99 1.166 GB/s
+```
+
+**Cutting the corpus to 64 KiB frames costs the reference decoder 8 to 14
+percent, and that is the opposite of what the Snappy entry above found.** At
+level 1 the same bytes decode at 1.510 GB/s in 512 KiB frames and 1.281 GB/s in
+64 KiB ones; at level 3, 1.404 against 1.301; at level 19, 1.262 against 1.086.
+Each gap is several times the p50-to-p99 spread of either row, where the Snappy
+whole-versus-chunked pair differed by 0.18% and sat inside it. Zstd carries a
+frame envelope and per-block entropy tables that Snappy has no equivalent of,
+and cutting the corpus eight times finer pays for them eight times as often;
+this measurement does not separate those two costs from each other, and no
+claim is made here about which dominates.
+
+What that means for later device numbers is a rule rather than an observation:
+**a GPU figure must be quoted against the denominator at its own granularity.**
+Reading a 64 KiB batch decode against the 512 KiB CPU row would credit the
+device with a difference that is the corpus shape.
+
+**Level 19 is the slowest cell at both granularities while compressing the
+best.** 1.086 GB/s against 1.281 at 64 KiB, 1.262 against 1.510 at 512 KiB,
+with the ratio moving 0.3619 to 0.3069 and 0.3489 to 0.2767. The ratio and the
+decode cost move in opposite directions across the level set, so the
+high-search family is where a device decoder has both the most to gain and the
+most work per output byte. Why decode slows is not measured here; the per-phase
+entropy-versus-execution split that would answer it is a separate entry.
+
+**As a sanity check only**, the whole range 1.086 to 1.510 GB/s brackets the
+order of magnitude zstd's own README suggests for single-thread decode. That
+figure is not quoted as a number and nothing above is derived from it; these
+rows were measured locally and stand on their own.
+
+**Against the other two references on the same bytes and the same host**, at 64
+KiB frames: liblz4 3.410 GB/s at ratio 0.483, snappy 1.197 GB/s at 0.478, and
+libzstd 1.281 GB/s at 0.3619. Zstd is the only one of the three that is both
+faster than snappy and substantially smaller. All three are single-thread wall
+clock with the timed region held to the decode call alone, so this compares the
+three references and says nothing about any GPU path.
+
+**The forced-mode corpus is run as coverage and carries no number.** Nineteen
+fixtures over five families (envelope, block, literals, tables, level) are
+decoded by the reference and checked against the shape each was built to
+demand, on every run of `bench_zstd --coverage`. They are sized to reach one
+decode surface each, so a throughput figure over them would measure the fixture
+list; the harness prints that in place of a number rather than leaving it to be
+inferred.
+
 ## Community AMD results
 
 **No community results yet.** Nothing in this section is a measurement; it
