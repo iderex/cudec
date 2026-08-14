@@ -810,9 +810,8 @@ none of them is a call that needs the release gate.
 
 What GDeflate is, sourced, so that the kernel design panel and the
 table/parse core work from one record instead of each re-reading a draft.
-This section states facts and provenance only. It takes no design decision,
-and it does not settle the legal posture, which is its own maintainer-gated
-issue.
+Facts and provenance only. No design decision is taken below, and the legal
+posture is settled in its own maintainer-gated issue.
 
 ### 11.1 Provenance: three artifacts, no single specification
 

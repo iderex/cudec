@@ -129,19 +129,19 @@ is covered in [The design rationale](#the-design-rationale-single-pass).
 The worst case matters because it is the security-posture number: it is what
 an attacker who fully controls a valid input can force. The honest findings:
 
-- **The degradation is uniform and bounded, ~2.2–2.3× across every path** -
-  CPU, GPU decode, and GPU parse-only all slow by the same factor. That factor
-  is the sequence density (one sequence per 4 decoded bytes here, versus
-  Silesia's longer average matches): the cost is linear in the number of
-  sequences, exactly the redundant parse the design accepts. There is no
-  super-linear blow-up, and this is below the ~4× the issue pessimistically
-  estimated.
+- The degradation is uniform and bounded at roughly 2.2–2.3× across every
+  path. CPU, GPU decode, and GPU parse-only all slow by the same factor. That
+  factor is the sequence density, one sequence per 4 decoded bytes here
+  against Silesia's longer average matches: the cost is linear in the number
+  of sequences, which is the redundant parse the design accepts. There is no
+  super-linear blow-up, and the measured factor is below the ~4× the issue
+  pessimistically estimated.
 - **No size amplification.** The block barely compresses (ratio 0.750,
   ~1.33× expansion) and each chunk decodes to exactly 65536 bytes, capped by
-  the caller's destination capacity. The throughput worst case and a
-  decompression bomb are mutually exclusive for LZ4 - a bomb is one long
-  match (a single fast sequence), the opposite shape - and cudec's fixed
-  per-chunk output cap fail-closes the size axis regardless.
+  the caller's destination capacity. For LZ4 the throughput worst case and a
+  decompression bomb are mutually exclusive, because a bomb is one long match
+  and therefore a single fast sequence, which is the opposite shape. cudec's
+  fixed per-chunk output cap fail-closes the size axis regardless.
 - **The GPU advantage holds under the worst input:** 8.1 GB/s worst-case GPU
   is still ~5.4× the CPU worst case and ~2.3× the CPU's Silesia _average_.
 

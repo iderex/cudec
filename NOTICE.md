@@ -13,9 +13,8 @@ cudec distributes none of the sources below. They are fetched at configure
 time by the test build, the way the LZ4, Snappy and Zstd references already
 are, and the no-vendored-binaries rule keeps them out of this tree. Neither
 upstream ships a NOTICE file, so Apache-2.0 section 4(d) has nothing to
-propagate here; this section exists because recording where the verification
-apparatus came from is worth doing on its own terms, and it is what
-`docs/MASTERPLAN.md` section 11.9 decided to carry.
+propagate here. The provenance below is recorded anyway, and
+`docs/MASTERPLAN.md` section 11.9 is where that was decided.
 
 **The NVIDIA fork of libdeflate, branch `gdeflate`**, pinned at commit
 `8ba9502fb30d2bf728592d121f0d402e40c8cb05`. It is the reference GDeflate
