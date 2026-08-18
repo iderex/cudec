@@ -17,5 +17,5 @@ not incidental:
 
 Please report vulnerabilities (e.g. a crafted bitstream causing memory
 corruption) privately via
-[GitHub private vulnerability reporting](../../security/advisories/new)
+[GitHub private vulnerability reporting](https://github.com/iderex/cudec/security/advisories/new)
 rather than a public issue. Reports are usually answered within a week.
