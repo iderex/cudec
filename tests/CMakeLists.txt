@@ -261,6 +261,15 @@ cudec_add_test(oracle_gdeflate SOURCES oracle_gdeflate.cpp LIBS
 # device.
 cudec_add_test(gdeflate_probes SOURCES gdeflate_probes.cpp LIBS
                gdeflate_oracle)
+# The GDeflate round/refill schedule (issue #178), the first rung of the M4
+# substream machine. GPU-less because the schedule is pure arithmetic over a
+# byte range and the CPU twin is the only place it is testable before a kernel
+# exists; it links gdeflate_oracle alone for the reason oracle_gdeflate gives
+# above, and it reaches src/ for the header under test.
+cudec_add_test(gdeflate_schedule_twin SOURCES gdeflate_schedule_twin.cpp LIBS
+               gdeflate_oracle)
+target_include_directories(gdeflate_schedule_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.
