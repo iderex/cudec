@@ -36,7 +36,10 @@
 #include "cudec.h"
 #include "zstd_frame.h"
 
-#define ZSTD_STATIC_LINKING_ONLY
+/* ZSTD_STATIC_LINKING_ONLY is defined by the build rather than here, which is
+ * how tests/zstd_frame_twin.cpp reaches the same symbol. Defining it in both
+ * places is a redefinition the strict-warning build refuses, and it refused
+ * this file on its first CI run. */
 #include <zstd.h>
 #include <zstd_errors.h>
 
