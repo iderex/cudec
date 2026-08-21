@@ -371,6 +371,7 @@ jobs:
           grep -E ': bench_worst4b_selfcheck$' host-selected.txt &&
           grep -E ': oracle_gdeflate$' host-selected.txt &&
           grep -E ': gdeflate_probes$' host-selected.txt &&
+          grep -E ': gdeflate_schedule_twin$' host-selected.txt &&
           echo "Deferred to the local GPU gate:" &&
           ctest --test-dir build-cuda -L gpu -N | tee gpu-deferred.txt &&
           grep -E ': smoke$' gpu-deferred.txt &&
@@ -435,6 +436,7 @@ jobs:
           test -x build-san/tests/snappy_parser_twin &&
           test -x build-san/tests/frame_host_negative &&
           test -x build-san/tests/tilestream_host_negative &&
+          test -x build-san/tests/gdeflate_schedule_twin &&
           test -x build-san/tests/termination
 
       # Prove the sanitizer runtimes are actually linked: a dropped or renamed
@@ -456,7 +458,7 @@ jobs:
       - name: Run the untrusted-input decode path under ASan+UBSan
         run: >-
           ctest --test-dir build-san --no-tests=error --output-on-failure -R
-          '^(conformance_c|oracle_lz4|parser_twin|snappy_parser_twin|snappy_edge_sweep|snappy_upstream_negatives|frame_host_negative|tilestream_host_negative|zstd_frame_twin|termination)$'
+          '^(conformance_c|oracle_lz4|parser_twin|snappy_parser_twin|snappy_edge_sweep|snappy_upstream_negatives|frame_host_negative|tilestream_host_negative|gdeflate_schedule_twin|zstd_frame_twin|termination)$'
           &&
           ctest --test-dir build-san -N | tee san-selected.txt &&
           grep -E ': conformance_c$' san-selected.txt &&
@@ -467,6 +469,7 @@ jobs:
           grep -E ': snappy_upstream_negatives$' san-selected.txt &&
           grep -E ': frame_host_negative$' san-selected.txt &&
           grep -E ': tilestream_host_negative$' san-selected.txt &&
+          grep -E ': gdeflate_schedule_twin$' san-selected.txt &&
           grep -E ': zstd_frame_twin$' san-selected.txt &&
           grep -E ': termination$' san-selected.txt
 
