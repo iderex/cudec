@@ -42,6 +42,7 @@
 namespace {
 
 using cudec_detail::kTileStreamHeaderBytes;
+using cudec_detail::kTileStreamMaxTiles;
 using cudec_detail::kTileStreamTileSize;
 using cudec_detail::TileStreamInfo;
 using cudec_detail::TileStreamParse;
@@ -219,6 +220,35 @@ int main() {
         slack.push_back(0x00);
         REQUIRE(Parse(slack, &info, &tiles) == CUDEC_OK);
         REQUIRE(TilesAreInBounds(tiles, info.tile_count, slack.size()));
+    }
+    {
+        /* The largest envelope the fields can describe, which is where the
+         * total-output arithmetic is closest to the edge the header argues it
+         * stays inside: every tile full, at the tile count's own ceiling. The
+         * number is written out rather than recomputed from the same
+         * expression the parser uses, because a test that restates the
+         * derivation agrees with it however wrong both are.
+         *
+         * Pinned here rather than reached by fuzzing (issue #184). A table
+         * this size is a quarter of a megabyte of table alone, so no fuzz
+         * input under any workable length bound carries a tile count near the
+         * ceiling; building the stream is the only route to this branch. */
+        const uint64_t ceiling = 4294901760u;
+        Bytes full = MakeEnvelope(std::vector<uint32_t>(static_cast<size_t>(kTileStreamMaxTiles), 1),
+                                  0);
+        REQUIRE(Parse(full, &info, &tiles) == CUDEC_OK);
+        REQUIRE(info.tile_count == kTileStreamMaxTiles);
+        REQUIRE(info.total_uncompressed == ceiling);
+        REQUIRE(info.total_uncompressed < UINT32_MAX);
+        REQUIRE(TilesAreInBounds(tiles, info.tile_count, full.size()));
+
+        /* And one byte short of full on the last tile, the other end of the
+         * same arithmetic: the subtraction that shortens the total must take
+         * exactly the shortfall and not a tile. */
+        Bytes almost = MakeEnvelope(
+            std::vector<uint32_t>(static_cast<size_t>(kTileStreamMaxTiles), 1), 65535);
+        REQUIRE(Parse(almost, &info, &tiles) == CUDEC_OK);
+        REQUIRE(info.total_uncompressed == ceiling - 1);
     }
 
     /* ---- The caller's own mistakes: INVALID_ARGUMENT, not CORRUPT_INPUT.
