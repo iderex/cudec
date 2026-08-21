@@ -11,6 +11,7 @@
 
 include(${PROJECT_SOURCE_DIR}/cmake/CudecLz4Oracle.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/CudecSnappyOracle.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/CudecZstdOracle.cmake)
 
 function(cudec_add_fuzz_target name)
   cmake_parse_arguments(F "" "" "SOURCES;LIBS" ${ARGN})
@@ -73,3 +74,18 @@ cudec_add_fuzz_target(fuzz_gdeflate_tilestream_selftest SOURCES
                       fuzz_gdeflate_tilestream.cpp)
 target_compile_definitions(fuzz_gdeflate_tilestream_selftest
                            PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
+
+# The Zstd frame and block header walk (issue #180), the one Zstd surface raw
+# fuzzer bytes reach without a structure-aware layer. It links zstd_oracle -
+# the decode-only translation units - because nothing here produces a frame;
+# the seed corpus is committed bytes. ZSTD_STATIC_LINKING_ONLY is for
+# ZSTD_getFrameHeader, which lives in libzstd's static API, the same reason
+# tests/zstd_frame_twin.cpp defines it.
+cudec_add_fuzz_target(fuzz_zstd_frame SOURCES fuzz_zstd_frame.cpp LIBS
+                      zstd_oracle)
+target_compile_definitions(fuzz_zstd_frame PRIVATE ZSTD_STATIC_LINKING_ONLY)
+cudec_add_fuzz_target(fuzz_zstd_frame_selftest SOURCES fuzz_zstd_frame.cpp
+                      LIBS zstd_oracle)
+target_compile_definitions(
+  fuzz_zstd_frame_selftest PRIVATE ZSTD_STATIC_LINKING_ONLY
+                                   CUDEC_FUZZ_SELFTEST_BREAK)
