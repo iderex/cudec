@@ -75,15 +75,24 @@ constexpr uint32_t kGDeflateNumStreams = 32;
 constexpr uint32_t kGDeflateBitsPerPacket = 32;
 constexpr uint32_t kGDeflateLowWatermarkBits = 32;
 
-/* The bit buffer is 64-bit and a refill only fires below the watermark, so a
- * lane holds at most (watermark - 1) + packet bits at any instant. This is the
- * bound the shift in the refill is safe under: shifting a 32-bit packet left
- * by up to 31 places touches bit 62 at the highest. */
+/* The width of one lane's bit buffer, named rather than left as the width of
+ * whatever type the struct below happens to use: every shift in this header is
+ * safe because of this number, so it is the thing the assertions compare
+ * against. */
+constexpr uint32_t kGDeflateLaneBufferBits = 64;
+
+/* A refill only fires below the watermark, so a lane holds at most
+ * (watermark - 1) + packet bits at any instant. That is the bound the shift in
+ * the refill is safe under: shifting one packet left by up to a watermark less
+ * one place stays inside the buffer. */
 constexpr uint32_t kGDeflateMaxLaneBits =
     kGDeflateLowWatermarkBits - 1 + kGDeflateBitsPerPacket;
-static_assert(kGDeflateMaxLaneBits < 64,
-              "the lane bit buffer is 64-bit; a refill at the watermark must "
-              "not shift a packet off the top of it");
+static_assert(kGDeflateMaxLaneBits < kGDeflateLaneBufferBits,
+              "a refill at the watermark must not shift a packet off the top "
+              "of the lane bit buffer");
+static_assert(sizeof(uint64_t) * 8 == kGDeflateLaneBufferBits,
+              "the lane bit buffer type must be as wide as the constant the "
+              "shift bounds are argued against");
 
 /* The widest single read the format asks for is the 16-bit stored-block LEN
  * (dossier 11.3). The ceiling here is not that number: it is the watermark,
