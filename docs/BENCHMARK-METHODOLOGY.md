@@ -339,3 +339,133 @@ corpora, and draw their own head-to-head conclusion under their own
 acceptance of the nvCOMP EULA. cudec ships the honest, published half - its
 own measured numbers and the CPU baseline - and the tooling to complete the
 picture privately.
+
+## The hipCOMP comparison (protocol defined, no result)
+
+The comparison the section above cannot publish has a sibling that it can.
+hipCOMP is AMD's port of nvCOMP, it is open source, and its LZ4 decompressor
+is warp-per-chunk like cudec's - so a run of both on one AMD device isolates
+the kernel family instead of the vendor. This section defines that run. It
+publishes no number, and there is none to publish: cudec has no HIP backend
+yet, and nobody here has an AMD GPU.
+
+The warp-per-chunk claim is read out of the source rather than carried over.
+`src/lowlevel/LZ4CompressionKernels.cu` launches its decode with a
+two-dimensional block whose first extent is one wavefront and whose second
+selects the chunk, over a grid of chunk pairs, and the kernel takes the
+wavefront width as a template parameter:
+
+```sh
+gh api repos/ROCm/hipCOMP-core/contents/src/lowlevel/LZ4CompressionKernels.cu \
+  --jq '.content' | base64 -d | sed -n '215,228p'
+```
+
+That is the same shape cudec's LZ4 decoder has and the same shape the HIP
+port is being cut to, which is why this comparison is worth the trouble: two
+implementations of one strategy on one device. Nothing here is read into
+cudec - the file is cited, never borrowed, per the legal guardrails in
+[MASTERPLAN](MASTERPLAN.md).
+
+### The licence, checked rather than assumed
+
+Read on 2026-08-21 from `ROCm/hipCOMP-core` at the head of its default branch
+`release/rocmds-26.03`:
+
+```sh
+gh api repos/ROCm/hipCOMP-core \
+  --jq '{license: .license.spdx_id, default_branch, archived}'
+{"archived":false,"default_branch":"release/rocmds-26.03","license":"MIT"}
+
+gh api repos/ROCm/hipCOMP-core/commits/release/rocmds-26.03 \
+  --jq '{sha, date: .commit.committer.date}'
+{"date":"2026-07-07T23:41:56Z","sha":"22cc762f54fba7cdfca74a4c50c00f2aac4ace7a"}
+```
+
+Two licences apply, not one, and the second is the one worth reading. The
+repository's own `LICENSE` is the MIT licence, copyright Advanced Micro
+Devices. `NOTICES.md` then names a long list of files - the public headers and
+much of `src/`, including the LZ4 and Snappy paths - as derived from NVIDIA
+nvCOMP `branch-2.2` and governed by that project's 3-Clause BSD licence, which
+the repository carries verbatim as `NVCOMP_2_2_LICENSE`.
+
+**Neither licence restricts publishing benchmark results.** MIT grants use
+without restriction subject only to the notice condition. BSD-3-Clause adds
+two redistribution conditions and one more term, and that third term is about
+endorsement rather than measurement: it forbids using NVIDIA's name or its
+contributors' names to endorse or promote products _derived from that
+software_. cudec is not derived from it - no line of nvCOMP or hipCOMP is read
+or copied here, which is the standing rule in
+[MASTERPLAN](MASTERPLAN.md) - so the term does not reach cudec, and it would
+not restrict a measurement even if it did. There is no clause anywhere in
+either file resembling §8.9 of the NVIDIA Software License Agreement.
+
+So the finding is: **publishing a cudec-vs-hipCOMP comparison is
+unencumbered**, and the reason is the licences, not the absence of a search
+for one. Anyone re-checking should re-run the two commands above rather than
+trust this paragraph: a licence is a fact about a repository at a commit, and
+the commit moves.
+
+### What must be said wherever a hipCOMP number appears
+
+hipCOMP says two things about itself that a fair comparison repeats. Its
+README leads with a caution that the release is an early-access software
+technology preview and that production workloads are not recommended, and its
+own algorithm table marks LZ4 and Snappy as supported and **not optimized**.
+A throughput table that omits either turns a preview into a straw man.
+
+That framing is a condition of publishing, not a caveat added afterwards: a
+faster number against an unoptimised preview is evidence about that preview
+and not about the two kernel families, and a comparison presented without it
+is arguing something it did not measure.
+
+### The protocol
+
+Written so a reporter with an AMD device can execute it from this section
+alone and produce two report blocks that are comparable. Nothing below has
+been run.
+
+1. **One device, one container, one session.** Both libraries are built and
+   run inside the same ROCm container image, pinned by `sha256` digest, on the
+   same GPU, in one sitting. Two runs on the same model of card on different
+   days are not a same-hardware comparison. The digest is deliberately **not**
+   written here, because no ROCm image is pinned in this repository yet - that
+   pin arrives with the HIP CI job and this section takes it from there rather
+   than inventing a second one.
+
+2. **The same corpora, hash-pinned.** `sh bench/get-corpora.sh`, which refuses
+   any file whose SHA-256 does not match its pin. Both sides read the same
+   files from the same directory. A corpus either side assembled for itself is
+   not the same corpus.
+
+3. **The same chunk-size distribution.** cudec decodes independent chunks and
+   so does hipCOMP; throughput depends on how the input was cut before either
+   library saw it. The reporter states the chunk size used and applies one
+   value to both sides in a run.
+
+4. **Device-resident decode, host transfers excluded, event timing.** The
+   region measured is the decode itself, with the compressed input already on
+   the device and the output staying there, timed with device events - the
+   same region and the same instrument as every number in this document.
+   Including a host copy on one side and not the other is the easiest way to
+   publish a wrong result honestly.
+
+5. **Three warmup runs and thirty measured runs**, per side, which is what
+   `--warmup 3 --runs 30` already does for `bench_lz4` and what the reporter
+   configures on the hipCOMP side to match.
+
+6. **Both report blocks pasted whole.** `bench_lz4` prints its own methodology
+   block with every run, so a pasted cudec block is self-describing; the
+   hipCOMP side is pasted with its build command, its ROCm version and its
+   `gfx` target beside it. An edited or summarised block is not a result. Any
+   number that reaches [BENCHMARKS.md](BENCHMARKS.md) arrives through the
+   recording format that document defines, with the early-access framing above
+   attached to it.
+
+### What this section deliberately does not do
+
+It states no result and implies none. It does not say which library is
+expected to be faster, on which architecture, or by how much - there is no
+cudec HIP backend to run and no AMD device here to run it on, so any such
+sentence would be a guess wearing the clothes of a measurement. The first
+comparison to fill this in will be somebody else's, run on their hardware,
+under the protocol above.
