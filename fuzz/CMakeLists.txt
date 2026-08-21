@@ -59,3 +59,17 @@ cudec_add_fuzz_target(fuzz_snappy_block_selftest SOURCES fuzz_snappy_block.cpp
                       LIBS snappy_oracle)
 target_compile_definitions(fuzz_snappy_block_selftest
                            PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
+
+# The GDeflate TileStream envelope walker (issue #184), and the first target
+# here with no reference behind it: the container has no oracle in this tree,
+# so the property is an invariant over what the walker ACCEPTS rather than a
+# comparison against another implementation. It links no oracle library for
+# that reason. The twin below breaks the same way its siblings do - it
+# perturbs an accepted result so the checks must fire - which is what keeps
+# "no oracle" from also meaning "nothing proves the checks run".
+cudec_add_fuzz_target(fuzz_gdeflate_tilestream SOURCES
+                      fuzz_gdeflate_tilestream.cpp)
+cudec_add_fuzz_target(fuzz_gdeflate_tilestream_selftest SOURCES
+                      fuzz_gdeflate_tilestream.cpp)
+target_compile_definitions(fuzz_gdeflate_tilestream_selftest
+                           PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
