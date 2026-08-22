@@ -1,0 +1,547 @@
+/* The Zstd literals section: the four block types, the size-format variants
+ * of its header, and the one- and four-stream Huffman decodes behind the two
+ * compressed ones. RFC 8878 section 3.1.1.3.1. Single-sourced for host and
+ * device, the sibling of src/zstd_huf.h and src/zstd_seq.h. Internal header,
+ * not part of the ABI.
+ *
+ * THE HEADER IS ONE LITTLE-ENDIAN NUMBER READ AT FOUR WIDTHS, and reading it
+ * as separate fields is where an implementation drifts. The type and the size
+ * format are the low four bits of the first byte, and Regenerated_Size starts
+ * at bit 4 of the same number - so the header is loaded as a 24-, 32- or
+ * 40-bit little-endian value and the two sizes are shifts out of it. The
+ * widths differ per size format and the type decides which table of widths
+ * applies, which is why the two type families are parsed separately here
+ * rather than through one shared shift.
+ *
+ * A SIZE FORMAT IS NOT A STREAM COUNT EXCEPT IN ONE PLACE. For Compressed and
+ * Treeless literals, Size_Format 00 is the only single-stream spelling and
+ * every other value means four streams. Size_Format 00 and 01 describe the
+ * same field widths and the same header length, and differ in nothing but
+ * that count: a decoder that folds them together decodes a four-stream
+ * section as one stream and produces plausible garbage for the first quarter
+ * of the literals.
+ *
+ * THE FOUR-STREAM SPLIT IS TWO INDEPENDENT DIVISIONS AND THEY DO NOT AGREE.
+ * The COMPRESSED sizes of streams 1 to 3 are declared by a six-byte jump
+ * table and the fourth stream's is whatever is left; the REGENERATED sizes
+ * are (Regenerated_Size + 3) / 4 for the first three with the remainder,
+ * which is the SHORT one, on the fourth. Nothing ties one division to the
+ * other, and the fourth stream is the short end of both - so a fixture whose
+ * Regenerated_Size is a multiple of four proves neither.
+ *
+ * WHAT A STREAM'S BITS ARE MEASURED AGAINST IS THE STREAM, NEVER THE SECTION.
+ * Each of the four decodes through its own backward reader over its own slice
+ * of the payload, so a stream that runs out of bits is refused where it ran
+ * out rather than walking into its neighbour's bytes and decoding symbols
+ * from them. That is the whole reason the jump table is validated before any
+ * reader is started: the sizes decide the slices.
+ *
+ * A HUFFMAN SYMBOL IS PEEKED AT THE TREE'S FULL DEPTH AND CONSUMED AT ITS OWN
+ * WIDTH, so the last symbol of a stream is routinely read from fewer bits
+ * than the peek asks for. The peek pads with zero below the end, which is
+ * what the reference's bit container does; the CONSUMPTION is what is bounded
+ * here, and a code wider than the bits remaining is the refusal. The
+ * reference reaches the same verdict one step later, by decoding into the
+ * zero padding and failing its end-of-stream check afterwards.
+ *
+ * THE TABLE OUTLIVES THE SECTION AND THAT IS THE POINT OF Treeless. A
+ * Compressed section carries a tree description and leaves its table behind;
+ * a Treeless section carries none and decodes through the one left by an
+ * earlier block. So the table is the caller's, carried across blocks by it,
+ * and `present` is a fact about whether a description was ever read rather
+ * than about the cell array existing - a Treeless section in the first block
+ * of a frame is refused over storage that is allocated and stale.
+ *
+ * The storage is the caller's throughout, sized by it and checked here, in
+ * the shape src/zstd_huf.h and src/zstd_seq.h use: this header allocates
+ * nothing and a device translation unit compiles it unchanged. */
+#ifndef CUDEC_ZSTD_LITERALS_H
+#define CUDEC_ZSTD_LITERALS_H
+
+#include "cudec.h"
+#include "zstd_bitstream.h"
+#include "zstd_frame.h"
+#include "zstd_huf.h"
+
+#include <stdint.h>
+
+/* Guarded: the sibling decode headers define the same macro for the same
+ * reason, and a device translation unit that decodes more than one format
+ * includes more than one of them. */
+#ifndef CUDEC_HOST_DEVICE
+#if defined(__CUDACC__)
+#define CUDEC_HOST_DEVICE __host__ __device__
+#else
+#define CUDEC_HOST_DEVICE
+#endif
+#endif
+
+namespace cudec_detail {
+
+/* Literals_Block_Type, RFC 8878 section 3.1.1.3.1.1. */
+constexpr unsigned kZstdLiteralsTypeRaw = 0;
+constexpr unsigned kZstdLiteralsTypeRle = 1;
+constexpr unsigned kZstdLiteralsTypeCompressed = 2;
+constexpr unsigned kZstdLiteralsTypeTreeless = 3;
+
+/* Section 4.2.1: a literals tree's depth may not exceed eleven. This is
+ * narrower than src/zstd_huf.h's own ceiling, which is the reference's
+ * twelve-bit read width; the format's limit is enforced here, at the unit
+ * that knows the tree is a LITERALS tree. */
+constexpr unsigned kZstdLiteralsMaxTableLog = 11;
+
+/* The four-stream shape's fixed costs and floors, all of them the
+ * reference's: the jump table is six bytes (three 16-bit sizes), a payload
+ * must additionally hold at least one byte per stream, and a section with
+ * fewer regenerated bytes than streams-plus-two cannot be split at all
+ * (MIN_LITERALS_FOR_4_STREAMS in the reference's zstd_internal.h). */
+constexpr unsigned kZstdLiteralsStreamCount = 4;
+constexpr uint64_t kZstdLiteralsJumpTableBytes = 6;
+constexpr uint64_t kZstdLiteralsMinFourStreamPayload =
+    kZstdLiteralsJumpTableBytes + kZstdLiteralsStreamCount;
+constexpr uint64_t kZstdLiteralsMinFourStreamRegenerated = 6;
+
+/* Section 3.1.1.2.4: Block_Maximum_Size is the smaller of Window_Size and
+ * 128 KB. The ceiling is src/zstd_frame.h's constant rather than a second
+ * one of the same value: a block header and a literals section are bounded
+ * by the same rule, and two spellings of it would drift apart in silence. */
+CUDEC_HOST_DEVICE inline uint64_t ZstdLiteralsBlockMaximum(
+    uint64_t window_size) {
+    return window_size < kZstdBlockSizeCeiling ? window_size
+                                               : kZstdBlockSizeCeiling;
+}
+
+/* The reject ladder, enumerated once, in the shape src/zstd_huf.h and
+ * src/zstd_seq.h use: every refusal returns through one choke point naming
+ * its rung, so the twin requires a negative per rung instead of counting
+ * statuses that repeat. The reference collapses most of these into
+ * corruption_detected, so the rung is this tree's own vocabulary. */
+enum ZstdLiteralsReject {
+    kZstdLiteralsRejectNone = 0,
+    /* An argument outside what the format can express, or storage the caller
+     * sized below what it asked to have decoded. A caller bug rather than a
+     * stream, refused rather than clamped. */
+    kZstdLiteralsRejectBadRequest,
+    /* The section ends before the size format's own header does. */
+    kZstdLiteralsRejectHeaderTruncated,
+    /* Regenerated_Size is above the block maximum this frame admits. */
+    kZstdLiteralsRejectRegeneratedTooLarge,
+    /* Regenerated_Size is above the destination the caller supplied. Not a
+     * malformed stream: it is the one rung on this ladder that the reference
+     * also keeps out of its corruption class. */
+    kZstdLiteralsRejectRegeneratedPastCapacity,
+    /* A Raw section's literals, or an RLE section's single byte, reach past
+     * the bytes supplied. */
+    kZstdLiteralsRejectContentTruncated,
+    /* Compressed_Size plus the header reaches past the bytes supplied. */
+    kZstdLiteralsRejectPayloadTruncated,
+    /* A Treeless section with no table left behind by an earlier block. */
+    kZstdLiteralsRejectNoPreviousTable,
+    /* The tree description this section carries was refused. The rung it was
+     * refused at is src/zstd_huf.h's and is reported through that unit. */
+    kZstdLiteralsRejectTreeDescription,
+    /* The tree description consumed the whole payload, leaving no stream. */
+    kZstdLiteralsRejectStreamsAbsent,
+    /* A four-stream payload below the jump table plus one byte per stream. */
+    kZstdLiteralsRejectFourStreamPayloadTooShort,
+    /* A four-stream section with too few literals to split four ways. */
+    kZstdLiteralsRejectFourStreamTooFewLiterals,
+    /* The three declared stream sizes leave the fourth stream nothing, or
+     * reach past the payload on their own. */
+    kZstdLiteralsRejectJumpTableOverruns,
+    /* A stream's code needs more bits than the stream has left, or the
+     * stream carries no start marker at all. */
+    kZstdLiteralsRejectStreamTruncated,
+    /* A stream had bits left after its last symbol: the declared regenerated
+     * size and the stream disagree, which is the fail-open the reference
+     * refuses with its own end-of-stream check. */
+    kZstdLiteralsRejectStreamNotConsumed,
+    kZstdLiteralsRejectCount
+};
+
+CUDEC_HOST_DEVICE inline cudec_status ZstdLiteralsRefuse(
+    ZstdLiteralsReject rung, cudec_status status, ZstdLiteralsReject* out) {
+    if (out != 0) {
+        *out = rung;
+    }
+    return status;
+}
+
+/* What a literals section header declared.
+ *
+ * `stream_count` and `compressed_size` are zero for Raw and RLE, which carry
+ * neither: a caller that reads them there has misread the type, and a zero
+ * that would be a legal count is safer to hand it than a stale one. */
+struct ZstdLiteralsHeader {
+    uint64_t regenerated_size;
+    uint64_t compressed_size;
+    uint64_t header_size;
+    unsigned block_type;
+    unsigned size_format;
+    unsigned stream_count;
+};
+
+/* The Huffman table a Compressed section leaves behind for a Treeless one.
+ *
+ * `present` is deliberately not the same question as `cells != 0`, for the
+ * reason ZstdSeqTable's field of the same name is not: a caller hands the
+ * same cell array to every block of a frame, and a Treeless section in the
+ * first block must be refused over an array that is allocated and stale. */
+struct ZstdLiteralsTable {
+    ZstdHufCell* cells;
+    uint32_t capacity;
+    unsigned table_log;
+    bool present;
+};
+
+/* The working memory a tree description needs, the caller's for the reason
+ * the Huffman and sequence units give: the kernel places it, and a header
+ * that allocated would decide that placement. */
+struct ZstdLiteralsScratch {
+    ZstdHufWeightScratch weights_scratch;
+    uint8_t weights[kZstdHufMaxSymbolValue + 1];
+};
+
+/* Reads a Literals_Section_Header.
+ *
+ * `size` is the bytes remaining in the block from the header's first byte.
+ * Only the header itself is bounded here; whether the CONTENT it declares is
+ * present is the decode's business, because Raw, RLE and the two compressed
+ * types measure their content differently. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdParseLiteralsHeader(
+    const unsigned char* src, uint64_t size, ZstdLiteralsHeader* out,
+    ZstdLiteralsReject* reject) {
+    if (reject != 0) {
+        *reject = kZstdLiteralsRejectNone;
+    }
+    if (src == 0 || out == 0) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectBadRequest,
+                                  CUDEC_ERR_INVALID_ARGUMENT, reject);
+    }
+    if (size == 0) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectHeaderTruncated,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    const unsigned block_type = src[0] & 0x03u;
+    const unsigned size_format = (src[0] >> 2) & 0x03u;
+
+    out->block_type = block_type;
+    out->size_format = size_format;
+    out->compressed_size = 0;
+    out->stream_count = 0;
+
+    if (block_type == kZstdLiteralsTypeRaw ||
+        block_type == kZstdLiteralsTypeRle) {
+        /* Section 3.1.1.3.1.1: for these two types Size_Format is one bit
+         * wide when its low bit is clear, so 00 and 10 are the same
+         * five-bit-size spelling. That is why the switch is on the low bit
+         * first and not on all four values. */
+        unsigned header_size = 1;
+        unsigned size_bits_shift = 3;
+        if (size_format == 1) {
+            header_size = 2;
+            size_bits_shift = 4;
+        } else if (size_format == 3) {
+            header_size = 3;
+            size_bits_shift = 4;
+        }
+        if (size < header_size) {
+            return ZstdLiteralsRefuse(kZstdLiteralsRejectHeaderTruncated,
+                                      CUDEC_ERR_CORRUPT_INPUT, reject);
+        }
+        out->regenerated_size =
+            ZstdReadLe(src, header_size) >> size_bits_shift;
+        out->header_size = header_size;
+        return CUDEC_OK;
+    }
+
+    /* Compressed and Treeless. Size_Format 00 is the only single-stream
+     * spelling; 00 and 01 are otherwise identical. */
+    unsigned header_size = 3;
+    unsigned field_bits = 10;
+    if (size_format == 2) {
+        header_size = 4;
+        field_bits = 14;
+    } else if (size_format == 3) {
+        header_size = 5;
+        field_bits = 18;
+    }
+    if (size < header_size) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectHeaderTruncated,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    const uint64_t raw = ZstdReadLe(src, header_size);
+    const uint64_t field_mask = (static_cast<uint64_t>(1) << field_bits) - 1;
+    out->regenerated_size = (raw >> 4) & field_mask;
+    out->compressed_size = (raw >> (4 + field_bits)) & field_mask;
+    out->header_size = header_size;
+    out->stream_count = size_format == 0 ? 1u : kZstdLiteralsStreamCount;
+    return CUDEC_OK;
+}
+
+/* The next `count` bits of a backward stream WITHOUT consuming them, padded
+ * with zero below the stream's end.
+ *
+ * The padding is the reference's behaviour and not a convenience: a Huffman
+ * peek is the tree's full depth, the last code of a stream is usually
+ * shorter than that, and a peek that refused there would refuse every legal
+ * stream. What is bounded is the CONSUMPTION, in the caller below. `count`
+ * is the tree depth, at most kZstdLiteralsMaxTableLog, so the shift cannot
+ * reach the accumulator's width. */
+CUDEC_HOST_DEVICE inline uint32_t ZstdLiteralsPeekBits(
+    const ZstdBitReader* reader, unsigned count) {
+    uint32_t accumulated = 0;
+    const uint64_t remaining = reader->BitsRemaining();
+    for (unsigned i = 0; i < count; i++) {
+        const unsigned bit =
+            i < remaining ? reader->BitAt(reader->bits_read + i) : 0u;
+        accumulated = (accumulated << 1) | bit;
+    }
+    return accumulated;
+}
+
+/* Decodes exactly `count` symbols out of one backward stream, and requires
+ * the stream to end exactly there.
+ *
+ * A count of zero is legal and is the shape a four-way split produces at the
+ * format's own minimum: Regenerated_Size 6 gives segments of 2, 2, 2 and 0.
+ * Such a stream still has to exist and still has to be empty of live bits,
+ * which the end check below is what says. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdLiteralsDecodeStream(
+    const unsigned char* src, uint64_t size, const ZstdLiteralsTable* table,
+    unsigned char* dst, uint64_t count, ZstdLiteralsReject* reject) {
+    ZstdBitReader reader;
+    reader.src = src;
+    reader.size = size;
+    if (reader.Start() != CUDEC_OK) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectStreamTruncated,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    /* Counted by the symbols asked for, which the caller derived from
+     * Regenerated_Size and bounded against the block maximum before any bit
+     * was read: the trip count is not stream-derived. */
+    for (uint64_t i = 0; i < count; i++) {
+        /* The peek returns exactly table_log bits, so the index is inside a
+         * table of 1 << table_log cells by construction and no mask is
+         * applied here. What makes that constructive argument sound is the
+         * depth check on the table itself, in the caller. */
+        const uint32_t index = ZstdLiteralsPeekBits(&reader, table->table_log);
+        const ZstdHufCell cell = table->cells[index];
+        uint64_t consumed = 0;
+        if (reader.ReadBits(cell.nb_bits, &consumed) != CUDEC_OK) {
+            return ZstdLiteralsRefuse(kZstdLiteralsRejectStreamTruncated,
+                                      CUDEC_ERR_CORRUPT_INPUT, reject);
+        }
+        dst[i] = cell.symbol;
+    }
+    if (!reader.AtEnd()) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectStreamNotConsumed,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    return CUDEC_OK;
+}
+
+/* Decodes one literals section into `dst`.
+ *
+ * `size` is the bytes remaining in the block from the section's first byte.
+ * `window_size` is the frame's, from which the block maximum is derived here
+ * rather than by the caller - the bound belongs with the check it feeds.
+ *
+ * `table` is carried across the blocks of a frame by the caller: a
+ * Compressed section overwrites it and marks it present, a Treeless one
+ * reads it and requires it, and Raw and RLE leave it alone. `scratch` is
+ * only touched on the Compressed path.
+ *
+ * `out_consumed` is what the section occupied in the block, which is where
+ * the sequences section begins. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeLiterals(
+    const unsigned char* src, uint64_t size, uint64_t window_size,
+    ZstdLiteralsTable* table, ZstdLiteralsScratch* scratch, unsigned char* dst,
+    uint64_t dst_capacity, uint64_t* out_produced, uint64_t* out_consumed,
+    ZstdLiteralsReject* reject) {
+    if (reject != 0) {
+        *reject = kZstdLiteralsRejectNone;
+    }
+    if (out_produced != 0) {
+        *out_produced = 0;
+    }
+    if (out_consumed != 0) {
+        *out_consumed = 0;
+    }
+    if (src == 0 || dst == 0 || table == 0 || scratch == 0 ||
+        out_produced == 0 || out_consumed == 0 || table->cells == 0 ||
+        table->capacity < (1u << kZstdLiteralsMaxTableLog)) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectBadRequest,
+                                  CUDEC_ERR_INVALID_ARGUMENT, reject);
+    }
+
+    ZstdLiteralsHeader header;
+    const cudec_status header_status =
+        ZstdParseLiteralsHeader(src, size, &header, reject);
+    if (header_status != CUDEC_OK) {
+        return header_status;
+    }
+
+    if (header.regenerated_size > ZstdLiteralsBlockMaximum(window_size)) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectRegeneratedTooLarge,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    if (header.regenerated_size > dst_capacity) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectRegeneratedPastCapacity,
+                                  CUDEC_ERR_OUTPUT_TOO_SMALL, reject);
+    }
+
+    const uint64_t after_header = size - header.header_size;
+
+    if (header.block_type == kZstdLiteralsTypeRaw) {
+        if (header.regenerated_size > after_header) {
+            return ZstdLiteralsRefuse(kZstdLiteralsRejectContentTruncated,
+                                      CUDEC_ERR_CORRUPT_INPUT, reject);
+        }
+        for (uint64_t i = 0; i < header.regenerated_size; i++) {
+            dst[i] = src[header.header_size + i];
+        }
+        *out_produced = header.regenerated_size;
+        *out_consumed = header.header_size + header.regenerated_size;
+        return CUDEC_OK;
+    }
+
+    if (header.block_type == kZstdLiteralsTypeRle) {
+        if (after_header < 1) {
+            return ZstdLiteralsRefuse(kZstdLiteralsRejectContentTruncated,
+                                      CUDEC_ERR_CORRUPT_INPUT, reject);
+        }
+        const unsigned char symbol = src[header.header_size];
+        for (uint64_t i = 0; i < header.regenerated_size; i++) {
+            dst[i] = symbol;
+        }
+        *out_produced = header.regenerated_size;
+        *out_consumed = header.header_size + 1;
+        return CUDEC_OK;
+    }
+
+    /* Compressed and Treeless from here. */
+    if (header.compressed_size > after_header) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectPayloadTruncated,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    const unsigned char* payload = src + header.header_size;
+    uint64_t payload_size = header.compressed_size;
+
+    if (header.block_type == kZstdLiteralsTypeCompressed) {
+        unsigned symbol_count = 0;
+        unsigned table_log = 0;
+        uint64_t description_size = 0;
+        ZstdHufReject huf_reject = kZstdHufRejectNone;
+        const cudec_status weights_status = ZstdHufReadWeights(
+            payload, payload_size, kZstdHufMaxSymbolValue + 1,
+            kZstdLiteralsMaxTableLog, &scratch->weights_scratch,
+            scratch->weights, &symbol_count, &table_log, &description_size,
+            &huf_reject);
+        if (weights_status != CUDEC_OK) {
+            return ZstdLiteralsRefuse(kZstdLiteralsRejectTreeDescription,
+                                      weights_status, reject);
+        }
+        const cudec_status build_status =
+            ZstdHufBuildDTable(scratch->weights, symbol_count, table_log,
+                               table->cells, table->capacity, &huf_reject);
+        if (build_status != CUDEC_OK) {
+            return ZstdLiteralsRefuse(kZstdLiteralsRejectTreeDescription,
+                                      build_status, reject);
+        }
+        table->table_log = table_log;
+        table->present = true;
+        payload += description_size;
+        payload_size -= description_size;
+    } else if (!table->present) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectNoPreviousTable,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+
+    /* The depth is the caller's state rather than this section's bytes, and
+     * it is the bound the stream decode indexes the cell array by. A table
+     * marked present with a depth this unit could not have written is a
+     * caller bug, refused here rather than trusted one call deeper. */
+    if (table->table_log == 0 || table->table_log > kZstdLiteralsMaxTableLog) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectBadRequest,
+                                  CUDEC_ERR_INVALID_ARGUMENT, reject);
+    }
+
+    if (payload_size == 0) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectStreamsAbsent,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+
+    if (header.stream_count == 1) {
+        const cudec_status status = ZstdLiteralsDecodeStream(
+            payload, payload_size, table, dst, header.regenerated_size,
+            reject);
+        if (status != CUDEC_OK) {
+            return status;
+        }
+        *out_produced = header.regenerated_size;
+        *out_consumed = header.header_size + header.compressed_size;
+        return CUDEC_OK;
+    }
+
+    if (payload_size < kZstdLiteralsMinFourStreamPayload) {
+        return ZstdLiteralsRefuse(
+            kZstdLiteralsRejectFourStreamPayloadTooShort,
+            CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    if (header.regenerated_size < kZstdLiteralsMinFourStreamRegenerated) {
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectFourStreamTooFewLiterals,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+
+    /* The jump table: three 16-bit little-endian compressed sizes, the
+     * fourth stream taking what is left. The sum is accumulated in 64 bits
+     * from 16-bit reads, so it cannot wrap, and the comparison below is what
+     * makes the fourth stream's size a subtraction that stays positive. */
+    uint64_t compressed[kZstdLiteralsStreamCount];
+    uint64_t declared_total = 0;
+    for (unsigned s = 0; s + 1 < kZstdLiteralsStreamCount; s++) {
+        compressed[s] = ZstdReadLe(payload + s * 2, 2);
+        declared_total += compressed[s];
+    }
+    const uint64_t stream_bytes = payload_size - kZstdLiteralsJumpTableBytes;
+    if (declared_total >= stream_bytes) {
+        /* Equality is a refusal too: it leaves the fourth stream zero bytes,
+         * and a stream with no bytes has no start marker to read. */
+        return ZstdLiteralsRefuse(kZstdLiteralsRejectJumpTableOverruns,
+                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    compressed[kZstdLiteralsStreamCount - 1] = stream_bytes - declared_total;
+
+    /* The regenerated split, which is a different division from the one
+     * above: the first three segments are the rounded-up quarter and the
+     * fourth is the remainder. Three rounded-up quarters exceed the whole
+     * for exactly one value, five, and the floor of six checked above is
+     * what excludes it - so the subtraction below cannot underflow. */
+    const uint64_t segment = (header.regenerated_size + 3) / 4;
+    uint64_t regenerated[kZstdLiteralsStreamCount];
+    for (unsigned s = 0; s + 1 < kZstdLiteralsStreamCount; s++) {
+        regenerated[s] = segment;
+    }
+    regenerated[kZstdLiteralsStreamCount - 1] =
+        header.regenerated_size - 3 * segment;
+
+    const unsigned char* stream = payload + kZstdLiteralsJumpTableBytes;
+    unsigned char* out = dst;
+    for (unsigned s = 0; s < kZstdLiteralsStreamCount; s++) {
+        const cudec_status status = ZstdLiteralsDecodeStream(
+            stream, compressed[s], table, out, regenerated[s], reject);
+        if (status != CUDEC_OK) {
+            return status;
+        }
+        stream += compressed[s];
+        out += regenerated[s];
+    }
+    *out_produced = header.regenerated_size;
+    *out_consumed = header.header_size + header.compressed_size;
+    return CUDEC_OK;
+}
+
+}  // namespace cudec_detail
+
+#endif /* CUDEC_ZSTD_LITERALS_H */
