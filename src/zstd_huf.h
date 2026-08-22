@@ -332,10 +332,14 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdHufReadWeights(
         return ZstdHufRefuse(kZstdHufRejectLastWeightNotClean,
                              CUDEC_ERR_CORRUPT_INPUT, reject);
     }
-    if (written + 1u > max_symbol_count) {
-        return ZstdHufRefuse(kZstdHufRejectTooManyWeights,
-                             CUDEC_ERR_CORRUPT_INPUT, reject);
-    }
+    /* THE SLOT FOR THE IMPLIED SYMBOL IS ALREADY OWED AND THERE IS NO SECOND
+     * CHECK HERE. Both spellings stop one short of the caller's alphabet: the
+     * direct one refuses a count that would not leave the slot before it writes
+     * a nibble, and the compressed one is given a capacity of
+     * max_symbol_count - 1 and refuses rather than truncating when it fills. So
+     * `written` is at most max_symbol_count - 1 on every path that reaches this
+     * line, and a guard for the other case would be one no negative could
+     * reach. */
     weights[written] = static_cast<uint8_t>(last_weight);
 
     /* The deepest rank of a tree that closes holds at least two leaves: its
