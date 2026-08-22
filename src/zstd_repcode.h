@@ -84,6 +84,45 @@ enum ZstdRepcodeReject {
     kZstdRepcodeRejectCount
 };
 
+/* The seven ways an Offset_Value can resolve, which is the same case split
+ * ZstdRepcodeResolve makes below and is named here so a caller can ask which
+ * of them a stream reached. That question is not decoration: a corpus that
+ * decodes byte-identically proves nothing about a rule it never took, and the
+ * seventh rule - value 3 with no literals, the most recent offset minus one -
+ * is both the rarest and the one whose arithmetic can wrap.
+ *
+ * Derived from the value and the literals length alone, exactly as the
+ * resolution is, so the two cannot disagree about which rule ran. */
+enum ZstdRepcodePath {
+    /* Offset_Value above three: an explicit distance. */
+    kZstdRepcodePathExplicit = 0,
+    /* Literals present, value 1, 2, 3: the most recent offset, the second,
+     * the third. */
+    kZstdRepcodePathSlot0,
+    kZstdRepcodePathSlot1,
+    kZstdRepcodePathSlot2,
+    /* No literals, value 1 and 2: the second offset and the third. */
+    kZstdRepcodePathShiftedSlot1,
+    kZstdRepcodePathShiftedSlot2,
+    /* No literals, value 3: the most recent offset, minus one. */
+    kZstdRepcodePathMinusOne,
+    kZstdRepcodePathCount
+};
+
+CUDEC_HOST_DEVICE inline ZstdRepcodePath ZstdRepcodeClassify(
+    uint64_t offset_value, uint32_t literals_length) {
+    if (offset_value > kZstdRepcodeMaxSlotValue || offset_value == 0) {
+        return kZstdRepcodePathExplicit;
+    }
+    if (literals_length != 0) {
+        return static_cast<ZstdRepcodePath>(
+            kZstdRepcodePathSlot0 + static_cast<unsigned>(offset_value) - 1u);
+    }
+    return static_cast<ZstdRepcodePath>(kZstdRepcodePathShiftedSlot1 +
+                                        static_cast<unsigned>(offset_value) -
+                                        1u);
+}
+
 CUDEC_HOST_DEVICE inline cudec_status ZstdRepcodeRefuse(
     ZstdRepcodeReject rung, cudec_status status, ZstdRepcodeReject* out) {
     if (out != 0) {

@@ -63,11 +63,12 @@ using cudec_twin::Run;
 /* ---- The count lock ----------------------------------------------------
  *
  * Every reject rung the Zstd surface can return, summed at compile time. The
- * seven ladders are the bitstream reader, the FSE table description, the
+ * eight ladders are the bitstream reader, the FSE table description, the
  * Huffman tree description, the literals section, the sequences section, the
- * repeat-offset history and the sequence execution - the whole surface rather
- * than the entropy subset, because a rung added to any of them is a refusal
- * that arrives with no negative behind it unless somebody wrote one.
+ * repeat-offset history, the sequence execution and the block loop - the
+ * whole surface rather than the entropy subset, because a rung added to any
+ * of them is a refusal that arrives with no negative behind it unless
+ * somebody wrote one.
  *
  * Each ladder's `...RejectCount` counts kNone as well, so the sum below
  * subtracts one per ladder and the number is the count of real rungs.
@@ -83,9 +84,10 @@ constexpr int kZstdRejectRungs =
     (cudec_detail::kZstdLiteralsRejectCount - 1) +
     (cudec_detail::kZstdSeqRejectCount - 1) +
     (cudec_detail::kZstdRepcodeRejectCount - 1) +
-    (cudec_detail::kZstdExecRejectCount - 1);
+    (cudec_detail::kZstdExecRejectCount - 1) +
+    (cudec_detail::kZstdBlocksRejectCount - 1);
 
-constexpr int kExpectedZstdRejectRungs = 68;
+constexpr int kExpectedZstdRejectRungs = 74;
 
 /* How many mutants land in the declared class below, measured on the pinned
  * zstd 1.5.7 and the pinned mutation corpus. Written down rather than derived

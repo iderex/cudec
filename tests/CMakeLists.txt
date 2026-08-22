@@ -343,6 +343,20 @@ target_compile_definitions(zstd_repcode_twin PRIVATE HUF_STATIC_LINKING_ONLY)
 cudec_add_test(zstd_exec_twin SOURCES zstd_exec_twin.cpp)
 target_include_directories(zstd_exec_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The block loop and the per-frame state it carries (issue #201). Host-side and
+# GPU-less. What it adds to zstd_entropy_twin, which also decodes frames, is
+# the two questions a corpus run cannot ask: whether the entropy state that
+# must survive a block boundary does, and whether the state that must not
+# survive a FRAME boundary dies. Both are proven by removing the thing under
+# test and watching the verdict move. It links zstd_full alone for the reason
+# zstd_oracle_smoke gives above - it drives the compressor through
+# zstd_corpus.cpp for the forced-mode families, and it needs the reference to
+# agree that its hand-built frames are frames before it trusts a mutation of
+# one.
+cudec_add_test(zstd_blocks_twin SOURCES zstd_blocks_twin.cpp zstd_corpus.cpp
+               LIBS zstd_full)
+target_include_directories(zstd_blocks_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The whole M5 entropy stage over both corpora, two-directionally (issue
 # #223). It is the only Zstd test that decodes a FRAME: the sibling twins each
 # prove one unit against the reference entry point that matches it, and none of
