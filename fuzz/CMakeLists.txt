@@ -14,7 +14,20 @@ include(${PROJECT_SOURCE_DIR}/cmake/CudecSnappyOracle.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/CudecZstdOracle.cmake)
 
 function(cudec_add_fuzz_target name)
-  cmake_parse_arguments(F "" "" "SOURCES;LIBS" ${ARGN})
+  cmake_parse_arguments(F "" "SHARE" "SOURCES;LIBS" ${ARGN})
+  # SHARE is how much of the fuzz job's ONE wall-clock budget this target is
+  # worth, relative to its siblings. Nothing here reads the number: it is
+  # declared at the target because that is where a new target is written, and
+  # scripts/fuzz-budget.sh divides the budget by it, argues there why the
+  # shares are not equal, and refuses a target that declares none. The keyword
+  # is named here all the same, because an undeclared keyword lands in
+  # F_UNPARSED_ARGUMENTS and this function would silently accept a
+  # misspelling of it.
+  #
+  # The _selftest twins declare none, and are exempt in the script for the
+  # reason they exist: they are replayed once over the committed seeds to prove
+  # the parity comparison is live, never fuzzed, so a budget for them would be
+  # time spent on a binary whose findings are never read.
   add_executable(${name} ${F_SOURCES})
   target_link_libraries(${name} PRIVATE ${F_LIBS})
   # src/ for the single-sourced parser, tests/ for the shared host driver the
@@ -39,7 +52,7 @@ function(cudec_add_fuzz_target name)
                       ${CUDEC_SANITIZE_LINK_FLAGS})
 endfunction()
 
-cudec_add_fuzz_target(fuzz_lz4_block SOURCES fuzz_lz4_block.cpp LIBS
+cudec_add_fuzz_target(fuzz_lz4_block SHARE 1 SOURCES fuzz_lz4_block.cpp LIBS
                       lz4_oracle)
 
 # The second binary of the pair, and the reason the first one's verdict can be
@@ -54,8 +67,8 @@ target_compile_definitions(fuzz_lz4_block_selftest
                            PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
 
 # The Snappy pair (issue #90), the same two binaries for the same two reasons.
-cudec_add_fuzz_target(fuzz_snappy_block SOURCES fuzz_snappy_block.cpp LIBS
-                      snappy_oracle)
+cudec_add_fuzz_target(fuzz_snappy_block SHARE 1 SOURCES fuzz_snappy_block.cpp
+                      LIBS snappy_oracle)
 cudec_add_fuzz_target(fuzz_snappy_block_selftest SOURCES fuzz_snappy_block.cpp
                       LIBS snappy_oracle)
 target_compile_definitions(fuzz_snappy_block_selftest
@@ -68,7 +81,7 @@ target_compile_definitions(fuzz_snappy_block_selftest
 # that reason. The twin below breaks the same way its siblings do - it
 # perturbs an accepted result so the checks must fire - which is what keeps
 # "no oracle" from also meaning "nothing proves the checks run".
-cudec_add_fuzz_target(fuzz_gdeflate_tilestream SOURCES
+cudec_add_fuzz_target(fuzz_gdeflate_tilestream SHARE 1 SOURCES
                       fuzz_gdeflate_tilestream.cpp)
 cudec_add_fuzz_target(fuzz_gdeflate_tilestream_selftest SOURCES
                       fuzz_gdeflate_tilestream.cpp)
@@ -81,7 +94,7 @@ target_compile_definitions(fuzz_gdeflate_tilestream_selftest
 # the seed corpus is committed bytes. ZSTD_STATIC_LINKING_ONLY is for
 # ZSTD_getFrameHeader, which lives in libzstd's static API, the same reason
 # tests/zstd_frame_twin.cpp defines it.
-cudec_add_fuzz_target(fuzz_zstd_frame SOURCES fuzz_zstd_frame.cpp LIBS
+cudec_add_fuzz_target(fuzz_zstd_frame SHARE 1 SOURCES fuzz_zstd_frame.cpp LIBS
                       zstd_oracle)
 target_compile_definitions(fuzz_zstd_frame PRIVATE ZSTD_STATIC_LINKING_ONLY)
 cudec_add_fuzz_target(fuzz_zstd_frame_selftest SOURCES fuzz_zstd_frame.cpp
@@ -98,7 +111,8 @@ target_compile_definitions(
 # entry point is not exported by the pinned release. It is defined here rather
 # than in the source for the reason issue #180 landed - the two spellings are a
 # redefinition the strict-warning build refuses.
-cudec_add_fuzz_target(fuzz_zstd_fse SOURCES fuzz_zstd_fse.cpp LIBS zstd_oracle)
+cudec_add_fuzz_target(fuzz_zstd_fse SHARE 2 SOURCES fuzz_zstd_fse.cpp LIBS
+                      zstd_oracle)
 target_compile_definitions(fuzz_zstd_fse PRIVATE FSE_STATIC_LINKING_ONLY)
 cudec_add_fuzz_target(fuzz_zstd_fse_selftest SOURCES fuzz_zstd_fse.cpp LIBS
                       zstd_oracle)
@@ -114,8 +128,8 @@ target_compile_definitions(
 # frame rather than an internal entry point. The target's own header says why
 # the frame is there: a literals section is not something libzstd decodes on
 # its own, so an envelope is what gives the reference a question to answer.
-cudec_add_fuzz_target(fuzz_zstd_literals SOURCES fuzz_zstd_literals.cpp LIBS
-                      zstd_oracle)
+cudec_add_fuzz_target(fuzz_zstd_literals SHARE 2 SOURCES fuzz_zstd_literals.cpp
+                      LIBS zstd_oracle)
 cudec_add_fuzz_target(fuzz_zstd_literals_selftest SOURCES
                       fuzz_zstd_literals.cpp LIBS zstd_oracle)
 target_compile_definitions(fuzz_zstd_literals_selftest PRIVATE
@@ -131,7 +145,7 @@ target_compile_definitions(fuzz_zstd_literals_selftest PRIVATE
 # body and once with, and the target's own header says why that is the only way
 # the sequence execution is reachable inside a subset that requires the
 # declaration.
-cudec_add_fuzz_target(fuzz_zstd_decode SOURCES fuzz_zstd_decode.cpp LIBS
+cudec_add_fuzz_target(fuzz_zstd_decode SHARE 3 SOURCES fuzz_zstd_decode.cpp LIBS
                       zstd_oracle)
 cudec_add_fuzz_target(fuzz_zstd_decode_selftest SOURCES fuzz_zstd_decode.cpp
                       LIBS zstd_oracle)

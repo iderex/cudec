@@ -43,21 +43,32 @@ jobs:
   fuzz:
     name: fuzz
     runs-on: ubuntu-latest
-    # Covers the scheduled shape: the build, plus the per-target budget below
-    # times the number of targets, plus room for the seed replay.
-    timeout-minutes: 50
+    # Covers the scheduled shape: the build, plus the ONE fuzzing budget below,
+    # plus room for the seed replay. It no longer has to be re-read every time
+    # a target lands, because the budget below is a total rather than a rate -
+    # which is the failure scripts/fuzz-budget.sh opens by measuring.
+    timeout-minutes: 90
     permissions:
       contents: read
     defaults:
       run:
         shell: bash
     env:
-      # The whole budget question in one line. 60 s per target on a pull
-      # request: the job runs on its own runner in parallel with build and
-      # sanitize, which carry 30-minute timeouts each, so a two-target smoke
-      # adds two minutes to a step nobody is waiting on and no wall-clock to
-      # the gate as a whole. The scheduled run is where depth comes from.
-      CUDEC_FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '900' || '60' }}
+      # The whole budget question in one line, and it is a TOTAL rather than a
+      # rate: 7 minutes of fuzzing on a pull request and 60 on the schedule,
+      # whatever number of targets the build declares. The job runs on its own
+      # runner in parallel with build and sanitize, which carry 30-minute
+      # timeouts each, so the smoke adds no wall-clock to the gate as a whole;
+      # the scheduled run is where depth comes from.
+      #
+      # How the total is split is not written here and is not split evenly.
+      # Each target declares what it is worth beside itself in
+      # fuzz/CMakeLists.txt, scripts/fuzz-budget.sh divides the total by those
+      # shares and prints the table it derived, and that script is where the
+      # argument for unequal shares lives. A table written into this file
+      # instead would drift against the build that decides which targets
+      # exist, silently and in the direction where a target gets no time.
+      CUDEC_FUZZ_TOTAL_SECONDS: ${{ github.event_name == 'schedule' && '3600' || '420' }}
       # Above every seed and above the harnesses' own stream ceilings, so the
       # ceiling that bounds the run is the one written in the target rather
       # than one written here.
@@ -93,21 +104,21 @@ jobs:
       - name: The seed corpus is the corpus its manifest describes
         run: scripts/check-fuzz-corpus.sh
 
-      # The target list is derived from fuzz/CMakeLists.txt, not written here.
-      # A list in this file would drift against the build that decides it, and
-      # the drift is silent in the dangerous direction - the target the list
-      # forgot is the one that never gets fuzzed while the check reads green.
-      # Empty is refused: it would turn every loop below into a no-op.
-      - name: Derive the targets from the build
+      # The target list and each target's slice of the budget, both derived
+      # from fuzz/CMakeLists.txt and neither written here. A list in this file
+      # would drift against the build that decides it, and the drift is silent
+      # in the dangerous direction - the target the list forgot is the one that
+      # never gets fuzzed while the check reads green. The script refuses an
+      # empty list, a target that declares no share, and a share that works out
+      # to zero seconds, and it proves on every run that it refuses at all.
+      - name: Derive the targets and their budgets from the build
         run: |
           set -eu
-          targets="$(sed -n 's/^cudec_add_fuzz_target(\([A-Za-z0-9_]*\).*/\1/p' \
-            fuzz/CMakeLists.txt | grep -v '_selftest$' | LC_ALL=C sort -u)"
-          if [ -z "$targets" ]; then
-            echo "FAIL: no cudec_add_fuzz_target(...) in fuzz/CMakeLists.txt"
-            exit 1
-          fi
-          echo "targets: $(echo $targets)"
+          table="$RUNNER_TEMP/fuzz-budget.txt"
+          scripts/fuzz-budget.sh "$CUDEC_FUZZ_TOTAL_SECONDS" > "$table"
+          cat "$table"
+          echo "CUDEC_FUZZ_BUDGET_TABLE=$table" >> "$GITHUB_ENV"
+          targets="$(cut -d' ' -f1 "$table")"
           echo "CUDEC_FUZZ_TARGETS=$(echo $targets)" >> "$GITHUB_ENV"
 
       # CUDEC_FUZZ refuses a non-Clang toolchain and refuses -fsanitize=fuzzer
@@ -199,20 +210,20 @@ jobs:
       # given first, with the committed seeds read-only behind it, so a run
       # cannot quietly rewrite the corpus the manifest pins. A crash lands as
       # an artifact under RUNNER_TEMP and is uploaded by the step below.
-      - name: Fuzz each target for the event's budget
+      - name: Fuzz each target for its share of the budget
         run: |
           set -eu
           mkdir -p "$RUNNER_TEMP/crashes"
-          for t in $CUDEC_FUZZ_TARGETS; do
+          while read -r t seconds; do
             work="$RUNNER_TEMP/corpus/$t"
             mkdir -p "$work"
-            echo "--- $t for ${CUDEC_FUZZ_SECONDS}s"
+            echo "--- $t for ${seconds}s"
             "$PWD/build-fuzz/fuzz/$t" "$work" "fuzz/corpus/$t" \
-              -max_total_time="$CUDEC_FUZZ_SECONDS" \
+              -max_total_time="$seconds" \
               -max_len="$CUDEC_FUZZ_MAX_LEN" \
               -print_final_stats=1 \
               -artifact_prefix="$RUNNER_TEMP/crashes/$t-"
-          done
+          done < "$CUDEC_FUZZ_BUDGET_TABLE"
 
       # A crashing input is the finding, and it is worthless if it is not
       # carried out of the runner: the regression policy in fuzz/README.md
