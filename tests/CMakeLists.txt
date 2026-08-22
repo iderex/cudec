@@ -303,6 +303,20 @@ cudec_add_test(zstd_seq_twin SOURCES zstd_seq_twin.cpp zstd_corpus.cpp LIBS
                zstd_full)
 target_include_directories(zstd_seq_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The Zstd literals section: the four block types, the size-format variants of
+# its header, and the one- and four-stream Huffman decodes (issue #221).
+# Host-side and GPU-less. It links zstd_full alone for the reason
+# zstd_oracle_smoke gives above, and because its negatives are whole frames the
+# reference decides on through its frame entry point - a literals section is
+# not an entry point libzstd exposes. It compiles zstd_corpus.cpp for the
+# reason zstd_fse_twin does: the #185 fixtures are where the sections it sweeps
+# come from. HUF_STATIC_LINKING_ONLY is what exposes the four HUF_decompress
+# entry points and the workspace macro it diffs against.
+cudec_add_test(zstd_literals_twin SOURCES zstd_literals_twin.cpp
+               zstd_corpus.cpp LIBS zstd_full)
+target_include_directories(zstd_literals_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(zstd_literals_twin PRIVATE HUF_STATIC_LINKING_ONLY)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
