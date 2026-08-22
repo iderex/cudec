@@ -277,6 +277,20 @@ cudec_add_test(zstd_fse_twin SOURCES zstd_fse_twin.cpp zstd_corpus.cpp LIBS
 target_include_directories(zstd_fse_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(zstd_fse_twin PRIVATE FSE_STATIC_LINKING_ONLY)
+# The Zstd Huffman tree description and the table built from it (issue #220),
+# held to HUF_readStats and HUF_readDTableX1 cell by cell over every Compressed
+# literals section the corpus carries, plus a direct-nibble spelling this test
+# writes because the compressor does not emit one at these sizes. Host-side and
+# GPU-less. It links zstd_full alone for the reason zstd_oracle_smoke gives
+# above, and compiles zstd_corpus.cpp for the reason zstd_fse_twin does - the
+# #185 fixtures are where the literals sections it sweeps come from.
+# HUF_STATIC_LINKING_ONLY is what exposes HUF_readStats_wksp,
+# HUF_readDTableX1_wksp and the two sizing macros.
+cudec_add_test(zstd_huf_twin SOURCES zstd_huf_twin.cpp zstd_corpus.cpp LIBS
+               zstd_full)
+target_include_directories(zstd_huf_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(zstd_huf_twin PRIVATE HUF_STATIC_LINKING_ONLY)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
