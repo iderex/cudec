@@ -330,6 +330,20 @@ cudec_add_test(zstd_repcode_twin SOURCES zstd_repcode_twin.cpp zstd_corpus.cpp
 target_include_directories(zstd_repcode_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(zstd_repcode_twin PRIVATE HUF_STATIC_LINKING_ONLY)
+# The whole M5 entropy stage over both corpora, two-directionally (issue
+# #223). It is the only Zstd test that decodes a FRAME: the sibling twins each
+# prove one unit against the reference entry point that matches it, and none of
+# them can say whether the stage as a whole ever accepts what the reference
+# refuses. Host-side and GPU-less. It links zstd_full alone for the reason
+# zstd_oracle_smoke gives above, and compiles zstd_corpus.cpp for the reason
+# zstd_fse_twin does - the #185 fixtures and the #187 mutants are both behind
+# it. HUF_STATIC_LINKING_ONLY is what exposes the reference decoder it uses to
+# classify the one mutant on which libzstd disagrees with itself.
+cudec_add_test(zstd_entropy_twin SOURCES zstd_entropy_twin.cpp zstd_corpus.cpp
+               LIBS zstd_full)
+target_include_directories(zstd_entropy_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(zstd_entropy_twin PRIVATE HUF_STATIC_LINKING_ONLY)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
