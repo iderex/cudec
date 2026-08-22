@@ -35,10 +35,8 @@
  * observable at all. */
 #include "require.h"
 #include "zstd_corpus.h"
-#include "zstd_frame.h"
-#include "zstd_literals.h"
 #include "zstd_repcode.h"
-#include "zstd_seq.h"
+#include "zstd_twin_driver.h"
 
 #include <zstd.h>
 #include <zstd_errors.h>
@@ -50,49 +48,23 @@
 
 namespace {
 
-using Bytes = std::vector<unsigned char>;
+using Bytes = cudec_twin::Bytes;
 
 using cudec_detail::ZstdRepcodeHistory;
 using cudec_detail::ZstdRepcodeInit;
 using cudec_detail::ZstdRepcodeReject;
 using cudec_detail::ZstdRepcodeResolve;
 
-/* The seven ways an Offset_Value can resolve, counted as the driver goes.
- *
- * A corpus that decodes byte-identically proves nothing about a rule it never
- * reached, and this is what says which rules it reached. Measured rather than
- * assumed: a compressor emits some of these and not others, the numbers are
- * printed on the PASS line, and the ones a compressor does emit are required
- * to be non-zero so a corpus that stops carrying them reds this test instead
- * of passing more cheaply. */
-enum RulePath {
-    kPathExplicit = 0,     /* Offset_Value above three: an explicit distance */
-    kPathSlot0,            /* literals, value 1: the most recent offset */
-    kPathSlot1,            /* literals, value 2: the second */
-    kPathSlot2,            /* literals, value 3: the third */
-    kPathShiftedSlot1,     /* no literals, value 1: the second */
-    kPathShiftedSlot2,     /* no literals, value 2: the third */
-    /* no literals, value 3: the most recent offset, minus one */
-    kPathMinusOne,
-    kPathCount
-};
+using cudec_twin::DecodeFrame;
+using cudec_twin::kPathCount;
+using cudec_twin::kPathNames;
+using cudec_twin::Run;
 
-const char* const kPathNames[kPathCount] = {
-    "explicit", "rep1", "rep2", "rep3", "rep1-shifted", "rep2-shifted",
-    "rep1-minus-one"};
+/* One capacity for every driver run, larger than anything decoded here. */
+constexpr uint64_t kDriverCapacity = 8ull * 1024ull * 1024ull;
 
 size_t g_path_corpus[kPathCount] = {0};
 size_t g_path_crafted[kPathCount] = {0};
-
-RulePath ClassifyPath(uint64_t offset_value, uint32_t literals_length) {
-    if (offset_value > cudec_detail::kZstdRepcodeMaxSlotValue) {
-        return kPathExplicit;
-    }
-    if (literals_length != 0) {
-        return static_cast<RulePath>(kPathSlot0 + (offset_value - 1));
-    }
-    return static_cast<RulePath>(kPathShiftedSlot1 + (offset_value - 1));
-}
 
 /* Which reject rungs a declared negative reached. Same discipline as the
  * sibling twins: the enumeration lives once, in the header, and main()
@@ -272,231 +244,6 @@ bool OracleDecodes(const Bytes& frame, Bytes* out) {
     return true;
 }
 
-/* ---------------------------------------------------------------- driver */
-
-constexpr unsigned kLitLenCells = 1u
-                                  << cudec_detail::kZstdLitLenAccuracyLogMax;
-constexpr unsigned kOffsetCells = 1u
-                                  << cudec_detail::kZstdOffsetAccuracyLogMax;
-constexpr unsigned kMatchLenCells =
-    1u << cudec_detail::kZstdMatchLenAccuracyLogMax;
-
-/* Everything one frame's decode needs, in the shape each unit asks for. All
- * of it is per-FRAME rather than per-block: the Huffman table a Treeless
- * literals section reuses, the three FSE tables a Repeat mode reuses, and the
- * repeat-offset history are exactly the state that survives a block boundary
- * and is reset at frame start. */
-struct Driver {
-    std::vector<cudec_detail::ZstdHufCell> huf_cells;
-    cudec_detail::ZstdLiteralsScratch literals_scratch;
-    cudec_detail::ZstdLiteralsTable literals_table;
-    cudec_detail::ZstdFseCell litlen_cells[kLitLenCells];
-    cudec_detail::ZstdFseCell offset_cells[kOffsetCells];
-    cudec_detail::ZstdFseCell matchlen_cells[kMatchLenCells];
-    cudec_detail::ZstdSeqTable litlen;
-    cudec_detail::ZstdSeqTable offset;
-    cudec_detail::ZstdSeqTable matchlen;
-    cudec_detail::ZstdSeqScratch seq_scratch;
-    ZstdRepcodeHistory repcodes;
-
-    Driver()
-        : huf_cells(1u << cudec_detail::kZstdLiteralsMaxTableLog),
-          literals_scratch(), literals_table(), litlen(), offset(),
-          matchlen(), seq_scratch(), repcodes() {
-        literals_table.cells = huf_cells.data();
-        literals_table.capacity = static_cast<uint32_t>(huf_cells.size());
-        literals_table.table_log = 0;
-        literals_table.present = false;
-        litlen.cells = litlen_cells;
-        litlen.capacity = kLitLenCells;
-        offset.cells = offset_cells;
-        offset.capacity = kOffsetCells;
-        matchlen.cells = matchlen_cells;
-        matchlen.capacity = kMatchLenCells;
-        ZstdRepcodeInit(&repcodes);
-    }
-};
-
-/* What a driver run produced, or why it stopped. `repcode_refusal` is set
- * apart from every other failure because it is the one this test is about:
- * the reject direction asserts that the run stopped THERE and not somewhere
- * that happens to also refuse. */
-struct Run {
-    bool ok;
-    bool repcode_refusal;
-    ZstdRepcodeReject rung;
-    std::string why;
-    Bytes output;
-    size_t sequences;
-    size_t repeats;
-    size_t path[kPathCount];
-};
-
-void Fail(Run* run, const char* why) {
-    run->ok = false;
-    run->why = why;
-}
-
-/* Decodes one whole frame: the header, then each block in turn, carrying the
- * literals table, the three sequence tables and the repeat-offset history
- * across block boundaries and resetting none of them. */
-Run DecodeFrame(const Bytes& frame) {
-    Run run;
-    run.ok = true;
-    run.repcode_refusal = false;
-    run.rung = cudec_detail::kZstdRepcodeRejectNone;
-    run.sequences = 0;
-    run.repeats = 0;
-    for (unsigned i = 0; i < kPathCount; i++) {
-        run.path[i] = 0;
-    }
-
-    Driver driver;
-    cudec_detail::ZstdFrameHeader header;
-    cudec_detail::ZstdFrameReject frame_rung;
-    if (cudec_detail::ZstdParseFrameHeader(frame.data(), frame.size(), &header,
-                                           &frame_rung) != CUDEC_OK) {
-        Fail(&run, "frame header refused");
-        return run;
-    }
-    uint64_t pos = header.header_size;
-    Bytes literals;
-    for (;;) {
-        cudec_detail::ZstdBlockHeader block;
-        if (cudec_detail::ZstdParseBlockHeader(
-                frame.data() + pos, frame.size() - pos, header.window_size,
-                &block, &frame_rung) != CUDEC_OK) {
-            Fail(&run, "block header refused");
-            return run;
-        }
-        const unsigned char* body = frame.data() + pos + 3;
-        if (block.block_type == cudec_detail::kZstdBlockTypeRaw) {
-            run.output.insert(run.output.end(), body, body + block.body_size);
-        } else if (block.block_type == cudec_detail::kZstdBlockTypeRle) {
-            run.output.insert(run.output.end(), block.block_size, body[0]);
-        } else {
-            literals.assign(cudec_detail::kZstdBlockSizeCeiling, 0);
-            uint64_t produced = 0;
-            uint64_t consumed = 0;
-            cudec_detail::ZstdLiteralsReject literals_rung =
-                cudec_detail::kZstdLiteralsRejectNone;
-            if (cudec_detail::ZstdDecodeLiterals(
-                    body, block.body_size, header.window_size,
-                    &driver.literals_table, &driver.literals_scratch,
-                    literals.data(), literals.size(), &produced, &consumed,
-                    &literals_rung) != CUDEC_OK) {
-                Fail(&run, "literals section refused");
-                return run;
-            }
-            literals.resize(static_cast<size_t>(produced));
-
-            const unsigned char* section = body + consumed;
-            uint64_t remaining = block.body_size - consumed;
-            cudec_detail::ZstdSeqSectionHeader seq_header;
-            uint64_t seq_consumed = 0;
-            cudec_detail::ZstdSeqReject seq_rung =
-                cudec_detail::kZstdSeqRejectNone;
-            if (cudec_detail::ZstdParseSeqSectionHeader(
-                    section, remaining, cudec_detail::kZstdBlockSizeCeiling,
-                    &seq_header, &seq_consumed, &seq_rung) != CUDEC_OK) {
-                Fail(&run, "sequences header refused");
-                return run;
-            }
-            section += seq_consumed;
-            remaining -= seq_consumed;
-
-            std::vector<cudec_detail::ZstdSequence> sequences(
-                seq_header.sequence_count);
-            if (seq_header.sequence_count != 0) {
-                const unsigned fields[] = {
-                    cudec_detail::kZstdSeqFieldLitLen,
-                    cudec_detail::kZstdSeqFieldOffset,
-                    cudec_detail::kZstdSeqFieldMatchLen};
-                const unsigned modes[] = {seq_header.litlen_mode,
-                                          seq_header.offset_mode,
-                                          seq_header.matchlen_mode};
-                cudec_detail::ZstdSeqTable* targets[] = {
-                    &driver.litlen, &driver.offset, &driver.matchlen};
-                for (unsigned index = 0; index < 3; index++) {
-                    uint64_t table_consumed = 0;
-                    if (cudec_detail::ZstdSeqLoadTable(
-                            fields[index], modes[index], section, remaining,
-                            &driver.seq_scratch, targets[index],
-                            &table_consumed, &seq_rung) != CUDEC_OK) {
-                        Fail(&run, "sequence table refused");
-                        return run;
-                    }
-                    section += table_consumed;
-                    remaining -= table_consumed;
-                }
-                if (cudec_detail::ZstdDecodeSequences(
-                        section, remaining, seq_header.sequence_count,
-                        &driver.litlen, &driver.offset, &driver.matchlen,
-                        sequences.data(),
-                        static_cast<uint32_t>(sequences.size()),
-                        &seq_rung) != CUDEC_OK) {
-                    Fail(&run, "sequences refused");
-                    return run;
-                }
-            }
-
-            /* The execution: literals, then a match at the offset this unit
-             * resolves. Byte by byte rather than by block copy, because a
-             * match may overlap its own destination - the format's way of
-             * spelling a run. */
-            size_t literal_pos = 0;
-            for (size_t s = 0; s < sequences.size(); s++) {
-                const cudec_detail::ZstdSequence& sequence = sequences[s];
-                if (literal_pos + sequence.literals_length > literals.size()) {
-                    Fail(&run, "a sequence asked for literals that are not "
-                               "there");
-                    return run;
-                }
-                for (uint32_t i = 0; i < sequence.literals_length; i++) {
-                    run.output.push_back(literals[literal_pos + i]);
-                }
-                literal_pos += sequence.literals_length;
-
-                uint64_t resolved = 0;
-                ZstdRepcodeReject rung = cudec_detail::kZstdRepcodeRejectNone;
-                if (ZstdRepcodeResolve(&driver.repcodes,
-                                       sequence.offset_value,
-                                       sequence.literals_length, &resolved,
-                                       &rung) != CUDEC_OK) {
-                    run.ok = false;
-                    run.repcode_refusal = true;
-                    run.rung = rung;
-                    run.why = "repeat offset refused";
-                    return run;
-                }
-                run.sequences++;
-                run.path[ClassifyPath(sequence.offset_value,
-                                      sequence.literals_length)]++;
-                if (sequence.offset_value <=
-                    cudec_detail::kZstdRepcodeMaxSlotValue) {
-                    run.repeats++;
-                }
-                if (resolved > run.output.size()) {
-                    Fail(&run, "a match reached before the output");
-                    return run;
-                }
-                const size_t from = run.output.size() - resolved;
-                for (uint32_t i = 0; i < sequence.match_length; i++) {
-                    run.output.push_back(run.output[from + i]);
-                }
-            }
-            for (size_t i = literal_pos; i < literals.size(); i++) {
-                run.output.push_back(literals[i]);
-            }
-        }
-        pos += 3 + block.body_size;
-        if (block.last_block) {
-            break;
-        }
-    }
-    return run;
-}
-
 /* ------------------------------------------------------------- the rows */
 
 size_t g_frames = 0;
@@ -514,7 +261,7 @@ int OracleAgrees(const char* name, const Bytes& frame, size_t* tally) {
     Bytes reference;
     REQUIRE_CTX(OracleDecodes(frame, &reference),
                 "%s: the reference refused the frame", name);
-    const Run run = DecodeFrame(frame);
+    const Run run = DecodeFrame(frame, kDriverCapacity);
     REQUIRE_CTX(run.ok, "%s: %s", name, run.why.c_str());
     REQUIRE_CTX(run.output.size() == reference.size(),
                 "%s: %zu bytes, the reference produced %zu", name,
@@ -539,13 +286,14 @@ int OracleAndTwinRefuse(const char* name, const Bytes& frame,
     Bytes reference;
     REQUIRE_CTX(!OracleDecodes(frame, &reference),
                 "%s: the reference accepted it", name);
-    const Run run = DecodeFrame(frame);
+    const Run run = DecodeFrame(frame, kDriverCapacity);
     REQUIRE_CTX(!run.ok, "%s: the driver accepted it", name);
-    REQUIRE_CTX(run.repcode_refusal, "%s: refused elsewhere: %s", name,
-                run.why.c_str());
-    REQUIRE_CTX(run.rung == want_rung, "%s: rung %d", name,
-                static_cast<int>(run.rung));
-    CoverRung(run.rung);
+    REQUIRE_CTX(run.stage == cudec_twin::kStageRepcode,
+                "%s: refused at the %s stage: %s", name,
+                cudec_twin::kStageNames[run.stage], run.why.c_str());
+    REQUIRE_CTX(run.rung == static_cast<int>(want_rung), "%s: rung %d", name,
+                run.rung);
+    CoverRung(static_cast<ZstdRepcodeReject>(run.rung));
     return 0;
 }
 
