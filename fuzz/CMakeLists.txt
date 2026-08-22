@@ -89,3 +89,19 @@ cudec_add_fuzz_target(fuzz_zstd_frame_selftest SOURCES fuzz_zstd_frame.cpp
 target_compile_definitions(
   fuzz_zstd_frame_selftest PRIVATE ZSTD_STATIC_LINKING_ONLY
                                    CUDEC_FUZZ_SELFTEST_BREAK)
+
+# The Zstd FSE table description decode and the table built from it (issue
+# #190). It links zstd_oracle rather than zstd_full: this target only ever
+# READS a description, and FSE_readNCount and FSE_buildDTable_wksp are both in
+# the decode translation units. FSE_STATIC_LINKING_ONLY is what exposes
+# FSE_buildDTable_wksp, FSE_decode_t and the two sizing macros; the non-wksp
+# entry point is not exported by the pinned release. It is defined here rather
+# than in the source for the reason issue #180 landed - the two spellings are a
+# redefinition the strict-warning build refuses.
+cudec_add_fuzz_target(fuzz_zstd_fse SOURCES fuzz_zstd_fse.cpp LIBS zstd_oracle)
+target_compile_definitions(fuzz_zstd_fse PRIVATE FSE_STATIC_LINKING_ONLY)
+cudec_add_fuzz_target(fuzz_zstd_fse_selftest SOURCES fuzz_zstd_fse.cpp LIBS
+                      zstd_oracle)
+target_compile_definitions(
+  fuzz_zstd_fse_selftest PRIVATE FSE_STATIC_LINKING_ONLY
+                                 CUDEC_FUZZ_SELFTEST_BREAK)
