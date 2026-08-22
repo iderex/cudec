@@ -172,6 +172,17 @@ struct Reference {
 
 Reference Decode(const Bytes& frame) {
     Reference out;
+    /* AN EMPTY BUFFER IS NOT A FRAME THE REFERENCE ACCEPTED, and reading it as
+     * one is what the first bounded run on this target found. ZSTD_decompress
+     * over zero bytes returns zero without an error, which is a vacuous
+     * success rather than a verdict about a frame - and cudec refuses the same
+     * buffer as CORRUPT_INPUT at the frame header, correctly, so the
+     * comparison reported a divergence on the empty input before it had
+     * examined anything at all. There is no frame here for the two sides to
+     * disagree about. */
+    if (frame.empty()) {
+        return out;
+    }
     Bytes buffer(static_cast<size_t>(kDecodeCapacity), 0);
     const size_t produced =
         ZSTD_decompress(buffer.data(), buffer.size(), frame.data(),
