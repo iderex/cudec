@@ -316,7 +316,6 @@ int RunHandBuiltFrames() {
     /* The input runs out before any block sets the last-block flag. */
     const Bytes unterminated = RawFrame(64, content, false);
     REQUIRE(!ReferenceAccepts(unterminated, &reference));
-    Harness harness(kBlockMaximum, static_cast<uint32_t>(kBlockMaximum));
     run = DecodeFrame(unterminated, kCapacity);
     REQUIRE(!run.ok);
     REQUIRE_CTX(run.stage == cudec_twin::kStageBlockHeader,
