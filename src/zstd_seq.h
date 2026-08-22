@@ -110,6 +110,14 @@ enum ZstdSeqReject {
     kZstdSeqRejectCountTruncated,
     /* More sequences than the block's regenerated size can hold. */
     kZstdSeqRejectCountTooLarge,
+    /* A count of zero followed by bytes the block has no reader for. With no
+     * sequences the section is the count alone and the block's content ends
+     * there, so anything after it is a byte nobody consumes - and a decoder
+     * that ignored it would accept a block the reference calls corrupt while
+     * producing the literals as if the stream were whole. Every other count
+     * lands in the bitstream, which is required to be consumed exactly, so
+     * this is the one arm where the leftover has nowhere else to be refused. */
+    kZstdSeqRejectBlockNotConsumed,
     /* No Symbol_Compression_Modes byte after the count. */
     kZstdSeqRejectModesTruncated,
     /* The mode byte's low two bits are reserved and must be zero. */
@@ -361,8 +369,17 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdParseSeqSectionHeader(
         consumed = 3;
     }
     /* Zero sequences ends the section: no mode byte, no tables, no bitstream.
-     * The block is its literals and nothing else. */
+     * The block is its literals and nothing else - and `size` is what is left
+     * of the block, so it ends here too. A byte after the count has no reader:
+     * the tables and the bitstream that would have consumed it do not exist in
+     * this arm. Measured rather than argued from the text: the pinned
+     * reference refuses such a block as corrupt, and this decoder used to
+     * decode it to its literals. */
     if (count == 0) {
+        if (size != consumed) {
+            return ZstdSeqRefuse(kZstdSeqRejectBlockNotConsumed,
+                                 CUDEC_ERR_CORRUPT_INPUT, reject);
+        }
         *out_consumed = consumed;
         return CUDEC_OK;
     }

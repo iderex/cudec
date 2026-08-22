@@ -770,6 +770,33 @@ int main() {
                         &header, &consumed, &rung) == CUDEC_OK);
         }
 
+        /* A count of zero followed by a byte nobody consumes. With no
+         * sequences there is no mode byte, no table and no bitstream, so the
+         * leftover has nowhere to be refused downstream - and a decoder that
+         * ignored it produced the block's literals for a block the reference
+         * calls corrupt. Found by the whole-frame fuzz target (#194); the
+         * bytes are a permanent seed beside it. */
+        {
+            cudec_detail::ZstdSeqSectionHeader header;
+            uint64_t consumed = 0;
+            cudec_detail::ZstdSeqReject rung = cudec_detail::kZstdSeqRejectNone;
+            const Bytes trailing{0x00, 0x00};
+            REQUIRE(cudec_detail::ZstdParseSeqSectionHeader(
+                        trailing.data(), trailing.size(), kAcceptedContentSize,
+                        &header, &consumed, &rung) != CUDEC_OK);
+            REQUIRE(rung == cudec_detail::kZstdSeqRejectBlockNotConsumed);
+            CoverRung(rung);
+            /* The same count with the block ending where it says it does is
+             * accepted, so the refusal above is the leftover byte rather than
+             * a blanket refusal of an empty sequences section. */
+            const Bytes exact{0x00};
+            REQUIRE(cudec_detail::ZstdParseSeqSectionHeader(
+                        exact.data(), exact.size(), kAcceptedContentSize,
+                        &header, &consumed, &rung) == CUDEC_OK);
+            REQUIRE(header.sequence_count == 0);
+            REQUIRE(consumed == 1);
+        }
+
         /* A section of no bytes at all. Written against a real pointer with
          * a zero length rather than an empty vector, whose data() may be null
          * and would reach the caller-argument rung instead. */

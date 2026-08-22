@@ -14,14 +14,15 @@ sed -n 's/^cudec_add_fuzz_target(\([A-Za-z0-9_]*\).*/\1/p' fuzz/CMakeLists.txt \
   | grep -v '_selftest$' | LC_ALL=C sort -u
 ```
 
-| target                     | parser                | reference                                    |
-| -------------------------- | --------------------- | -------------------------------------------- |
-| `fuzz_lz4_block`           | `src/lz4_block.h`     | `LZ4_decompress_safe`, liblz4 1.10.0         |
-| `fuzz_snappy_block`        | `src/snappy_block.h`  | `snappy::RawUncompress`, google/snappy 1.2.2 |
-| `fuzz_gdeflate_tilestream` | `src/tilestream.h`    | none; invariants over what it accepts        |
-| `fuzz_zstd_frame`          | `src/zstd_frame.h`    | `ZSTD_getFrameHeader`, zstd 1.5.7            |
-| `fuzz_zstd_fse`            | `src/zstd_fse.h`      | `FSE_readNCount`, zstd 1.5.7                 |
-| `fuzz_zstd_literals`       | `src/zstd_literals.h` | `ZSTD_decompress`, zstd 1.5.7                |
+| target                     | parser                 | reference                                    |
+| -------------------------- | ---------------------- | -------------------------------------------- |
+| `fuzz_lz4_block`           | `src/lz4_block.h`      | `LZ4_decompress_safe`, liblz4 1.10.0         |
+| `fuzz_snappy_block`        | `src/snappy_block.h`   | `snappy::RawUncompress`, google/snappy 1.2.2 |
+| `fuzz_gdeflate_tilestream` | `src/tilestream.h`     | none; invariants over what it accepts        |
+| `fuzz_zstd_frame`          | `src/zstd_frame.h`     | `ZSTD_getFrameHeader`, zstd 1.5.7            |
+| `fuzz_zstd_fse`            | `src/zstd_fse.h`       | `FSE_readNCount`, zstd 1.5.7                 |
+| `fuzz_zstd_literals`       | `src/zstd_literals.h`  | `ZSTD_decompress`, zstd 1.5.7                |
+| `fuzz_zstd_decode`         | the whole M5 host path | `ZSTD_decompress`, zstd 1.5.7                |
 
 The property every target asserts is the fail-open direction: where the parser
 accepts, the reference must accept the same bytes and produce the identical
@@ -40,6 +41,22 @@ twelve, and it identifies a refusal as that one by re-reading the description at
 the reference's ceiling rather than by guessing from the rung. Where a
 deliberate strictness exists instead, it is pinned in the twin test rather than
 here (`tests/parser_twin.cpp` holds the LZ4 `offset == 0` family).
+
+`fuzz_zstd_decode` is the only target that enters more than one unit, and the
+two things it can say follow from that. It runs the same host driver the CPU
+twin test runs, so a stage order that is wrong, per-frame state that does not
+survive a block boundary, or a section read at an offset the previous stage did
+not leave are all visible to it and to none of the unit targets. It also runs
+two passes: raw bytes as a whole frame, which is where the frame header, the
+subset decisions, the checksum and the bytes-after-the-frame rule live; and a
+structure-aware pass that holds a frame header, a block header and a Raw
+literals section fixed and lets the fuzzer write the sequences section, which is
+the only way the repeat-offset rules and the sequence execution are reached at
+all. Its declared exception is a buffer holding a frame followed by anything
+else, which the reference walks and the subset refuses (masterplan section
+12.4); like the literals target's, it is identified rather than guessed at and
+is printed once per run. What its second pass cannot compare, and why, is
+argued in the target's own header rather than restated here.
 
 The Snappy target asserts one thing more, and it is the one a verdict cannot
 carry: the driver counts every element the parser handed back that a caller

@@ -120,3 +120,20 @@ cudec_add_fuzz_target(fuzz_zstd_literals_selftest SOURCES
                       fuzz_zstd_literals.cpp LIBS zstd_oracle)
 target_compile_definitions(fuzz_zstd_literals_selftest PRIVATE
                            CUDEC_FUZZ_SELFTEST_BREAK)
+
+# The whole host Zstd frame decode (issue #194): every M5 unit in the order the
+# format runs them, driven through the same host driver the CPU twin test runs.
+# It links zstd_oracle for the reason fuzz_zstd_fse gives - this target only
+# ever DECODES - and it needs no STATIC_LINKING_ONLY define, because both
+# reference entry points it uses, ZSTD_decompress and
+# ZSTD_findFrameCompressedSize, are in the stable API. Its structure-aware pass
+# builds a frame twice, once without a declared content size to measure the
+# body and once with, and the target's own header says why that is the only way
+# the sequence execution is reachable inside a subset that requires the
+# declaration.
+cudec_add_fuzz_target(fuzz_zstd_decode SOURCES fuzz_zstd_decode.cpp LIBS
+                      zstd_oracle)
+cudec_add_fuzz_target(fuzz_zstd_decode_selftest SOURCES fuzz_zstd_decode.cpp
+                      LIBS zstd_oracle)
+target_compile_definitions(fuzz_zstd_decode_selftest PRIVATE
+                           CUDEC_FUZZ_SELFTEST_BREAK)

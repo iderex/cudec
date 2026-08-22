@@ -85,7 +85,7 @@ constexpr int kZstdRejectRungs =
     (cudec_detail::kZstdRepcodeRejectCount - 1) +
     (cudec_detail::kZstdExecRejectCount - 1);
 
-constexpr int kExpectedZstdRejectRungs = 67;
+constexpr int kExpectedZstdRejectRungs = 68;
 
 /* How many mutants land in the declared class below, measured on the pinned
  * zstd 1.5.7 and the pinned mutation corpus. Written down rather than derived
