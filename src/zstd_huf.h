@@ -139,7 +139,11 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdHufRefuse(ZstdHufReject rung,
  * this header compiles for both the host and the device. */
 CUDEC_HOST_DEVICE inline unsigned ZstdHufHighestSetBit(uint32_t value) {
     unsigned highest = 0;
-    for (unsigned bit = 0; bit < 32u; bit++) {
+    /* The bound is the accumulator's width, named rather than spelled: the
+     * structural scanner refuses a bare 32 in an expression because that is
+     * how a wave width gets hardcoded, and it refused this line. The constant
+     * is src/zstd_fse.h's rather than a second one of the same value. */
+    for (unsigned bit = 0; bit < kZstdFseWordBits; bit++) {
         if ((value >> bit) & 1u) {
             highest = bit;
         }
