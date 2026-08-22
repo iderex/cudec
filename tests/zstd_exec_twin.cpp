@@ -185,7 +185,15 @@ int Accepts(const char* name, const std::vector<ZstdSequence>& sequences,
             const Bytes& prefix, uint64_t window_size, const char* want) {
     const Bytes expected = Ascii(want);
     Bytes dst(prefix.size() + expected.size() + 64, 0);
-    std::memcpy(dst.data(), prefix.data(), prefix.size());
+    /* Guarded on emptiness rather than called with a zero length: an empty
+     * vector's data() is a null pointer, and memcpy is declared never to take
+     * one however many bytes it is asked for. UBSan says so, and it said so
+     * here. */
+    if (!prefix.empty()) {
+        if (!prefix.empty()) {
+            std::memcpy(dst.data(), prefix.data(), prefix.size());
+        }
+    }
     const Outcome out =
         Execute(sequences, offsets, literals,
                 cudec_detail::kZstdBlockSizeCeiling, window_size, &dst,
