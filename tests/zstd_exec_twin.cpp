@@ -190,9 +190,7 @@ int Accepts(const char* name, const std::vector<ZstdSequence>& sequences,
      * one however many bytes it is asked for. UBSan says so, and it said so
      * here. */
     if (!prefix.empty()) {
-        if (!prefix.empty()) {
-            std::memcpy(dst.data(), prefix.data(), prefix.size());
-        }
+        std::memcpy(dst.data(), prefix.data(), prefix.size());
     }
     const Outcome out =
         Execute(sequences, offsets, literals,
@@ -640,7 +638,9 @@ int Sweep() {
                     "run %d: the model refused its own row", run);
 
         Bytes dst(expected.size() + 64, 0);
-        std::memcpy(dst.data(), prefix.data(), prefix.size());
+        if (!prefix.empty()) {
+            std::memcpy(dst.data(), prefix.data(), prefix.size());
+        }
         const Outcome out =
             Execute(sequences, offsets, literals,
                     cudec_detail::kZstdBlockSizeCeiling, kWideWindow, &dst,
