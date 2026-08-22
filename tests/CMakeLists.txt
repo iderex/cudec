@@ -291,6 +291,18 @@ cudec_add_test(zstd_huf_twin SOURCES zstd_huf_twin.cpp zstd_corpus.cpp LIBS
 target_include_directories(zstd_huf_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(zstd_huf_twin PRIVATE HUF_STATIC_LINKING_ONLY)
+# The Zstd sequences section: the Number_of_Sequences varint, the four table
+# modes on each of the three fields, and the three-state interleaved decode
+# loop (issue #196). Host-side and GPU-less. It links zstd_full alone for the
+# reason zstd_oracle_smoke gives above, and because its negatives are one-byte
+# mutations of a whole frame the reference has to accept first - which needs
+# the frame entry point rather than a block one. It compiles zstd_corpus.cpp
+# for the reason zstd_fse_twin does: the #185 fixtures are where the
+# compressor-written sequences sections it sweeps over come from.
+cudec_add_test(zstd_seq_twin SOURCES zstd_seq_twin.cpp zstd_corpus.cpp LIBS
+               zstd_full)
+target_include_directories(zstd_seq_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
