@@ -105,3 +105,18 @@ cudec_add_fuzz_target(fuzz_zstd_fse_selftest SOURCES fuzz_zstd_fse.cpp LIBS
 target_compile_definitions(
   fuzz_zstd_fse_selftest PRIVATE FSE_STATIC_LINKING_ONLY
                                  CUDEC_FUZZ_SELFTEST_BREAK)
+
+# The Zstd literals section: the header, the Huffman tree description in both
+# spellings, the canonical table build, the jump table and the four streams
+# (issue #191). It links zstd_oracle for the reason fuzz_zstd_fse gives - this
+# target only ever DECODES - and it needs no STATIC_LINKING_ONLY define,
+# because the reference it compares against is ZSTD_decompress on a whole
+# frame rather than an internal entry point. The target's own header says why
+# the frame is there: a literals section is not something libzstd decodes on
+# its own, so an envelope is what gives the reference a question to answer.
+cudec_add_fuzz_target(fuzz_zstd_literals SOURCES fuzz_zstd_literals.cpp LIBS
+                      zstd_oracle)
+cudec_add_fuzz_target(fuzz_zstd_literals_selftest SOURCES
+                      fuzz_zstd_literals.cpp LIBS zstd_oracle)
+target_compile_definitions(fuzz_zstd_literals_selftest PRIVATE
+                           CUDEC_FUZZ_SELFTEST_BREAK)

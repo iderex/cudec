@@ -21,16 +21,23 @@ sed -n 's/^cudec_add_fuzz_target(\([A-Za-z0-9_]*\).*/\1/p' fuzz/CMakeLists.txt \
 | `fuzz_gdeflate_tilestream` | `src/tilestream.h`   | none; invariants over what it accepts        |
 | `fuzz_zstd_frame`          | `src/zstd_frame.h`   | `ZSTD_getFrameHeader`, zstd 1.5.7            |
 | `fuzz_zstd_fse`            | `src/zstd_fse.h`     | `FSE_readNCount`, zstd 1.5.7                 |
+| `fuzz_zstd_literals`       | `src/zstd_literals.h` | `ZSTD_decompress`, zstd 1.5.7               |
 
 The property every target asserts is the fail-open direction: where the parser
 accepts, the reference must accept the same bytes and produce the identical
 output and size. The opposite direction is asserted only where a target can
 show the two sides were given the same question to answer, because a parser
 that is stricter than its reference is usually the fail-closed contract
-working, not a defect. `fuzz_zstd_fse` is the one that can: it hands the
+working, not a defect. Two targets can. `fuzz_zstd_fse` hands the
 reference the alphabet and accuracy-log ceilings the unit under test was given,
 over a padded copy that keeps the reference's own end-of-buffer handling out of
-the comparison, and holds both sides to each other from there. Where a
+the comparison, and holds both sides to each other from there.
+`fuzz_zstd_literals` splices the fuzzer's bytes in as the literals section of a
+real frame and asks `ZSTD_decompress` about the frame, so both sides answer for
+the same section under the same window; it declares one strictness, the
+eleven-bit cap RFC 8878 puts on a literals tree where the reference reads
+twelve, and it identifies a refusal as that one by re-reading the description at
+the reference's ceiling rather than by guessing from the rung. Where a
 deliberate strictness exists instead, it is pinned in the twin test rather than
 here (`tests/parser_twin.cpp` holds the LZ4 `offset == 0` family).
 
