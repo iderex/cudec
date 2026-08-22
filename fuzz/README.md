@@ -14,14 +14,14 @@ sed -n 's/^cudec_add_fuzz_target(\([A-Za-z0-9_]*\).*/\1/p' fuzz/CMakeLists.txt \
   | grep -v '_selftest$' | LC_ALL=C sort -u
 ```
 
-| target                     | parser               | reference                                    |
-| -------------------------- | -------------------- | -------------------------------------------- |
-| `fuzz_lz4_block`           | `src/lz4_block.h`    | `LZ4_decompress_safe`, liblz4 1.10.0         |
-| `fuzz_snappy_block`        | `src/snappy_block.h` | `snappy::RawUncompress`, google/snappy 1.2.2 |
-| `fuzz_gdeflate_tilestream` | `src/tilestream.h`   | none; invariants over what it accepts        |
-| `fuzz_zstd_frame`          | `src/zstd_frame.h`   | `ZSTD_getFrameHeader`, zstd 1.5.7            |
-| `fuzz_zstd_fse`            | `src/zstd_fse.h`     | `FSE_readNCount`, zstd 1.5.7                 |
-| `fuzz_zstd_literals`       | `src/zstd_literals.h` | `ZSTD_decompress`, zstd 1.5.7               |
+| target                     | parser                | reference                                    |
+| -------------------------- | --------------------- | -------------------------------------------- |
+| `fuzz_lz4_block`           | `src/lz4_block.h`     | `LZ4_decompress_safe`, liblz4 1.10.0         |
+| `fuzz_snappy_block`        | `src/snappy_block.h`  | `snappy::RawUncompress`, google/snappy 1.2.2 |
+| `fuzz_gdeflate_tilestream` | `src/tilestream.h`    | none; invariants over what it accepts        |
+| `fuzz_zstd_frame`          | `src/zstd_frame.h`    | `ZSTD_getFrameHeader`, zstd 1.5.7            |
+| `fuzz_zstd_fse`            | `src/zstd_fse.h`      | `FSE_readNCount`, zstd 1.5.7                 |
+| `fuzz_zstd_literals`       | `src/zstd_literals.h` | `ZSTD_decompress`, zstd 1.5.7                |
 
 The property every target asserts is the fail-open direction: where the parser
 accepts, the reference must accept the same bytes and produce the identical
