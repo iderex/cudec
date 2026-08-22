@@ -317,6 +317,19 @@ cudec_add_test(zstd_literals_twin SOURCES zstd_literals_twin.cpp
 target_include_directories(zstd_literals_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(zstd_literals_twin PRIVATE HUF_STATIC_LINKING_ONLY)
+# Zstd repeat-offset resolution: the three-slot history, the zero-literals
+# index shift, the minus-one rule and the recency rotation (issue #197).
+# Host-side and GPU-less. It links zstd_full alone for the reason
+# zstd_oracle_smoke gives above, and because its rows are whole frames the
+# reference has to decide on through its frame entry point - a resolved offset
+# is not observable on its own. It compiles zstd_corpus.cpp for the reason
+# zstd_fse_twin does: the #185 fixtures are half of what it decodes, the other
+# half being repeat-offset-dense sources it compresses itself.
+cudec_add_test(zstd_repcode_twin SOURCES zstd_repcode_twin.cpp zstd_corpus.cpp
+               LIBS zstd_full)
+target_include_directories(zstd_repcode_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_definitions(zstd_repcode_twin PRIVATE HUF_STATIC_LINKING_ONLY)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
