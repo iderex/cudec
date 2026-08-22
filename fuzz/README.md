@@ -5,17 +5,34 @@ arbitrary bytes into the single-sourced parser from `src/`, runs the same host
 driver the CPU twin test runs, and compares the result in process against the
 hash-pinned reference decoder.
 
-| target              | parser               | reference                                    |
-| ------------------- | -------------------- | -------------------------------------------- |
-| `fuzz_lz4_block`    | `src/lz4_block.h`    | `LZ4_decompress_safe`, liblz4 1.10.0         |
-| `fuzz_snappy_block` | `src/snappy_block.h` | `snappy::RawUncompress`, google/snappy 1.2.2 |
+The list below names what each target reads and what answers it. It is not the
+authority for which targets exist - `CMakeLists.txt` is, and the job and the
+corpus check both derive the list from it rather than from here:
 
-The property each target asserts is the fail-open direction: where the parser
+```
+sed -n 's/^cudec_add_fuzz_target(\([A-Za-z0-9_]*\).*/\1/p' fuzz/CMakeLists.txt \
+  | grep -v '_selftest$' | LC_ALL=C sort -u
+```
+
+| target                     | parser               | reference                                    |
+| -------------------------- | -------------------- | -------------------------------------------- |
+| `fuzz_lz4_block`           | `src/lz4_block.h`    | `LZ4_decompress_safe`, liblz4 1.10.0         |
+| `fuzz_snappy_block`        | `src/snappy_block.h` | `snappy::RawUncompress`, google/snappy 1.2.2 |
+| `fuzz_gdeflate_tilestream` | `src/tilestream.h`   | none; invariants over what it accepts        |
+| `fuzz_zstd_frame`          | `src/zstd_frame.h`   | `ZSTD_getFrameHeader`, zstd 1.5.7            |
+| `fuzz_zstd_fse`            | `src/zstd_fse.h`     | `FSE_readNCount`, zstd 1.5.7                 |
+
+The property every target asserts is the fail-open direction: where the parser
 accepts, the reference must accept the same bytes and produce the identical
-output and size. The opposite direction is not asserted, because a parser that
-is stricter than its reference is the fail-closed contract working. Where a
-deliberate strictness exists it is pinned in the twin test rather than here
-(`tests/parser_twin.cpp` holds the LZ4 `offset == 0` family).
+output and size. The opposite direction is asserted only where a target can
+show the two sides were given the same question to answer, because a parser
+that is stricter than its reference is usually the fail-closed contract
+working, not a defect. `fuzz_zstd_fse` is the one that can: it hands the
+reference the alphabet and accuracy-log ceilings the unit under test was given,
+over a padded copy that keeps the reference's own end-of-buffer handling out of
+the comparison, and holds both sides to each other from there. Where a
+deliberate strictness exists instead, it is pinned in the twin test rather than
+here (`tests/parser_twin.cpp` holds the LZ4 `offset == 0` family).
 
 The Snappy target asserts one thing more, and it is the one a verdict cannot
 carry: the driver counts every element the parser handed back that a caller
