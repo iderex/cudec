@@ -438,7 +438,18 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeBlocks(
 
     uint64_t produced = 0;
     uint64_t pos = 0;
-    for (;;) {
+    /* THE TERMINATION FUEL (issue #72), the same shape the LZ4 frame walk in
+     * src/frame.cpp uses. Every block consumes at least its three header
+     * bytes, so a frame of `size` bytes admits at most size/3 + 1 steps, and
+     * the step after the last one a legal frame could take finds no three
+     * bytes to read - so the budget is out of reach of any input rather than
+     * a guess at one. What it buys is that a future bounds bug becomes a
+     * rejected frame instead of a loop that never leaves, which on a device
+     * is a warp that never retires: a hang rather than a failure, and the
+     * fail-closed contract does not admit either. */
+    uint64_t fuel = size / 3 + 1;
+    bool last_seen = false;
+    while (fuel-- != 0) {
         ZstdBlockHeader block;
         ZstdFrameReject frame_rung = kZstdFrameRejectNone;
         const cudec_status block_status = ZstdParseBlockHeader(
@@ -482,8 +493,19 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeBlocks(
 
         pos += static_cast<uint64_t>(3) + block.body_size;
         if (block.last_block) {
+            last_seen = true;
             break;
         }
+    }
+    if (!last_seen) {
+        /* The fuel ran out, which the bound above puts beyond every input:
+         * the block header refuses for want of its three bytes first, and
+         * that is the refusal reported here. It is not a rung of its own,
+         * because a rung no stream can reach is a refusal nobody could ever
+         * show firing. */
+        ZstdBlocksStop(report, kZstdBlocksStageBlockHeader,
+                       static_cast<int>(kZstdFrameRejectBlockHeaderTruncated));
+        return CUDEC_ERR_CORRUPT_INPUT;
     }
 
     /* Section 3.1.1.1.1 from the other side. Every path that would have
