@@ -4,14 +4,20 @@
  *
  * WHY THIS IS A TEST FILE AND NOT A UNIT. Every stage it calls is shipped -
  * the frame and block headers, the literals section, the FSE tables, the
- * sequences loop, the repeat-offset history, the content checksum - and the
- * two things it adds are not: the loop over a frame's blocks and the copy
- * that executes one sequence. Those are their own issues with their own
- * contracts, and a shipped decoder will make different choices about where
- * the state lives and how the copy is laid out on a device. What is here is
- * the least code that turns the stages into one byte string, so that
- * "the offset resolved to four" and "this literals section decodes" become
- * "the frame decodes to exactly what libzstd decodes it to".
+ * sequences loop, the repeat-offset history, the sequence execution, the
+ * content checksum - and the one thing it adds is not: the loop over a
+ * frame's blocks. That is its own issue with its own contract, and a shipped
+ * decoder will make different choices about where the per-frame state lives.
+ * What is here is the least code that turns the stages into one byte string,
+ * so that "the offset resolved to four" and "this literals section decodes"
+ * become "the frame decodes to exactly what libzstd decodes it to".
+ *
+ * THE COPY THAT EXECUTES A SEQUENCE USED TO BE HERE AND IS NOW SHIPPED. It
+ * moved to src/zstd_exec.h under issue #198, which is what makes the corpus
+ * runs below a statement about the decoder rather than about a copy loop that
+ * only tests ever compile. The driver still owns the block loop and the
+ * per-frame state it carries, because that is the sub-issue that has not
+ * landed.
  *
  * ALL OF THE STATE IS PER-FRAME AND NONE OF IT IS PER-BLOCK. The Huffman
  * table a Treeless literals section reuses, the three FSE tables a Repeat
@@ -27,6 +33,7 @@
 #ifndef CUDEC_TESTS_ZSTD_TWIN_DRIVER_H
 #define CUDEC_TESTS_ZSTD_TWIN_DRIVER_H
 
+#include "zstd_exec.h"
 #include "zstd_frame.h"
 #include "zstd_literals.h"
 #include "zstd_repcode.h"
@@ -194,8 +201,18 @@ inline Run DecodeFrame(const Bytes& frame, uint64_t dst_capacity) {
         return run;
     }
 
+    /* The frame's whole output, sized to what it declares, which the subset
+     * guarantees exists and the check above bounded. One byte of slack so the
+     * buffer has an address even for a frame declaring nothing; the capacity
+     * handed to the units is the declared size and never the slack. */
+    run.output.assign(static_cast<size_t>(header.frame_content_size) + 1, 0);
+    const uint64_t capacity = header.frame_content_size;
+    uint64_t produced = 0;
+
     uint64_t pos = header.header_size;
     Bytes literals;
+    std::vector<uint64_t> offsets;
+    std::vector<uint64_t> destinations;
     for (;;) {
         cudec_detail::ZstdBlockHeader block;
         const cudec_status block_status = cudec_detail::ZstdParseBlockHeader(
@@ -209,9 +226,25 @@ inline Run DecodeFrame(const Bytes& frame, uint64_t dst_capacity) {
         run.blocks++;
         const unsigned char* body = frame.data() + pos + 3;
         if (block.block_type == cudec_detail::kZstdBlockTypeRaw) {
-            run.output.insert(run.output.end(), body, body + block.body_size);
+            if (block.body_size > capacity - produced) {
+                Stop(&run, kStageContentSize, 0, CUDEC_ERR_OUTPUT_TOO_SMALL,
+                     "the frame regenerated more than the destination");
+                return run;
+            }
+            for (uint64_t i = 0; i < block.body_size; i++) {
+                run.output[static_cast<size_t>(produced + i)] = body[i];
+            }
+            produced += block.body_size;
         } else if (block.block_type == cudec_detail::kZstdBlockTypeRle) {
-            run.output.insert(run.output.end(), block.block_size, body[0]);
+            if (block.block_size > capacity - produced) {
+                Stop(&run, kStageContentSize, 0, CUDEC_ERR_OUTPUT_TOO_SMALL,
+                     "the frame regenerated more than the destination");
+                return run;
+            }
+            for (uint64_t i = 0; i < block.block_size; i++) {
+                run.output[static_cast<size_t>(produced + i)] = body[0];
+            }
+            produced += block.block_size;
         } else {
             /* A block may regenerate at most the block maximum, which is what
              * sizes the literals buffer: the section's own bound is checked
@@ -219,20 +252,20 @@ inline Run DecodeFrame(const Bytes& frame, uint64_t dst_capacity) {
             const uint64_t block_max =
                 cudec_detail::ZstdLiteralsBlockMaximum(header.window_size);
             literals.assign(static_cast<size_t>(block_max), 0);
-            uint64_t produced = 0;
+            uint64_t literals_produced = 0;
             uint64_t consumed = 0;
             cudec_detail::ZstdLiteralsReject literals_rung =
                 cudec_detail::kZstdLiteralsRejectNone;
             if (cudec_detail::ZstdDecodeLiterals(
                     body, block.body_size, header.window_size,
                     &driver.literals_table, &driver.literals_scratch,
-                    literals.data(), literals.size(), &produced, &consumed,
-                    &literals_rung) != CUDEC_OK) {
+                    literals.data(), literals.size(), &literals_produced,
+                    &consumed, &literals_rung) != CUDEC_OK) {
                 Stop(&run, kStageLiterals, static_cast<int>(literals_rung),
                      CUDEC_ERR_CORRUPT_INPUT, "literals section refused");
                 return run;
             }
-            literals.resize(static_cast<size_t>(produced));
+            literals.resize(static_cast<size_t>(literals_produced));
 
             const unsigned char* section = body + consumed;
             uint64_t remaining = block.body_size - consumed;
@@ -289,25 +322,20 @@ inline Run DecodeFrame(const Bytes& frame, uint64_t dst_capacity) {
                 }
             }
 
-            size_t literal_pos = 0;
+            /* The repeat-offset history is a serial chain over the frame and
+             * is resolved for every sequence before any byte moves, which is
+             * the shape the execution below asks for: with the distances in
+             * hand each copy is independent of every other. The rungs stay
+             * this stage's, so a twin can still say which of the two refused.
+             */
+            offsets.assign(sequences.size(), 0);
             for (size_t s = 0; s < sequences.size(); s++) {
                 const cudec_detail::ZstdSequence& sequence = sequences[s];
-                if (literal_pos + sequence.literals_length > literals.size()) {
-                    Stop(&run, kStageExecute, 0, CUDEC_ERR_CORRUPT_INPUT,
-                         "a sequence asked for literals that are not there");
-                    return run;
-                }
-                for (uint32_t i = 0; i < sequence.literals_length; i++) {
-                    run.output.push_back(literals[literal_pos + i]);
-                }
-                literal_pos += sequence.literals_length;
-
-                uint64_t resolved = 0;
                 cudec_detail::ZstdRepcodeReject repcode_rung =
                     cudec_detail::kZstdRepcodeRejectNone;
                 if (cudec_detail::ZstdRepcodeResolve(
                         &driver.repcodes, sequence.offset_value,
-                        sequence.literals_length, &resolved,
+                        sequence.literals_length, &offsets[s],
                         &repcode_rung) != CUDEC_OK) {
                     Stop(&run, kStageRepcode, static_cast<int>(repcode_rung),
                          CUDEC_ERR_CORRUPT_INPUT, "repeat offset refused");
@@ -320,37 +348,34 @@ inline Run DecodeFrame(const Bytes& frame, uint64_t dst_capacity) {
                     cudec_detail::kZstdRepcodeMaxSlotValue) {
                     run.repeats++;
                 }
-                /* Two bounds, and they are different statements. A match may
-                 * not reach before the output, which is what makes the index
-                 * below defined; and it may not reach further back than the
-                 * window, which is what the format promises a decoder it will
-                 * never have to hold. */
-                if (resolved > run.output.size() ||
-                    resolved > header.window_size) {
-                    Stop(&run, kStageExecute, 0, CUDEC_ERR_CORRUPT_INPUT,
-                         "a match reached past the window or before the "
-                         "output");
-                    return run;
-                }
-                const size_t from = run.output.size() - resolved;
-                for (uint32_t i = 0; i < sequence.match_length; i++) {
-                    run.output.push_back(run.output[from + i]);
-                }
-                if (run.output.size() > dst_capacity) {
-                    Stop(&run, kStageContentSize, 0,
-                         CUDEC_ERR_OUTPUT_TOO_SMALL,
-                         "the frame regenerated more than the destination");
-                    return run;
-                }
             }
-            for (size_t i = literal_pos; i < literals.size(); i++) {
-                run.output.push_back(literals[i]);
+
+            destinations.assign(sequences.size() + 1, 0);
+            cudec_detail::ZstdExecPlan plan;
+            cudec_detail::ZstdExecReject exec_rung =
+                cudec_detail::kZstdExecRejectNone;
+            cudec_status exec_status = cudec_detail::ZstdExecPrefixSum(
+                sequences.empty() ? 0 : sequences.data(),
+                static_cast<uint32_t>(sequences.size()), literals.size(),
+                block_max, destinations.data(),
+                static_cast<uint32_t>(destinations.size()), &plan, &exec_rung);
+            if (exec_status != CUDEC_OK) {
+                Stop(&run, kStageExecute, static_cast<int>(exec_rung),
+                     exec_status, "sequence destinations refused");
+                return run;
             }
-        }
-        if (run.output.size() > dst_capacity) {
-            Stop(&run, kStageContentSize, 0, CUDEC_ERR_OUTPUT_TOO_SMALL,
-                 "the frame regenerated more than the destination");
-            return run;
+            exec_status = cudec_detail::ZstdExecuteBlock(
+                sequences.empty() ? 0 : sequences.data(),
+                static_cast<uint32_t>(sequences.size()), destinations.data(),
+                offsets.empty() ? 0 : offsets.data(),
+                literals.empty() ? 0 : literals.data(), literals.size(), &plan,
+                header.window_size, run.output.data(), capacity, &produced,
+                &exec_rung);
+            if (exec_status != CUDEC_OK) {
+                Stop(&run, kStageExecute, static_cast<int>(exec_rung),
+                     exec_status, "sequence execution refused");
+                return run;
+            }
         }
         pos += 3 + block.body_size;
         if (block.last_block) {
@@ -359,12 +384,15 @@ inline Run DecodeFrame(const Bytes& frame, uint64_t dst_capacity) {
     }
 
     /* Section 3.1.1.1.1: where a content size is declared it is exact, and a
-     * frame in this subset always declares one. */
-    if (run.output.size() != header.frame_content_size) {
+     * frame in this subset always declares one. The buffer was sized to that
+     * number, so a frame producing MORE has already been refused for want of
+     * room; what is left for this check is the frame that produced less. */
+    if (produced != header.frame_content_size) {
         Stop(&run, kStageContentSize, 0, CUDEC_ERR_CORRUPT_INPUT,
              "the frame produced other than its declared content size");
         return run;
     }
+    run.output.resize(static_cast<size_t>(produced));
 
     if (header.content_checksum) {
         const uint64_t digest =

@@ -330,6 +330,19 @@ cudec_add_test(zstd_repcode_twin SOURCES zstd_repcode_twin.cpp zstd_corpus.cpp
 target_include_directories(zstd_repcode_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(zstd_repcode_twin PRIVATE HUF_STATIC_LINKING_ONLY)
+# Zstd sequence execution: the prefix sum that names every sequence's
+# destination, the literal and match copies it addresses, and the two bounds on
+# a resolved offset (issue #198). Host-side and GPU-less, and the ONE Zstd twin
+# that links no oracle: the reference exposes no entry point that executes a
+# sequence stream, so what the reference has an opinion about is a whole frame
+# and that parity lives in zstd_entropy_twin below, which drives this unit for
+# every compressed block it decodes. What is here is the branch set a
+# compressor cannot emit - the offset one past a bound, the destination array
+# that disagrees with its own sequences, the block past its maximum - written
+# by hand, one per rung. It compiles no corpus for the same reason.
+cudec_add_test(zstd_exec_twin SOURCES zstd_exec_twin.cpp)
+target_include_directories(zstd_exec_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The whole M5 entropy stage over both corpora, two-directionally (issue
 # #223). It is the only Zstd test that decodes a FRAME: the sibling twins each
 # prove one unit against the reference entry point that matches it, and none of
