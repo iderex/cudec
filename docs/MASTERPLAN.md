@@ -1067,11 +1067,44 @@ is the interesting one for coverage**: the header defines it as "create a
 valid stream, but only emit uncompressed blocks", so it reaches the stored
 block type by construction rather than by luck.
 
-**Interop evidence: the DirectStorage `GDeflateTest` vectors.** These are
-the bit-exactness check against the shipping runtime, and they are the one
-piece of evidence that comes from a different implementation lineage than
-the libdeflate fork. Their intake is its own issue; what this section fixes
-is that they are load-bearing rather than decorative.
+**Interop evidence: there is none, and this paragraph claimed there was.**
+It recorded the DirectStorage `GDeflateTest` vectors as the one piece of
+evidence coming from a different implementation lineage than the libdeflate
+fork, and as load-bearing rather than decorative. Both halves are wrong, and
+both were found by reading the upstream tree instead of its description.
+
+There are no vectors:
+
+    gh api 'repos/microsoft/DirectStorage/git/trees/main?recursive=1' \
+      --jq '[.tree[]|select(.path|startswith("GDeflate/GDeflateTest/"))|.path]'
+    ["GDeflate/GDeflateTest/CMakeLists.txt","GDeflate/GDeflateTest/GDeflateTest.cpp"]
+
+`GDeflateTest.cpp` opens no file. It builds its inputs at run time from
+`std::default_random_engine`, compresses them and validates the result, so
+nothing is written out that anyone could check in.
+
+And the lineage is not a second one. The `GDeflate/` library those two files
+call takes its codec from a submodule, at the commit this project already
+pins in `cmake/CudecGDeflateOracle.cmake`:
+
+    gh api repos/microsoft/DirectStorage/contents/GDeflate/3rdparty/libdeflate \
+      --jq '{submodule_git_url, sha}'
+    {"sha":"8ba9502fb30d2bf728592d121f0d402e40c8cb05","submodule_git_url":"https://github.com/NVIDIA/libdeflate"}
+
+`GDeflate::Decompress` allocates that fork's decompressor and calls
+`libdeflate_gdeflate_decompress`, the same entry `tests/oracle_gdeflate.cpp`
+already drives. Bytes taken from there and diffed here would be one copy of
+libdeflate agreeing with another, and they would read as cross-implementation
+evidence because of where the wrapper lives, which is worse than holding
+none.
+
+What section 11.1 says about `GDeflateTest` stays true and is a different
+statement: upstream does cross-check the shipping runtime against that
+reference codec, in both directions, so bit-exact interop is the contract
+tested **there**. The runtime is the one genuinely external decoder in the
+picture, it is reached through `dstorage.h` as a Windows binary component,
+and getting its bytes into this tree is a host question rather than a
+harness one. Issue #169 carries what is left of the intake.
 
 **Independent second decoder: rejected.** The candidate was `sk-zk/GisDeflate`
 (MIT, C#). The decision is no, and the reason is not the harness cost.
@@ -1086,14 +1119,15 @@ is a managed .NET component in a tree that carries no .NET anywhere, for
 CI and for local runs - but that cost is what would have been weighed if
 the coverage had been genuine. It is not.
 
-**What that loses, stated rather than waved away.** M4 has no
-independent-lineage oracle for the _reject_ direction on arbitrary bytes:
-where the libdeflate fork refuses a stream, no second implementation
-confirms it should. Three things compensate, and none of them is a full
-substitute:
+**What that loses, stated rather than waved away, and it is more than this
+passage admitted.** M4 has no independent-lineage oracle for the _reject_
+direction on arbitrary bytes: where the libdeflate fork refuses a stream, no
+second implementation confirms it should. It has none for the accept
+direction either. This list named three compensations and put the
+`GDeflateTest` vectors first, as "lineage-independent but cover the accept
+direction only, on a fixed set"; the paragraph above records why that is
+wrong in both of its terms. Two are left, and neither is a full substitute:
 
-- the `GDeflateTest` vectors, which are lineage-independent but cover the
-  accept direction only, on a fixed set;
 - cudec's own CPU twin, which is written from the draft rather than from
   the fork, so a fork-specific parsing bug does not propagate into it by
   construction - the twin is the second implementation, and this section

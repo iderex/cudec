@@ -26,9 +26,12 @@ each carry that MIT notice together with an `SPDX-License-Identifier:
 Apache-2.0` line and an NVIDIA copyright.
 
 **The GDeflate subtree of `microsoft/DirectStorage`**, which carries its own
-Apache-2.0 `LICENSE` with NVIDIA and Microsoft copyrights, and whose
-`GDeflateTest` vectors are the one piece of interop evidence in M4 that comes
-from a different implementation lineage than the fork above.
+Apache-2.0 `LICENSE` with NVIDIA and Microsoft copyrights. It is read as the
+de-facto reference implementation. It supplies no test vectors and no second
+lineage: `GDeflate/GDeflateTest` is two source files that build their inputs
+at run time, and the reference codec they exercise reaches the same NVIDIA
+libdeflate fork pinned above. `docs/MASTERPLAN.md` section 11.7 carries the
+readings and what their absence costs.
 
 **The IETF draft `draft-uralsky-gdeflate-00`**, "GDEFLATE bitstream format
 specification", used under the BCP 78 terms it is published with. It is one
