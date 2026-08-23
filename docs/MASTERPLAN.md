@@ -1001,7 +1001,8 @@ survived reading the text.
 
 Written here so the panel starts from an agenda rather than rediscovering
 it. None of these is answered above, and answering them is not this
-section's job.
+section's job. Section 13.2 is where the panel answered them, one by one
+and in this order.
 
 1. **Table residency.** One table set per block is read by all 32 lanes
    every round (D6). Shared memory, registers, or a hybrid, and what that
@@ -1551,3 +1552,577 @@ read as a run that proved something:
   argued to be unreachable for every input the guards admit, so a firing cap
   is a bounds bug that the cap converted into a rejection, and the bug is the
   finding rather than the rejection.
+
+## 13. M4 GDeflate kernel design (settled via the #94 design panel, 2026-08-23)
+
+Three candidate shapes were developed against the section 11 dossier and
+scored on one piece of arithmetic, the shared-memory footprint of a decode
+table set against the resident-warp target section 9 fixed for this kernel
+family. Two of the three are dead on that arithmetic alone and are recorded
+here so nobody re-proposes them. The panel was run inside this work rather
+than by a second person, which is stated here rather than implied; the
+arithmetic below is reproducible from the script it carries, and that is
+what stands in for a second judge.
+
+**One kernel. One warp per 64 KiB page over a grid-stride loop. The 32
+lanes are the format's 32 substreams, so the parse is genuinely
+cooperative rather than section 9's redundant lockstep. One table set per
+block in shared memory, with a fixed footprint that no input can grow, and
+the copy engine, failure contract and determinism discipline carried over
+from section 9 unchanged.**
+
+### 13.1 The arithmetic that forces the shape
+
+The binding resource is shared memory per resident warp. Section 9's
+occupancy plan targets at most 64 registers per thread for at least 32
+warps per SM, and section 9's own two-phase disproof reads an SM's usable
+shared memory as roughly 100 KiB, the sm_86 figure from the vendor's
+compute-capability table. sm_80, the baseline, has more of it; sm_86, the
+tuning target, is therefore the binding case. At 32 warps per SM the budget
+is 100 KiB / 32 = 3200 bytes of shared memory per warp, and every candidate
+below is scored against that one number.
+
+**Candidate A, two-level decode tables in shared memory, is dead.** A
+GDeflate block's code lengths are attacker-chosen inside what the format
+admits, so the table has to be sized for the worst legal case and not for a
+corpus. That worst case is computable in closed form. A root of R bits
+resolves every code no longer than R in one lookup; each root slot whose
+codes run longer gets a subtable of `2^d` entries, where d is the deepest
+code under that slot minus R. A complete subcode of depth d costs at least
+d+1 symbols, and filling k root slots with codes of length at most R costs
+at least `popcount(k)` symbols, so the worst case is a small knapsack over
+the symbol budget:
+
+```python
+def worst(n, R, L):
+    root = 1 << R
+    best = 0
+    for s in range(0, min(root, n) + 1):
+        budget = n - bin(root - s).count("1")
+        if budget < 0:
+            continue
+        dp = [[-1] * (budget + 1) for _ in range(s + 1)]
+        dp[0][0] = 0
+        for d in range(1, L - R + 1):
+            cost, val = d + 1, 1 << d
+            for c in range(1, s + 1):
+                for b in range(cost, budget + 1):
+                    if dp[c - 1][b - cost] >= 0:
+                        dp[c][b] = max(dp[c][b], dp[c - 1][b - cost] + val)
+        best = max(best, root + max(dp[s]))
+    return best
+
+
+for n in (286, 32):
+    print(n, min((worst(n, R, 15), R) for R in range(4, 13)))
+```
+
+    286 (2504, 10)
+    32 (642, 8)
+
+So the cheapest two-level literal/length table any root can produce is 2504
+entries, at a 10-bit root, and the cheapest distance table is 642 entries
+at an 8-bit root. At two bytes per entry, the narrowest entry that still
+carries a symbol index up to 285 and a code length up to 15, that is
+(2504 + 642) x 2 = 6292 bytes per warp. It is 1.97 times the 3200-byte
+budget, and a 4-warp block of it takes an SM to 16 resident warps, half the
+family target. The 2048-entry figure that circulated in the M4 planning
+before this pass is not a bound on anything, and the script above is where
+that was found.
+
+**Candidate B, a phase split that materializes the symbol stream, is dead
+for the reason section 9 killed table-in-smem two-phase.** A 64 KiB page
+decodes to at most 65536 bytes, so its symbol stream can be 65536 literals;
+at 4 bytes per record that is 256 KiB for one page, 2.6 times an SM's
+shared memory, for a single tile rather than for a warp. Moving that
+scratch to global memory does not rescue it: it would put a per-tile
+workspace into a batch ABI that has none today, and it would spend two
+passes over that scratch at full residency to accelerate a stage that is
+entropy-bound rather than bandwidth-bound.
+
+**Candidate C, block per tile, buys nothing the format can use.** Thirty
+two substreams are 32 lanes, so a 128-thread block leaves 96 lanes idle
+through every parse round, and the only work they could take is the copy
+fan-out, which is ordered by the in-tile LZ77 dependency and therefore
+cannot run ahead of the parse without the phase split candidate B already
+rules out. It also turns the section 10 end-of-block quiesce rule from a
+warp-level ballot into a block-wide barrier on every round.
+
+**The shape that survives is the fixed-footprint table.** The decode state
+is sized so that no input can change how much shared memory a warp holds,
+which is the anti-pattern rule section 9 states for packed fields, applied
+to an allocation instead of to a field. Per warp:
+
+| what                                              | bytes |
+| ------------------------------------------------- | ----- |
+| canonical symbol order, 286 lit/len + 32 distance | 636   |
+| per-length counts, first codes and first indices  | 192   |
+| literal/length root accelerator, 10 bits          | 2048  |
+| distance root accelerator, 7 bits                 | 256   |
+| total                                             | 3132  |
+
+The symbol-order array and the per-length arrays are a complete canonical
+decoder on their own, and their size is fixed by the alphabet rather than
+by the code lengths, so the worst case above cannot arise. The two root
+tables are accelerators over that decoder: a code no longer than its root
+resolves in one lookup, and a longer one falls back to the length-by-length
+walk, which is the case that is rare by construction, because a long code
+is what a rare symbol gets. The footprint is 3132 bytes against the
+3200-byte budget, so a 4-warp block takes 12528 bytes, an SM fits eight of
+those blocks inside 100 KiB, and that is exactly the 32 resident warps
+section 9 asks for. The 68 bytes of margin per warp are slack for the
+allocation granularity rather than a rounding accident.
+
+Registers stay where the draft puts them. Section 11.2's per-lane state is
+a bit buffer and a count of valid bits, which `src/gdeflate_schedule.h`
+already carries as one 64-bit buffer per lane
+(`kGDeflateLaneBufferBits`). Per-lane state has no reason to sit in shared
+memory, and moving it there would put the one thing that is genuinely
+private into the one resource that is shared.
+
+### 13.2 The five open questions from 11.6, answered
+
+**Table residency** is settled by 13.1: shared memory, at a footprint no
+input can grow, with the two-level table rejected on its worst case rather
+than on its average.
+
+**The end-of-block quiesce without divergence.** Section 10 forbids every
+lane after the one that decoded code 256 from consuming bits. The decode
+round is therefore speculative and its commit is predicated: every lane
+decodes, `__ballot_sync` collects the lanes that produced 256, `__ffs` of
+that mask names the first of them, and each lane commits its new bit
+position only if its own index is at or below that lane. A lane that must
+not have consumed keeps the bit position it entered the round with, which
+is a select rather than a branch, and the warp stays convergent. The rule
+is enforced by not committing, never by rolling back.
+
+**Bounding the tail round.** Section 11.5 forbids assuming any bytes past
+the stream, so the refill is bounded by the page's word count, which comes
+from the caller's compressed size rather than from the bits. The refill
+schedule is warp-uniform, so that is one comparison per refill and not one
+per lane, and `src/gdeflate_schedule.h` already fails it closed with a
+frozen cursor and a sticky failure. A round that does not refill pays
+nothing for it.
+
+**The desynchronization threat.** The deliberate look 11.6 asked for, with
+its answer: there is no cheap detector during a walk, there are two free
+ones at the end of it, and both are mandatory rather than optional. The
+first is exact word consumption, since a correct decode leaves the cursor
+inside the page's last word and a desynchronized one lands anywhere. The
+second is exact output size, which GDeflate itself does not carry (11.4)
+but the envelope does, so the declared uncompressed size is compared
+against what was produced rather than trusted to size a buffer. Neither
+catches a desynchronization early; together they turn one into a rejection
+instead of a wrong answer, which is the whole of what a checksum-less
+format offers. Every bound stays enforced at its point of use, as 11.2
+requires.
+
+**The stored-block path** is not specialized in the first kernel. D4 makes
+it an entropy-shaped path like any other, and whether it deserves a fast
+path is a measurement question that belongs to the perf pass, filed as #206
+against a measured block-type mix.
+
+### 13.3 The validation ladder
+
+Every value read from the stream is checked before its first use as an
+address, a length or an offset, and the ladder is the M4 instance of
+section 9's rather than a second discipline:
+
+- the page is at least the 128 bytes 11.2 makes the minimum, and its word
+  count is derived from the caller's compressed size, never from the bits;
+- the reserved block type never appears, and a block header round that
+  claims one is a reject;
+- the code-length alphabet is checked for oversubscription and for
+  incompleteness in both directions, since an incomplete literal/length
+  code admits a decode that walks off the end of the symbol order;
+- a repeat code 16 with nothing to repeat, and a 17 or 18 run that carries
+  the length vector past the 318 the format allows, are rejects;
+- a distance greater than the bytes already produced in this tile is a
+  reject, because a tile is independent and a match may never reach before
+  its start;
+- a stored block whose declared length overruns the page or the remaining
+  destination capacity is a reject, and D3 removes the one's complement
+  that would otherwise have caught it, so this bound is the only one there
+  is;
+- a block that ends without its end-of-block symbol is a reject, and a lane
+  that consumes bits after the end-of-block lane is prevented rather than
+  detected, per 13.2;
+- the refill is bounded on every round, per 13.2;
+- success only on exact word consumption and exact declared output size,
+  per 13.2.
+
+The round loop carries fuel in the shape section 12.8 records for Zstd: a
+cap on rounds per page derived from the page's word count, argued to be
+unreachable for every input the bounds above admit, so a firing cap is a
+bug that the cap converted into a rejection and the bug is the finding.
+
+**Failure contract**, unchanged from section 9: on any reject
+`bytes_written` is zero and the status is non-OK, the destination up to the
+failure point is unspecified and is never presented as success, and every
+bound is checked before the load rather than after it, because on a GPU an
+out-of-bounds read can fault the launch and poison the whole batch rather
+than one tile.
+
+### 13.4 The batch entry
+
+`cudec_gdeflate_decompress_batch` takes raw pages with a caller-provided
+size array, which is the draft's external-enveloping model (11.4) and the
+shape `cudec_lz4_decompress_batch` already froze. One page is one chunk, so
+per-page status maps onto `cudec_chunk_result` with no new vocabulary and
+the 16-byte layout its static assertions pin does not move. The kernel is
+envelope-ignorant: the DirectStorage TileStream container is parsed on the
+host, above this entry, and hands it pages. That split is #216's to
+implement and #177's to drive, and neither is redesigned here.
+
+A page whose declared uncompressed size exceeds the destination capacity
+the caller gave is `CUDEC_ERR_OUTPUT_TOO_SMALL` with `bytes_written` zero,
+and the declared size never sizes an allocation, per the anti-pattern rule.
+
+### 13.5 The worst case, and what would falsify this design
+
+The M4 adversarial corpus is not LZ4's `worst-4Bmatch` in another format.
+What costs this kernel is rounds and refills per decoded byte, so the shape
+to construct is a page that maximizes them: symbols spread so that every
+lane consumes near its watermark on every round, copies split across two
+rounds on the same lane (section 11), block headers frequent enough that
+the one-active-lane header rounds are a real share of the total, and code
+lengths long enough that the root accelerator misses and the canonical walk
+runs. The quantity that corpus locks is rounds per decoded byte, and its
+generator asserts a floor on it, so a generator that stops being
+adversarial reds CI rather than quietly reporting a better number. That
+corpus is #226 and the density floor is its proof.
+
+What would falsify this design, recorded before it is built:
+
+- A measured table-build cost per block that is a large share of a page's
+  decode time. The fixed-footprint table trades a bounded build for a
+  slower tail on long codes and is chosen on memory rather than on time. If
+  the build dominates, the answer is a smaller root and a cheaper build,
+  not the two-level table 13.1 rejected, whose worst case is what made it
+  dead.
+- A measured root-accelerator miss rate high enough that the canonical
+  walk, rather than the parse, sets the round time. That is a measurement
+  against the real corpus and against #226's adversarial one, the two are
+  allowed to disagree, and the adversarial one is the number that binds.
+- Achieved registers above 64 per thread, which would put resident warps
+  below the 32 this whole budget is derived from and invalidate the
+  3200-byte figure rather than merely miss a target. Registers are read out
+  at the kernel pull request and recorded, as section 9 requires.
+- Any input that makes the shared-memory footprint depend on the stream.
+  That is the anti-pattern rule broken, and it is a defect in this design
+  rather than a tuning result.
+
+## 14. M5 Zstd kernel shape (settled via the #208 design panel, 2026-08-23)
+
+**One kernel, fused, with phase barriers inside the block, at block per
+frame with 128 threads.** The frame is the chunk, as 12.1 fixes; the block
+of four warps is what decodes it; and the phases inside a Zstd block are
+separated by `__syncthreads()` rather than by a launch. Shared memory holds
+one entropy table set per frame, the destination buffer holds everything
+else, and no workspace is added to the batch ABI.
+
+As in 13, the candidates were developed and scored inside this work rather
+than by a second person; the arithmetic below is the evidence in place of a
+second judge, and every constant it uses is read out of the tree or out of
+the section it cites rather than recalled.
+
+### 14.1 The table set is the whole budget
+
+What a frame must hold across a block boundary is fixed by 12.1 and by the
+subset in 12.2, and the ceilings are already constants in the tree:
+
+| table                                 | entries    | bytes |
+| ------------------------------------- | ---------- | ----- |
+| Literal_Lengths FSE, accuracy log 9   | 512 x 4 B  | 2048  |
+| Match_Lengths FSE, accuracy log 9     | 512 x 4 B  | 2048  |
+| Offsets FSE, accuracy log 8           | 256 x 4 B  | 1024  |
+| Literals Huffman, table log 11        | 2048 x 2 B | 4096  |
+| Huffman weight description FSE, log 6 | 64 x 4 B   | 256   |
+| total per frame                       |            | 9472  |
+
+The three sequence accuracy logs are `kZstdLitLenAccuracyLogMax`,
+`kZstdMatchLenAccuracyLogMax` and `kZstdOffsetAccuracyLogMax` in
+`src/zstd_fse.h`; the literals tree depth is `kZstdLiteralsMaxTableLog` in
+`src/zstd_literals.h`, which is the format's own eleven-bit limit and not a
+project choice; the weight description's ceiling is
+`kZstdHufWeightAccuracyLogMax` in `src/zstd_huf.h`. A four-byte FSE entry
+is a next state, a symbol and a bit count, and a two-byte Huffman entry is
+a symbol and a bit count.
+
+That 9472 bytes is per FRAME and not per warp, because 12.1 makes the
+entropy state cross block boundaries inside a frame and not between frames.
+It is the number that decides the granularity.
+
+### 14.2 Warp per frame is dead, and 128 threads is the smallest block that is not
+
+An SM's usable shared memory is the roughly 100 KiB section 9's two-phase
+disproof already reads for sm_86, the tuning target and the tighter of the
+two architectures. So an SM holds `floor(102400 / 9472) = 10` frames,
+whatever else it does.
+
+Section 9's occupancy plan is at most 64 registers per thread for at least
+32 resident warps per SM, and 32 warps is 1024 threads, which is exactly
+the 65536 registers an SM has at 64 per thread. Against those two limits:
+
+- **Warp per frame** makes ten frames ten warps. Shared memory becomes the
+  binding resource and costs 22 of the 32 warps the register budget would
+  have paid for. The table set is per frame, so a warp-per-frame kernel
+  pays the whole 9472 bytes for 32 lanes.
+- **Block per frame, four warps (128 threads)** needs eight blocks for 32
+  warps, and eight blocks take 75776 bytes, inside the 100 KiB with room
+  left. Registers bind, shared memory does not, and the family's occupancy
+  target is met rather than argued down.
+- **Block per frame, two warps (64 threads)** needs sixteen blocks for 32
+  warps, and sixteen blocks want 151552 bytes, which is over. Shared memory
+  binds again at ten blocks and twenty warps.
+- **Block per frame, eight warps (256 threads)** meets 32 warps at four
+  blocks and fits easily, but it puts four frames per SM in flight where
+  128 threads puts eight, and inter-frame parallelism is the only
+  parallelism M5 sells (12.1). Fewer, wider blocks is the wrong direction
+  for a batch decoder.
+
+So 128 threads is the smallest block size at which the table set stops
+being the binding resource, and being the smallest is the point: it
+maximizes the number of frames an SM decodes at once.
+
+### 14.3 The phase pipeline is dead on its intermediates
+
+The one production-grade decomposition to weigh is a phase pipeline of
+separate passes, parse then table init then literals then sequence decode
+then prefix sums then execution, with the intermediates in global memory.
+The arithmetic that kills it here is the size of those intermediates.
+`Number_of_Sequences` is a three-byte varint biased by
+`kZstdSeqCountThreeByteBias` (0x7F00) in `src/zstd_seq.h`, so a block may
+declare `0xFFFF + 0x7F00 = 98047` sequences. At twelve bytes for a
+literals length, a match length and an offset, that is about 1.1 MiB of
+tuples for one block, and at the eight resident frames per SM of 14.2
+across an RTX 3080's 68 SMs it is on the order of 600 MiB of scratch for
+the batch, live for the whole launch.
+
+That scratch has nowhere to come from. `cudec_lz4_decompress_batch` takes
+source pointers, destination pointers, capacities and a results array, and
+nothing else; a phase pipeline would have to add a workspace argument to
+the batch ABI, or allocate behind the caller's back inside an entry that is
+asynchronous on the caller's stream and today allocates nothing. Neither is
+a cost this shape has earned, and the fused shape does not incur it.
+
+**The fused shape needs no scratch at all, and 12.2 is why.** The subset
+requires `Frame_Content_Size` to be present, so the destination region for
+a frame is known before the first byte is decoded. A block's literals are
+decoded into the TAIL of the frame's remaining destination region: with `R`
+bytes of declared output left at the start of the block and `L` literal
+bytes regenerated, they land at `[P + R - L, P + R)`. Sequence `i` then
+writes its literal run at `P + prefix_i`, and `prefix_i` is the literals
+before it plus the match bytes before it, so `prefix_i <= R - L +
+litprefix_i` for every `i`. Every literal run therefore moves toward lower
+addresses, and run `i` ends at or before run `i+1`'s source begins, so
+executing them in increasing order is safe in place. The prefix sum itself
+is a warp scan with a running carry rather than a materialized array, which
+is what `src/zstd_exec.h` already says the device form of that unit is.
+
+That leaves one thing in shared memory, the table set, and one thing in
+global memory, the caller's destination. The phase barriers that a fused
+kernel needs are `__syncthreads()` between the literals phase and the
+sequence phase of each block, which is a barrier inside a block of four
+warps and not a launch.
+
+### 14.4 What this keeps from the family and what it breaks
+
+Kept: the frame-to-chunk mapping and the batch ABI shape; the failure
+contract, with `bytes_written` zero on every reject; determinism, since
+every copy is a pure function of lower addresses exactly as section 9
+records; the overlap semantics `src/zstd_exec.h` already carries; and the
+rule that every stream-decoded value is checked before its first use.
+
+Broken, knowingly: section 9's "no shared memory" property, which section 4
+already records as an LZ4 decision rather than a family invariant, and
+section 9's redundant 32-lane lockstep parse, which cannot survive a format
+whose entropy decode is serial per stream. The `template<class Parser>`
+chunk-decoder seam section 9 describes is not extended to M5: a Zstd frame
+is not a chunk with a different parser, it is a block loop with its own
+phases, and pretending otherwise would put a parser interface between the
+phases that has to carry all of them.
+
+### 14.5 The M5 pull-request ladder
+
+The entropy and format rungs landed first and are closed: the frame and
+block header walk, the FSE and Huffman table machinery, the literals
+section in all four types, the sequences section and its three-state loop,
+repcode resolution, sequence execution against a prefix sum, and the block
+loop that carries state across blocks, each as a host-twinnable header
+under `src/` with its twin under CI. The validation ladder, the fuel story
+and the worst-case corpus families are recorded in 12.7 to 12.9.
+
+What is left, in order, each its own gated pull request:
+
+1. The intra-kernel work assignment, which is #213's to settle and is
+   deliberately not settled here: which lanes run the serial FSE cores,
+   how the four literal streams are assigned, and how the sequence
+   destinations are scanned.
+2. The kernel and `cudec_zstd_decompress_batch` (#203), minimal-correct,
+   behind the frozen batch contract, with achieved registers and occupancy
+   read out and recorded at that pull request.
+3. The device gate set: determinism, two-directional mutant reject parity
+   against libzstd, and the capacity adversarials.
+4. The first recorded GPU baselines and the per-phase split (#231, #233).
+   Numbers and kernel never move in the same pull request.
+5. The measured perf levers (#234 to #239), each accepted only on a
+   recorded improvement with every gate green.
+
+Nothing above re-cuts a closed issue. The rungs that landed are format
+units, and a kernel shape does not move where a format's bounds are; the
+two rungs this section binds are the kernel and its ABI entry, and it binds
+them by naming where the literals live.
+
+### 14.6 What would falsify the shape
+
+- **A measured literals phase that dominates.** The four-stream literals
+  decode is at most four-way parallel, and a `Size_Format` of zero makes it
+  one-way, so 124 of 128 threads have nothing to do in that phase. If it is
+  the majority of a frame's time, block per frame is buying occupancy that
+  is idle, and warp per frame's ten resident frames stop being the worse
+  trade. That is the one measurement that reopens 14.2, and #236 and #237
+  are the levers that would be tried first.
+- **Achieved registers above 64 per thread.** The whole of 14.2 is derived
+  from 32 resident warps at 64 registers. Above it the block count falls
+  and the shared-memory headroom the four-warp block relies on stops being
+  headroom.
+- **An extension that widens a table.** 12.5's extension ladder is where a
+  wider window or a larger table log would arrive, and the 9472 bytes moves
+  with it. A literals tree of depth twelve alone would take the table set
+  to 13568 bytes and eight blocks to 108544, which is over the 100 KiB, and
+  the block size would have to be re-derived rather than assumed to still
+  hold.
+- **A frame where the literal tail placement does not fit.** The invariant
+  in 14.3 says it always does, so a case where it does not is a defect in
+  that invariant and is the finding, not a reason to add a workspace.
+
+## 15. M6 HIP port design (settled via the #110 design panel, 2026-08-23)
+
+**One set of kernel sources, a vendor shim header, and a `template <int
+WaveSize>` kernel family instantiated at 32 and 64, dispatched on the wave
+width the runtime reports.** No second copy of the decoder exists on any
+backend, and the ABI a caller sees does not change with the wave width.
+
+### 15.1 Single source, because a second copy is a second audit
+
+A translation of the kernels produces a second set of files that has to be
+reviewed as carefully as the first and drifts from it silently. The whole
+positioning of this library is one auditable decoder, so a port that
+doubles the decoder is a port that costs the thing it is for. The shim is a
+header that maps the CUDA runtime and intrinsic names this project actually
+uses onto their HIP spellings, keyed on `__HIP_PLATFORM_AMD__`, and the
+kernel sources stay one set of files.
+
+The surface that shim has to carry is small and is readable rather than
+guessed. The host layer's CUDA runtime use is concentrated in
+`src/cuda_raii.h`, which touches `cudaMalloc`, `cudaFree`, `cudaHostAlloc`,
+`cudaFreeHost`, `cudaEventCreate`, `cudaEventDestroy`,
+`cudaStreamCreateWithFlags` and `cudaStreamDestroy`, plus the error type and
+the two flag constants those calls take. That header is therefore the
+ownership boundary the panel adopts, which is where #240 already assumed it
+would land. Anything outside it that reaches for the runtime directly is a
+finding against this design rather than a case for widening the shim.
+
+### 15.2 The wave width is a template parameter, and the reason is a platform fact
+
+RDNA runs wave32 and CDNA runs wave64, neither can be forced to the other,
+and as of ROCm 7.0 the width is not available as a compile-time constant
+any more:
+
+> To match the CUDA specification, `warpSize` is no longer a `constexpr`.
+
+(HIP 7.0 changes, `hip-7-changes.html`.) The `__AMDGCN_WAVEFRONT_SIZE`
+macros are deprecated in the same direction and are to be disabled in a
+future release, with the runtime `warpSize` variable and
+`hipGetDeviceProperties` named as the replacements.
+
+So compile-time width cannot come from the toolchain and has to come from
+the source. The kernel family becomes `template <int WaveSize>`, both 32
+and 64 are instantiated in the same binary, and the host dispatches on the
+width the device reports. `kWarpSize` in `src/batch_limits.h` is already
+the single place the digits are written, and its own comment names #241 as
+the change that turns it into the parameter, so the port has one site to
+move rather than a sweep.
+
+This port is unusually cheap for a reason worth recording: the parse uses
+no shuffles and no ballots, so the 32-bit-to-64-bit lane-mask migration
+that is normally the most invasive part of a HIP port does not arise here
+at all. What is left is arithmetic that assumes a width, and the parameter
+is what removes the assumption.
+
+### 15.3 ROCm 7.0 is the floor, because `__syncwarp` is load-bearing
+
+Section 9's discipline is warp-synchronous and every `__syncwarp` in the
+tree is reviewed as such: it is what freezes the bytes an overlapping copy
+reads. A compatibility layer that defines `__syncwarp` away to nothing
+discards the memory ordering and the control-flow constraint the review
+depends on, and leaves a decoder that looks identical and is not. So the
+port does not no-op it.
+
+HIP has the real thing from ROCm 7.0, where the warp-level `_sync`
+primitives were added and are enabled by default, implemented as a release
+fence over the wavefront, `__builtin_amdgcn_wave_barrier()`, and an acquire
+fence. That fixes the minimum supported ROCm at 7.0, on the production
+stream, and the floor is a correctness requirement rather than a
+convenience.
+
+Lockstep itself holds by construction on AMD: no current architecture has
+independent thread scheduling within a wavefront, so section 9's
+redundant-lockstep-parse invariant is not weakened by the port.
+
+### 15.4 Wave64 redundant parse is accepted for v1, and the reason is the ladder
+
+On CDNA, 64 lanes redundantly computing one chunk's parse doubles the work
+the redundant parse does, for the same answer. It is correct and it is
+wasteful, and the alternative, a chunk per half-wave, is a second geometry
+inside the kernel family with its own correctness surface.
+
+It is accepted as is for v1. Correctness before measured performance is the
+first repo directive, no AMD hardware has produced a number for this
+project yet, and designing a second geometry against a cost nobody has
+measured is exactly the shape the zero-regression discipline exists to stop.
+The trigger that reopens it is a community measurement on CDNA showing the
+parse, rather than the copies, setting the time; #245's runbook and #246's
+intake form are what would produce that number.
+
+### 15.5 The ABI does not move with the wave width
+
+`kMaxBatchChunks` in `src/batch_limits.h` is `INT32_MAX * kWarpSize`, so a
+width-derived limit would be twice as large on wave64 as on wave32. The
+panel refuses that: the accepted set stays the wave32 value on every
+backend.
+
+A limit that widens with the device makes the same call succeed on one
+GPU and return `CUDEC_ERR_INVALID_ARGUMENT` on another, which is a contract
+that varies by hardware, and this project's determinism claim is that the
+same input produces the same result on every path. The cost of the narrower
+bound is nothing anybody will meet: `INT32_MAX * 32` chunks is far past any
+real batch. The geometry refusal itself, the launch shape that would leave a
+slice of a destination written by nobody
+([DETERMINISM.md](DETERMINISM.md)), is derived from `WaveSize` rather than
+from the digits, because there it is a statement about the launch and not
+about the ABI.
+
+### 15.6 What would falsify this design
+
+- **A shim that stops being a header.** If mapping the runtime surface
+  needs behaviour rather than names, the single-source claim is what breaks,
+  and the finding is that the seam is in the wrong place rather than that
+  the shim needs a source file.
+- **A wave64 measurement where the redundant parse dominates.** That
+  reopens 15.4 and only 15.4; it is a geometry question inside the kernel
+  family and not a reason to fork the sources.
+- **A ROCm release that disables the deprecated width macros in a way the
+  template parameter does not survive.** The parameter is chosen because it
+  depends on neither the macros nor a constexpr `warpSize`, so this would
+  mean the dependency was not removed where this section claims it was.
+- **Any decode path that produces different bytes on the two backends.**
+  That is not a port defect to be tuned around; determinism is the claim,
+  and the CUDA output is the reference the HIP build is compared against
+  bit for bit (#241, #243).
+
+The platform facts in 15.2 and 15.3 were read from the vendor documentation
+for this section. No ROCm toolchain and no AMD device were available while
+it was written, so nothing here is a measurement, and the first numbers for
+this backend arrive with #243 and the community route.
