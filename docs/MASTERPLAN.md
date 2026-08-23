@@ -1811,3 +1811,188 @@ What would falsify this design, recorded before it is built:
 - Any input that makes the shared-memory footprint depend on the stream.
   That is the anti-pattern rule broken, and it is a defect in this design
   rather than a tuning result.
+
+## 14. M5 Zstd kernel shape (settled via the #208 design panel, 2026-08-23)
+
+**One kernel, fused, with phase barriers inside the block, at block per
+frame with 128 threads.** The frame is the chunk, as 12.1 fixes; the block
+of four warps is what decodes it; and the phases inside a Zstd block are
+separated by `__syncthreads()` rather than by a launch. Shared memory holds
+one entropy table set per frame, the destination buffer holds everything
+else, and no workspace is added to the batch ABI.
+
+As in 13, the candidates were developed and scored inside this work rather
+than by a second person; the arithmetic below is the evidence in place of a
+second judge, and every constant it uses is read out of the tree or out of
+the section it cites rather than recalled.
+
+### 14.1 The table set is the whole budget
+
+What a frame must hold across a block boundary is fixed by 12.1 and by the
+subset in 12.2, and the ceilings are already constants in the tree:
+
+| table                                 | entries    | bytes |
+| ------------------------------------- | ---------- | ----- |
+| Literal_Lengths FSE, accuracy log 9   | 512 x 4 B  | 2048  |
+| Match_Lengths FSE, accuracy log 9     | 512 x 4 B  | 2048  |
+| Offsets FSE, accuracy log 8           | 256 x 4 B  | 1024  |
+| Literals Huffman, table log 11        | 2048 x 2 B | 4096  |
+| Huffman weight description FSE, log 6 | 64 x 4 B   | 256   |
+| total per frame                       |            | 9472  |
+
+The three sequence accuracy logs are `kZstdLitLenAccuracyLogMax`,
+`kZstdMatchLenAccuracyLogMax` and `kZstdOffsetAccuracyLogMax` in
+`src/zstd_fse.h`; the literals tree depth is `kZstdLiteralsMaxTableLog` in
+`src/zstd_literals.h`, which is the format's own eleven-bit limit and not a
+project choice; the weight description's ceiling is
+`kZstdHufWeightAccuracyLogMax` in `src/zstd_huf.h`. A four-byte FSE entry
+is a next state, a symbol and a bit count, and a two-byte Huffman entry is
+a symbol and a bit count.
+
+That 9472 bytes is per FRAME and not per warp, because 12.1 makes the
+entropy state cross block boundaries inside a frame and not between frames.
+It is the number that decides the granularity.
+
+### 14.2 Warp per frame is dead, and 128 threads is the smallest block that is not
+
+An SM's usable shared memory is the roughly 100 KiB section 9's two-phase
+disproof already reads for sm_86, the tuning target and the tighter of the
+two architectures. So an SM holds `floor(102400 / 9472) = 10` frames,
+whatever else it does.
+
+Section 9's occupancy plan is at most 64 registers per thread for at least
+32 resident warps per SM, and 32 warps is 1024 threads, which is exactly
+the 65536 registers an SM has at 64 per thread. Against those two limits:
+
+- **Warp per frame** makes ten frames ten warps. Shared memory becomes the
+  binding resource and costs 22 of the 32 warps the register budget would
+  have paid for. The table set is per frame, so a warp-per-frame kernel
+  pays the whole 9472 bytes for 32 lanes.
+- **Block per frame, four warps (128 threads)** needs eight blocks for 32
+  warps, and eight blocks take 75776 bytes, inside the 100 KiB with room
+  left. Registers bind, shared memory does not, and the family's occupancy
+  target is met rather than argued down.
+- **Block per frame, two warps (64 threads)** needs sixteen blocks for 32
+  warps, and sixteen blocks want 151552 bytes, which is over. Shared memory
+  binds again at ten blocks and twenty warps.
+- **Block per frame, eight warps (256 threads)** meets 32 warps at four
+  blocks and fits easily, but it puts four frames per SM in flight where
+  128 threads puts eight, and inter-frame parallelism is the only
+  parallelism M5 sells (12.1). Fewer, wider blocks is the wrong direction
+  for a batch decoder.
+
+So 128 threads is the smallest block size at which the table set stops
+being the binding resource, and being the smallest is the point: it
+maximizes the number of frames an SM decodes at once.
+
+### 14.3 The phase pipeline is dead on its intermediates
+
+The one production-grade decomposition to weigh is a phase pipeline of
+separate passes, parse then table init then literals then sequence decode
+then prefix sums then execution, with the intermediates in global memory.
+The arithmetic that kills it here is the size of those intermediates.
+`Number_of_Sequences` is a three-byte varint biased by
+`kZstdSeqCountThreeByteBias` (0x7F00) in `src/zstd_seq.h`, so a block may
+declare `0xFFFF + 0x7F00 = 98047` sequences. At twelve bytes for a
+literals length, a match length and an offset, that is about 1.1 MiB of
+tuples for one block, and at the eight resident frames per SM of 14.2
+across an RTX 3080's 68 SMs it is on the order of 600 MiB of scratch for
+the batch, live for the whole launch.
+
+That scratch has nowhere to come from. `cudec_lz4_decompress_batch` takes
+source pointers, destination pointers, capacities and a results array, and
+nothing else; a phase pipeline would have to add a workspace argument to
+the batch ABI, or allocate behind the caller's back inside an entry that is
+asynchronous on the caller's stream and today allocates nothing. Neither is
+a cost this shape has earned, and the fused shape does not incur it.
+
+**The fused shape needs no scratch at all, and 12.2 is why.** The subset
+requires `Frame_Content_Size` to be present, so the destination region for
+a frame is known before the first byte is decoded. A block's literals are
+decoded into the TAIL of the frame's remaining destination region: with `R`
+bytes of declared output left at the start of the block and `L` literal
+bytes regenerated, they land at `[P + R - L, P + R)`. Sequence `i` then
+writes its literal run at `P + prefix_i`, and `prefix_i` is the literals
+before it plus the match bytes before it, so `prefix_i <= R - L +
+litprefix_i` for every `i`. Every literal run therefore moves toward lower
+addresses, and run `i` ends at or before run `i+1`'s source begins, so
+executing them in increasing order is safe in place. The prefix sum itself
+is a warp scan with a running carry rather than a materialized array, which
+is what `src/zstd_exec.h` already says the device form of that unit is.
+
+That leaves one thing in shared memory, the table set, and one thing in
+global memory, the caller's destination. The phase barriers that a fused
+kernel needs are `__syncthreads()` between the literals phase and the
+sequence phase of each block, which is a barrier inside a block of four
+warps and not a launch.
+
+### 14.4 What this keeps from the family and what it breaks
+
+Kept: the frame-to-chunk mapping and the batch ABI shape; the failure
+contract, with `bytes_written` zero on every reject; determinism, since
+every copy is a pure function of lower addresses exactly as section 9
+records; the overlap semantics `src/zstd_exec.h` already carries; and the
+rule that every stream-decoded value is checked before its first use.
+
+Broken, knowingly: section 9's "no shared memory" property, which section 4
+already records as an LZ4 decision rather than a family invariant, and
+section 9's redundant 32-lane lockstep parse, which cannot survive a format
+whose entropy decode is serial per stream. The `template<class Parser>`
+chunk-decoder seam section 9 describes is not extended to M5: a Zstd frame
+is not a chunk with a different parser, it is a block loop with its own
+phases, and pretending otherwise would put a parser interface between the
+phases that has to carry all of them.
+
+### 14.5 The M5 pull-request ladder
+
+The entropy and format rungs landed first and are closed: the frame and
+block header walk, the FSE and Huffman table machinery, the literals
+section in all four types, the sequences section and its three-state loop,
+repcode resolution, sequence execution against a prefix sum, and the block
+loop that carries state across blocks, each as a host-twinnable header
+under `src/` with its twin under CI. The validation ladder, the fuel story
+and the worst-case corpus families are recorded in 12.7 to 12.9.
+
+What is left, in order, each its own gated pull request:
+
+1. The intra-kernel work assignment, which is #213's to settle and is
+   deliberately not settled here: which lanes run the serial FSE cores,
+   how the four literal streams are assigned, and how the sequence
+   destinations are scanned.
+2. The kernel and `cudec_zstd_decompress_batch` (#203), minimal-correct,
+   behind the frozen batch contract, with achieved registers and occupancy
+   read out and recorded at that pull request.
+3. The device gate set: determinism, two-directional mutant reject parity
+   against libzstd, and the capacity adversarials.
+4. The first recorded GPU baselines and the per-phase split (#231, #233).
+   Numbers and kernel never move in the same pull request.
+5. The measured perf levers (#234 to #239), each accepted only on a
+   recorded improvement with every gate green.
+
+Nothing above re-cuts a closed issue. The rungs that landed are format
+units, and a kernel shape does not move where a format's bounds are; the
+two rungs this section binds are the kernel and its ABI entry, and it binds
+them by naming where the literals live.
+
+### 14.6 What would falsify the shape
+
+- **A measured literals phase that dominates.** The four-stream literals
+  decode is at most four-way parallel, and a `Size_Format` of zero makes it
+  one-way, so 124 of 128 threads have nothing to do in that phase. If it is
+  the majority of a frame's time, block per frame is buying occupancy that
+  is idle, and warp per frame's ten resident frames stop being the worse
+  trade. That is the one measurement that reopens 14.2, and #236 and #237
+  are the levers that would be tried first.
+- **Achieved registers above 64 per thread.** The whole of 14.2 is derived
+  from 32 resident warps at 64 registers. Above it the block count falls
+  and the shared-memory headroom the four-warp block relies on stops being
+  headroom.
+- **An extension that widens a table.** 12.5's extension ladder is where a
+  wider window or a larger table log would arrive, and the 9472 bytes moves
+  with it. A literals tree of depth twelve alone would take the table set
+  to 13568 bytes and eight blocks to 108544, which is over the 100 KiB, and
+  the block size would have to be re-derived rather than assumed to still
+  hold.
+- **A frame where the literal tail placement does not fit.** The invariant
+  in 14.3 says it always does, so a case where it does not is a defect in
+  that invariant and is the finding, not a reason to add a workspace.
