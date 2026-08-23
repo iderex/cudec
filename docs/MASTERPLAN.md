@@ -1345,3 +1345,209 @@ construction, each sequence's copy depends on the sequences before it, and
 is written down before the first number is measured, so that the number,
 whatever it turns out to be, is read against the expectation rather than
 against a hope.
+
+### 12.7 The validation ladder, and the failure contract
+
+Fail-closed, on the same rule the M1 ladder in section 9 states: every value
+that came out of the stream is checked before it is first used as an address,
+a length or an offset. Zstd needs that rule more than the other three
+formats, because a frame carries an optional XXH64 over the content and
+nothing at all over the entropy stages, so a table description that decodes
+into nonsense is caught by a bound or it is not caught.
+
+The branch list itself is not written out here. It is nine enumerations in
+the source, one per unit, and a copy of them in this document would drift
+against the code that decides them. What this section fixes is the shape of
+the ladder, the class each rung carries, and the property that keeps it
+complete. The population is derived:
+
+    grep -ohE 'kZstd[A-Za-z]+Reject[A-Za-z]+' src/zstd_*.h \
+      | grep -vE 'RejectNone$|RejectCount$' | sort -u | wc -l
+    89
+
+reached from more sites than there are rungs, because several rungs are
+refused from more than one place in a parse:
+
+    cat src/zstd_*.h | tr '\n' ' ' \
+      | grep -oE 'Refuse\( *kZstd[A-Za-z]+' | wc -l
+    128
+
+Where the 89 sit is the useful half, because it says which parts of the
+format are dangerous. Counted per unit, `Bit` 6, `Blocks` 6, `Exec` 8,
+`Frame` 15, `Fse` 10, `Huf` 11, `Literals` 14, `Repcode` 2, `Seq` 17, and
+each of those is the same command with the unit name substituted.
+Fifty-eight of the eighty-nine sit in the entropy layer and its two
+consumers, which is the opposite of LZ4, where the whole ladder is one token
+loop.
+
+Walking the pipeline, and naming what each stage refuses rather than
+enumerating the rungs it does it with:
+
+- The frame header refuses a truncated or wrong magic, a truncated
+  descriptor, a set reserved bit, a truncated header, and separately the
+  three shapes that are legal and outside the subset (12.2).
+- The block header refuses the reserved block type 3, a block above
+  `min(Window_Size, 128 KB)`, a truncated header and a truncated body, and
+  the frame refuses a checksum that is truncated or does not match.
+- The literals section refuses a truncated header in each of its size
+  formats, a regenerated size above the block bound, a payload that is short
+  for what the header declared, Treeless reuse with no previously
+  established table, a four-stream jump table that overruns its payload, a
+  four-stream section with fewer literals than four streams can carry, and a
+  stream a decode did not consume exactly.
+- Huffman weight decode and table construction refuse an empty or truncated
+  description, more weights than the alphabet holds, a weight above the
+  maximum, a weight sum of zero, a table log above the format's ceiling, a
+  last weight that does not complete the distribution, and a deepest rank
+  left empty.
+- The FSE table description refuses an empty or truncated description, an
+  accuracy log above the ceiling, a symbol past the field's maximum, a
+  probability set that does not normalise, a truncated state initialisation
+  and a state outside the built table.
+- The sequences section refuses a truncated `Number_of_Sequences`, a count
+  larger than the block's regenerated size could hold, a count of zero
+  followed by bytes nobody consumes, truncated or reserved compression
+  modes, Repeat mode with no previous table, a truncated RLE table byte, a
+  decoded symbol past the alphabet, a truncated sequence, and a backward
+  bitstream that is missing, unstarted or not consumed to its start marker.
+- Repcode resolution refuses a resolution to zero, which is the one state
+  the rotation can reach that no valid stream reaches.
+- Sequence execution refuses an offset of zero, an offset past the window,
+  an offset before the bytes produced so far in the frame, literals
+  exhausted before the plan consumed them, and a plan whose totals do not
+  agree with the block it came from.
+
+The class rule is 12.3's and is not restated. What is worth recording is
+that the rule is executed rather than described: the whole Zstd path returns
+`CUDEC_ERR_UNSUPPORTED` at exactly four rungs, and they are exactly the
+shapes 12.2 and 12.4 put outside the subset.
+
+    grep -B3 -hE '^\s+CUDEC_ERR_UNSUPPORTED' src/zstd_*.h \
+      | grep -oE 'kZstd[A-Za-z]+Reject[A-Za-z]+' | sort -u
+    kZstdFrameRejectContentSizeAbsent
+    kZstdFrameRejectDictionaryId
+    kZstdFrameRejectSkippableFrame
+    kZstdFrameRejectWindowTooLarge
+
+Everything else is a corrupt verdict about the data, a caller-argument
+refusal, or a capacity refusal, and a rung that drifts across that line shows
+up in the command above rather than in a review.
+
+The failure contract is section 9's, unchanged and repeated here because it
+is what the rungs above are for: on any reject, `bytes_written = 0` and a
+non-OK status, destination contents up to the failure point unspecified and
+never presented as a short decode. Check-before-load is batch isolation
+rather than parity alone. On a device an out-of-bounds read is not a
+per-chunk failure, it faults the launch and poisons the whole batch, so the
+check has to happen before the load and not after it.
+
+What keeps the ladder complete is a per-unit sweep in the twins rather than a
+promise in this document. Each twin holds a coverage array sized by its
+unit's `RejectCount`, marks the rung every declared negative reached, and
+requires at the end that every rung between `None` and `Count` was reached by
+a negative written for it. There is no exemption list, so a rung added to a
+parser with no negative behind it lands as a named hole rather than as
+silence. All nine units carry one:
+
+    grep -l "RejectCount\]" tests/zstd_*.cpp | wc -l
+    9
+
+That is the conformance expectation this section fixes, and it is one crafted
+negative per ladder rung, checked by walking the enumeration rather than by
+counting to a number written down anywhere.
+
+### 12.8 What bounds every loop
+
+A decoder that rejects a hostile stream and a decoder that never returns on
+it are the same outcome to a caller, and on a device they are not: a warp
+that does not retire is a hang rather than a failure, and the fail-closed
+contract admits neither. So every loop in the Zstd path is either counted
+before it is entered or carries a fuel cap.
+
+Counted before entry is the ordinary case and it is the whole reason the
+rungs above sit where they do. The sequence loop runs `Number_of_Sequences`
+times, and that count is refused above `block_size_max / 3` before the loop
+exists. The literal decode runs to the regenerated size, refused above the
+block bound first. Every table build runs to a table size fixed by an
+accuracy log that was refused above its ceiling first. In each case the bound
+is a value the ladder has already refused if it was wrong, which is what
+makes the loop's trip count a fact rather than a hope.
+
+Three loops in the path are not counted, and each one carries fuel:
+
+    grep -cE '^\s*(while|do)\b' src/zstd_*.h src/frame.cpp | grep -v ':0'
+    src/zstd_blocks.h:1
+    src/zstd_fse.h:1
+    src/frame.cpp:1
+
+The two block loops walk a chain whose length the frame does not declare, so
+each is capped by the smallest number of bytes a step can consume: a block
+header is 3 bytes in `src/zstd_blocks.h` and the frame walk in
+`src/frame.cpp` uses 4. Both caps sit beyond anything a frame the guards
+admit can reach, so exhausting one is a bounds bug surfacing as a rejected
+frame rather than as a spinning thread. The third is the FSE spread's
+low-probability placement in `src/zstd_fse.h`, capped at the table size,
+which a normalised vector cannot exhaust and an unnormalised one is refused
+for.
+
+There is no `goto` anywhere in the path, so the three above and the counted
+loops are the whole of it.
+
+### 12.9 The worst-case corpus families, and what would falsify the ladder
+
+`docs/ZSTD-CORPUS.md` records the coverage corpus, whose job is to reach
+every mode of the format at least once and to prove it did. That is a
+different corpus from this one. What is named here is the adversarial set,
+whose job is to make the ladder and the loop bounds above expensive rather
+than merely reached, and each family is written so the corpus and fuzz rungs
+can be built from it without re-deriving the shape.
+
+- **Maximum sequence density.** A block whose regenerated size is at the
+  ceiling and whose sequences are all at the three-byte minimum match, so the
+  sequence count sits against the `block_size_max / 3` bound the loop is
+  capped by. This is the family that makes the sequence loop's trip count
+  worst and the per-sequence rung checks hottest.
+- **Maximum table switching.** A frame whose blocks alternate the three
+  fields' compression modes on every block, so `Set_Compressed` tables are
+  rebuilt as often as the format allows and `Repeat` never gets to amortise
+  anything. The table build is the serial part of the decode, and this is the
+  shape that pays for it most often.
+- **Adversarial repcode patterns.** Sequences that walk the rotation through
+  every state it has, including the `literals_length == 0` shift and the
+  rep1-1 case, arranged so a wrong rotation produces a plausible offset
+  rather than an obviously wrong one. The rung that catches a wrong rotation
+  is a resolution to zero, and a corpus that never approaches zero never
+  exercises it.
+- **Deep Huffman trees and four-stream literals.** Literals whose tree
+  reaches the format's maximum code length with four streams and a jump
+  table, so the stream bounds and the last stream's implied size are read at
+  their tightest.
+- **The high-search interop family.** libzstd at level 18 and above emits
+  frames whose shape a decoder written against the common cases can get
+  wrong, and `docs/ZSTD-CORPUS.md` already carries level 18, 19 and a
+  level 22 long-window cell for it. Named here as an adversarial family and
+  not only a coverage one, because what it is for is the divergence rather
+  than the mode.
+- **The tail shapes.** A frame whose last block is empty, a block whose
+  sequence section is a count of zero, and a frame whose declared content
+  size is reached exactly at the last literal, so the leftover-literals rule
+  and the exact-consumption checks are read at their boundary rather than
+  near it.
+
+What would falsify the ladder, recorded so a run that finds nothing is not
+read as a run that proved something:
+
+- A mutant the pinned reference accepts and cudec rejects, on any family
+  above. Over-strictness is a divergence in the same way over-permissiveness
+  is, and the corpus that catches it has to keep the accepted mutants rather
+  than filter them out.
+- A mutant the reference rejects and cudec accepts. That is a fail-open and
+  it is the finding this whole section exists to make findable.
+- A fuzz run that reaches a rung no declared negative reaches. The sweep in
+  12.7 says every rung has one, so this would mean the fuzzer found a route
+  to the rung that the negative does not take, which is a narrower negative
+  than the rung deserves.
+- A stream on which any of the three fuel caps in 12.8 fires. Each cap is
+  argued to be unreachable for every input the guards admit, so a firing cap
+  is a bounds bug that the cap converted into a rejection, and the bug is the
+  finding rather than the rejection.
