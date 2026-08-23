@@ -1996,3 +1996,133 @@ them by naming where the literals live.
 - **A frame where the literal tail placement does not fit.** The invariant
   in 14.3 says it always does, so a case where it does not is a defect in
   that invariant and is the finding, not a reason to add a workspace.
+
+## 15. M6 HIP port design (settled via the #110 design panel, 2026-08-23)
+
+**One set of kernel sources, a vendor shim header, and a `template <int
+WaveSize>` kernel family instantiated at 32 and 64, dispatched on the wave
+width the runtime reports.** No second copy of the decoder exists on any
+backend, and the ABI a caller sees does not change with the wave width.
+
+### 15.1 Single source, because a second copy is a second audit
+
+A translation of the kernels produces a second set of files that has to be
+reviewed as carefully as the first and drifts from it silently. The whole
+positioning of this library is one auditable decoder, so a port that
+doubles the decoder is a port that costs the thing it is for. The shim is a
+header that maps the CUDA runtime and intrinsic names this project actually
+uses onto their HIP spellings, keyed on `__HIP_PLATFORM_AMD__`, and the
+kernel sources stay one set of files.
+
+The surface that shim has to carry is small and is readable rather than
+guessed. The host layer's CUDA runtime use is concentrated in
+`src/cuda_raii.h`, which touches `cudaMalloc`, `cudaFree`, `cudaHostAlloc`,
+`cudaFreeHost`, `cudaEventCreate`, `cudaEventDestroy`,
+`cudaStreamCreateWithFlags` and `cudaStreamDestroy`, plus the error type and
+the two flag constants those calls take. That header is therefore the
+ownership boundary the panel adopts, which is where #240 already assumed it
+would land. Anything outside it that reaches for the runtime directly is a
+finding against this design rather than a case for widening the shim.
+
+### 15.2 The wave width is a template parameter, and the reason is a platform fact
+
+RDNA runs wave32 and CDNA runs wave64, neither can be forced to the other,
+and as of ROCm 7.0 the width is not available as a compile-time constant
+any more:
+
+> To match the CUDA specification, `warpSize` is no longer a `constexpr`.
+
+(HIP 7.0 changes, `hip-7-changes.html`.) The `__AMDGCN_WAVEFRONT_SIZE`
+macros are deprecated in the same direction and are to be disabled in a
+future release, with the runtime `warpSize` variable and
+`hipGetDeviceProperties` named as the replacements.
+
+So compile-time width cannot come from the toolchain and has to come from
+the source. The kernel family becomes `template <int WaveSize>`, both 32
+and 64 are instantiated in the same binary, and the host dispatches on the
+width the device reports. `kWarpSize` in `src/batch_limits.h` is already
+the single place the digits are written, and its own comment names #241 as
+the change that turns it into the parameter, so the port has one site to
+move rather than a sweep.
+
+This port is unusually cheap for a reason worth recording: the parse uses
+no shuffles and no ballots, so the 32-bit-to-64-bit lane-mask migration
+that is normally the most invasive part of a HIP port does not arise here
+at all. What is left is arithmetic that assumes a width, and the parameter
+is what removes the assumption.
+
+### 15.3 ROCm 7.0 is the floor, because `__syncwarp` is load-bearing
+
+Section 9's discipline is warp-synchronous and every `__syncwarp` in the
+tree is reviewed as such: it is what freezes the bytes an overlapping copy
+reads. A compatibility layer that defines `__syncwarp` away to nothing
+discards the memory ordering and the control-flow constraint the review
+depends on, and leaves a decoder that looks identical and is not. So the
+port does not no-op it.
+
+HIP has the real thing from ROCm 7.0, where the warp-level `_sync`
+primitives were added and are enabled by default, implemented as a release
+fence over the wavefront, `__builtin_amdgcn_wave_barrier()`, and an acquire
+fence. That fixes the minimum supported ROCm at 7.0, on the production
+stream, and the floor is a correctness requirement rather than a
+convenience.
+
+Lockstep itself holds by construction on AMD: no current architecture has
+independent thread scheduling within a wavefront, so section 9's
+redundant-lockstep-parse invariant is not weakened by the port.
+
+### 15.4 Wave64 redundant parse is accepted for v1, and the reason is the ladder
+
+On CDNA, 64 lanes redundantly computing one chunk's parse doubles the work
+the redundant parse does, for the same answer. It is correct and it is
+wasteful, and the alternative, a chunk per half-wave, is a second geometry
+inside the kernel family with its own correctness surface.
+
+It is accepted as is for v1. Correctness before measured performance is the
+first repo directive, no AMD hardware has produced a number for this
+project yet, and designing a second geometry against a cost nobody has
+measured is exactly the shape the zero-regression discipline exists to stop.
+The trigger that reopens it is a community measurement on CDNA showing the
+parse, rather than the copies, setting the time; #245's runbook and #246's
+intake form are what would produce that number.
+
+### 15.5 The ABI does not move with the wave width
+
+`kMaxBatchChunks` in `src/batch_limits.h` is `INT32_MAX * kWarpSize`, so a
+width-derived limit would be twice as large on wave64 as on wave32. The
+panel refuses that: the accepted set stays the wave32 value on every
+backend.
+
+A limit that widens with the device makes the same call succeed on one
+GPU and return `CUDEC_ERR_INVALID_ARGUMENT` on another, which is a contract
+that varies by hardware, and this project's determinism claim is that the
+same input produces the same result on every path. The cost of the narrower
+bound is nothing anybody will meet: `INT32_MAX * 32` chunks is far past any
+real batch. The geometry refusal itself, the launch shape that would leave a
+slice of a destination written by nobody
+([DETERMINISM.md](DETERMINISM.md)), is derived from `WaveSize` rather than
+from the digits, because there it is a statement about the launch and not
+about the ABI.
+
+### 15.6 What would falsify this design
+
+- **A shim that stops being a header.** If mapping the runtime surface
+  needs behaviour rather than names, the single-source claim is what breaks,
+  and the finding is that the seam is in the wrong place rather than that
+  the shim needs a source file.
+- **A wave64 measurement where the redundant parse dominates.** That
+  reopens 15.4 and only 15.4; it is a geometry question inside the kernel
+  family and not a reason to fork the sources.
+- **A ROCm release that disables the deprecated width macros in a way the
+  template parameter does not survive.** The parameter is chosen because it
+  depends on neither the macros nor a constexpr `warpSize`, so this would
+  mean the dependency was not removed where this section claims it was.
+- **Any decode path that produces different bytes on the two backends.**
+  That is not a port defect to be tuned around; determinism is the claim,
+  and the CUDA output is the reference the HIP build is compared against
+  bit for bit (#241, #243).
+
+The platform facts in 15.2 and 15.3 were read from the vendor documentation
+for this section. No ROCm toolchain and no AMD device were available while
+it was written, so nothing here is a measurement, and the first numbers for
+this backend arrive with #243 and the community route.
