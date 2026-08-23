@@ -1001,7 +1001,8 @@ survived reading the text.
 
 Written here so the panel starts from an agenda rather than rediscovering
 it. None of these is answered above, and answering them is not this
-section's job.
+section's job. Section 13.2 is where the panel answered them, one by one
+and in this order.
 
 1. **Table residency.** One table set per block is read by all 32 lanes
    every round (D6). Shared memory, registers, or a hybrid, and what that
@@ -1551,3 +1552,262 @@ read as a run that proved something:
   argued to be unreachable for every input the guards admit, so a firing cap
   is a bounds bug that the cap converted into a rejection, and the bug is the
   finding rather than the rejection.
+
+## 13. M4 GDeflate kernel design (settled via the #94 design panel, 2026-08-23)
+
+Three candidate shapes were developed against the section 11 dossier and
+scored on one piece of arithmetic, the shared-memory footprint of a decode
+table set against the resident-warp target section 9 fixed for this kernel
+family. Two of the three are dead on that arithmetic alone and are recorded
+here so nobody re-proposes them. The panel was run inside this work rather
+than by a second person, which is stated here rather than implied; the
+arithmetic below is reproducible from the script it carries, and that is
+what stands in for a second judge.
+
+**One kernel. One warp per 64 KiB page over a grid-stride loop. The 32
+lanes are the format's 32 substreams, so the parse is genuinely
+cooperative rather than section 9's redundant lockstep. One table set per
+block in shared memory, with a fixed footprint that no input can grow, and
+the copy engine, failure contract and determinism discipline carried over
+from section 9 unchanged.**
+
+### 13.1 The arithmetic that forces the shape
+
+The binding resource is shared memory per resident warp. Section 9's
+occupancy plan targets at most 64 registers per thread for at least 32
+warps per SM, and section 9's own two-phase disproof reads an SM's usable
+shared memory as roughly 100 KiB, the sm_86 figure from the vendor's
+compute-capability table. sm_80, the baseline, has more of it; sm_86, the
+tuning target, is therefore the binding case. At 32 warps per SM the budget
+is 100 KiB / 32 = 3200 bytes of shared memory per warp, and every candidate
+below is scored against that one number.
+
+**Candidate A, two-level decode tables in shared memory, is dead.** A
+GDeflate block's code lengths are attacker-chosen inside what the format
+admits, so the table has to be sized for the worst legal case and not for a
+corpus. That worst case is computable in closed form. A root of R bits
+resolves every code no longer than R in one lookup; each root slot whose
+codes run longer gets a subtable of `2^d` entries, where d is the deepest
+code under that slot minus R. A complete subcode of depth d costs at least
+d+1 symbols, and filling k root slots with codes of length at most R costs
+at least `popcount(k)` symbols, so the worst case is a small knapsack over
+the symbol budget:
+
+```python
+def worst(n, R, L):
+    root = 1 << R
+    best = 0
+    for s in range(0, min(root, n) + 1):
+        budget = n - bin(root - s).count("1")
+        if budget < 0:
+            continue
+        dp = [[-1] * (budget + 1) for _ in range(s + 1)]
+        dp[0][0] = 0
+        for d in range(1, L - R + 1):
+            cost, val = d + 1, 1 << d
+            for c in range(1, s + 1):
+                for b in range(cost, budget + 1):
+                    if dp[c - 1][b - cost] >= 0:
+                        dp[c][b] = max(dp[c][b], dp[c - 1][b - cost] + val)
+        best = max(best, root + max(dp[s]))
+    return best
+
+
+for n in (286, 32):
+    print(n, min((worst(n, R, 15), R) for R in range(4, 13)))
+```
+
+    286 (2504, 10)
+    32 (642, 8)
+
+So the cheapest two-level literal/length table any root can produce is 2504
+entries, at a 10-bit root, and the cheapest distance table is 642 entries
+at an 8-bit root. At two bytes per entry, the narrowest entry that still
+carries a symbol index up to 285 and a code length up to 15, that is
+(2504 + 642) x 2 = 6292 bytes per warp. It is 1.97 times the 3200-byte
+budget, and a 4-warp block of it takes an SM to 16 resident warps, half the
+family target. The 2048-entry figure that circulated in the M4 planning
+before this pass is not a bound on anything, and the script above is where
+that was found.
+
+**Candidate B, a phase split that materializes the symbol stream, is dead
+for the reason section 9 killed table-in-smem two-phase.** A 64 KiB page
+decodes to at most 65536 bytes, so its symbol stream can be 65536 literals;
+at 4 bytes per record that is 256 KiB for one page, 2.6 times an SM's
+shared memory, for a single tile rather than for a warp. Moving that
+scratch to global memory does not rescue it: it would put a per-tile
+workspace into a batch ABI that has none today, and it would spend two
+passes over that scratch at full residency to accelerate a stage that is
+entropy-bound rather than bandwidth-bound.
+
+**Candidate C, block per tile, buys nothing the format can use.** Thirty
+two substreams are 32 lanes, so a 128-thread block leaves 96 lanes idle
+through every parse round, and the only work they could take is the copy
+fan-out, which is ordered by the in-tile LZ77 dependency and therefore
+cannot run ahead of the parse without the phase split candidate B already
+rules out. It also turns the section 10 end-of-block quiesce rule from a
+warp-level ballot into a block-wide barrier on every round.
+
+**The shape that survives is the fixed-footprint table.** The decode state
+is sized so that no input can change how much shared memory a warp holds,
+which is the anti-pattern rule section 9 states for packed fields, applied
+to an allocation instead of to a field. Per warp:
+
+| what                                              | bytes |
+| ------------------------------------------------- | ----- |
+| canonical symbol order, 286 lit/len + 32 distance | 636   |
+| per-length counts, first codes and first indices  | 192   |
+| literal/length root accelerator, 10 bits          | 2048  |
+| distance root accelerator, 7 bits                 | 256   |
+| total                                             | 3132  |
+
+The symbol-order array and the per-length arrays are a complete canonical
+decoder on their own, and their size is fixed by the alphabet rather than
+by the code lengths, so the worst case above cannot arise. The two root
+tables are accelerators over that decoder: a code no longer than its root
+resolves in one lookup, and a longer one falls back to the length-by-length
+walk, which is the case that is rare by construction, because a long code
+is what a rare symbol gets. The footprint is 3132 bytes against the
+3200-byte budget, so a 4-warp block takes 12528 bytes, an SM fits eight of
+those blocks inside 100 KiB, and that is exactly the 32 resident warps
+section 9 asks for. The 68 bytes of margin per warp are slack for the
+allocation granularity rather than a rounding accident.
+
+Registers stay where the draft puts them. Section 11.2's per-lane state is
+a bit buffer and a count of valid bits, which `src/gdeflate_schedule.h`
+already carries as one 64-bit buffer per lane
+(`kGDeflateLaneBufferBits`). Per-lane state has no reason to sit in shared
+memory, and moving it there would put the one thing that is genuinely
+private into the one resource that is shared.
+
+### 13.2 The five open questions from 11.6, answered
+
+**Table residency** is settled by 13.1: shared memory, at a footprint no
+input can grow, with the two-level table rejected on its worst case rather
+than on its average.
+
+**The end-of-block quiesce without divergence.** Section 10 forbids every
+lane after the one that decoded code 256 from consuming bits. The decode
+round is therefore speculative and its commit is predicated: every lane
+decodes, `__ballot_sync` collects the lanes that produced 256, `__ffs` of
+that mask names the first of them, and each lane commits its new bit
+position only if its own index is at or below that lane. A lane that must
+not have consumed keeps the bit position it entered the round with, which
+is a select rather than a branch, and the warp stays convergent. The rule
+is enforced by not committing, never by rolling back.
+
+**Bounding the tail round.** Section 11.5 forbids assuming any bytes past
+the stream, so the refill is bounded by the page's word count, which comes
+from the caller's compressed size rather than from the bits. The refill
+schedule is warp-uniform, so that is one comparison per refill and not one
+per lane, and `src/gdeflate_schedule.h` already fails it closed with a
+frozen cursor and a sticky failure. A round that does not refill pays
+nothing for it.
+
+**The desynchronization threat.** The deliberate look 11.6 asked for, with
+its answer: there is no cheap detector during a walk, there are two free
+ones at the end of it, and both are mandatory rather than optional. The
+first is exact word consumption, since a correct decode leaves the cursor
+inside the page's last word and a desynchronized one lands anywhere. The
+second is exact output size, which GDeflate itself does not carry (11.4)
+but the envelope does, so the declared uncompressed size is compared
+against what was produced rather than trusted to size a buffer. Neither
+catches a desynchronization early; together they turn one into a rejection
+instead of a wrong answer, which is the whole of what a checksum-less
+format offers. Every bound stays enforced at its point of use, as 11.2
+requires.
+
+**The stored-block path** is not specialized in the first kernel. D4 makes
+it an entropy-shaped path like any other, and whether it deserves a fast
+path is a measurement question that belongs to the perf pass, filed as #206
+against a measured block-type mix.
+
+### 13.3 The validation ladder
+
+Every value read from the stream is checked before its first use as an
+address, a length or an offset, and the ladder is the M4 instance of
+section 9's rather than a second discipline:
+
+- the page is at least the 128 bytes 11.2 makes the minimum, and its word
+  count is derived from the caller's compressed size, never from the bits;
+- the reserved block type never appears, and a block header round that
+  claims one is a reject;
+- the code-length alphabet is checked for oversubscription and for
+  incompleteness in both directions, since an incomplete literal/length
+  code admits a decode that walks off the end of the symbol order;
+- a repeat code 16 with nothing to repeat, and a 17 or 18 run that carries
+  the length vector past the 318 the format allows, are rejects;
+- a distance greater than the bytes already produced in this tile is a
+  reject, because a tile is independent and a match may never reach before
+  its start;
+- a stored block whose declared length overruns the page or the remaining
+  destination capacity is a reject, and D3 removes the one's complement
+  that would otherwise have caught it, so this bound is the only one there
+  is;
+- a block that ends without its end-of-block symbol is a reject, and a lane
+  that consumes bits after the end-of-block lane is prevented rather than
+  detected, per 13.2;
+- the refill is bounded on every round, per 13.2;
+- success only on exact word consumption and exact declared output size,
+  per 13.2.
+
+The round loop carries fuel in the shape section 12.8 records for Zstd: a
+cap on rounds per page derived from the page's word count, argued to be
+unreachable for every input the bounds above admit, so a firing cap is a
+bug that the cap converted into a rejection and the bug is the finding.
+
+**Failure contract**, unchanged from section 9: on any reject
+`bytes_written` is zero and the status is non-OK, the destination up to the
+failure point is unspecified and is never presented as success, and every
+bound is checked before the load rather than after it, because on a GPU an
+out-of-bounds read can fault the launch and poison the whole batch rather
+than one tile.
+
+### 13.4 The batch entry
+
+`cudec_gdeflate_decompress_batch` takes raw pages with a caller-provided
+size array, which is the draft's external-enveloping model (11.4) and the
+shape `cudec_lz4_decompress_batch` already froze. One page is one chunk, so
+per-page status maps onto `cudec_chunk_result` with no new vocabulary and
+the 16-byte layout its static assertions pin does not move. The kernel is
+envelope-ignorant: the DirectStorage TileStream container is parsed on the
+host, above this entry, and hands it pages. That split is #216's to
+implement and #177's to drive, and neither is redesigned here.
+
+A page whose declared uncompressed size exceeds the destination capacity
+the caller gave is `CUDEC_ERR_OUTPUT_TOO_SMALL` with `bytes_written` zero,
+and the declared size never sizes an allocation, per the anti-pattern rule.
+
+### 13.5 The worst case, and what would falsify this design
+
+The M4 adversarial corpus is not LZ4's `worst-4Bmatch` in another format.
+What costs this kernel is rounds and refills per decoded byte, so the shape
+to construct is a page that maximizes them: symbols spread so that every
+lane consumes near its watermark on every round, copies split across two
+rounds on the same lane (section 11), block headers frequent enough that
+the one-active-lane header rounds are a real share of the total, and code
+lengths long enough that the root accelerator misses and the canonical walk
+runs. The quantity that corpus locks is rounds per decoded byte, and its
+generator asserts a floor on it, so a generator that stops being
+adversarial reds CI rather than quietly reporting a better number. That
+corpus is #226 and the density floor is its proof.
+
+What would falsify this design, recorded before it is built:
+
+- A measured table-build cost per block that is a large share of a page's
+  decode time. The fixed-footprint table trades a bounded build for a
+  slower tail on long codes and is chosen on memory rather than on time. If
+  the build dominates, the answer is a smaller root and a cheaper build,
+  not the two-level table 13.1 rejected, whose worst case is what made it
+  dead.
+- A measured root-accelerator miss rate high enough that the canonical
+  walk, rather than the parse, sets the round time. That is a measurement
+  against the real corpus and against #226's adversarial one, the two are
+  allowed to disagree, and the adversarial one is the number that binds.
+- Achieved registers above 64 per thread, which would put resident warps
+  below the 32 this whole budget is derived from and invalidate the
+  3200-byte figure rather than merely miss a target. Registers are read out
+  at the kernel pull request and recorded, as section 9 requires.
+- Any input that makes the shared-memory footprint depend on the stream.
+  That is the anti-pattern rule broken, and it is a defect in this design
+  rather than a tuning result.
