@@ -1955,10 +1955,12 @@ and the worst-case corpus families are recorded in 12.7 to 12.9.
 
 What is left, in order, each its own gated pull request:
 
-1. The intra-kernel work assignment, which is #213's to settle and is
-   deliberately not settled here: which lanes run the serial FSE cores,
-   how the four literal streams are assigned, and how the sequence
-   destinations are scanned.
+1. The intra-kernel work assignment, which was #213's to settle and is
+   settled in 14.7 to 14.11 below: which lanes run the serial cores, how
+   the four literal streams are assigned, and how the sequence
+   destinations are scanned. It is a record rather than a pull request of
+   its own, so the rung it leaves is the extraction work 14.9 names, which
+   lands with the kernel below.
 2. The kernel and `cudec_zstd_decompress_batch` (#203), minimal-correct,
    behind the frozen batch contract, with achieved registers and occupancy
    read out and recorded at that pull request.
@@ -1996,6 +1998,273 @@ them by naming where the literals live.
 - **A frame where the literal tail placement does not fit.** The invariant
   in 14.3 says it always does, so a case where it does not is a defect in
   that invariant and is the finding, not a reason to add a workspace.
+
+### 14.7 The rule that decides every lane assignment
+
+_14.7 to 14.11 are the intra-kernel work assignment, settled via the #213
+design panel on 2026-08-23, against the shape 14.1 to 14.6 fixed. As in
+14.1 to 14.6, the candidates were developed and scored inside this work
+rather than by a second person, and the arithmetic is the evidence in
+place of a second judge._
+
+The shape above says a block of four warps decodes one frame. It does not
+say which of the 128 threads runs what, and that is not free to choose,
+because every unit this kernel is made of is a host-twinned header the
+device compiles unchanged (14.5). One rule follows from that, and it
+decides almost every entry in the map below.
+
+**A lane assignment is free when it gives each lane its own call of an
+unchanged function. It is a new implementation when it splits one call
+across lanes.** Four literal streams on four lanes is four calls of
+`ZstdLiteralsDecodeStream`, and the twin that covers one call covers all
+four. Three sequence tables on three lanes is three calls of
+`ZstdSeqLoadTable`, and the same holds. Putting the three interleaved
+states of ONE call of `ZstdDecodeSequences` on three lanes is neither: it
+is a second decoder for the same bits, and the host twin beside it stops
+running the code the device runs.
+
+This map takes every free assignment and no unfree one. Where a lane wants
+a PIECE of a function rather than a call of it, the piece is extracted into
+its own function that the whole-frame form then calls, so the twin still
+exercises the exact code the device executes. 14.9 names the three places
+that costs something.
+
+It is also why the idle-lane answer below is so often "waits at the
+barrier". Finding work for an idle lane here means writing a second
+spelling of a unit whose first spelling is what the oracle diff runs
+against, and the project's ordering - correctness, then measured
+performance, then minimal code - puts that behind a measurement rather than
+in front of one.
+
+### 14.8 The stage map, lane by lane
+
+One block of a frame, start to finish. `t` is the thread index inside the
+block, so the warp is `t / 32` and the lane is `t % 32`. Every stage ends
+at a `__syncthreads()`, named because the stage after it reads what it
+wrote to shared memory.
+
+**A. The block header, and the literals header.** Thread 0 alone: the
+three-byte `Block_Header`, then `ZstdParseLiteralsHeader` for a Compressed
+block. Everything else waits. What the stage produces is small and every
+later stage wants all of it, so it goes to the block's shared scalars and
+is read from there rather than broadcast across four warps.
+
+That header is what makes stage B two teams instead of one. For both
+compressed literals types the section occupies `header_size +
+compressed_size` bytes and `src/zstd_literals.h` returns exactly that as
+`out_consumed`, so **where the sequences section starts is known before a
+single literal is decoded**. The two descriptions can be walked at the same
+time, and that is the only concurrency in this kernel that costs nothing to
+have.
+
+Raw and RLE literals leave stage B with nothing to do. They are a copy and
+a fill, they are the one place a literals section is byte-parallel, and all
+128 threads run them.
+
+**B. The two description walks, concurrently.** Barrier, then:
+
+- warp 0 lane 0: `ZstdHufReadWeights` over the tree description, then
+  `ZstdHufBuildDTable` into the 2048-cell table. Each is serial in its own
+  body and each is one call, so each is one lane.
+- warp 1 lane 0: `ZstdParseSeqSectionHeader`, then the field descriptions
+  in order. The three are a serial chain rather than three independent
+  reads: a description's length is known only once it has been decoded, so
+  each one's first byte is the previous one's `out_consumed`.
+- warp 1 lanes 0, 1 and 2: the three table BUILDS, one field each, once
+  that chain has produced all three count vectors. Independent objects,
+  three calls, free by 14.7.
+- every other thread: waits.
+
+The two walks read different bytes and write different shared arrays, so
+the concurrency is real rather than a barrier in disguise. Both are serial,
+so what it buys is the shorter of the two and not a fraction of the sum.
+
+**C. The literal streams.** Barrier, then warp 0 lanes 0 to 3, one call of
+`ZstdLiteralsDecodeStream` each, writing into the tail of the frame's
+remaining destination region where 14.3 places it. `Size_Format` 00 is one
+stream and lane 0 alone; every other value is four.
+
+**Four lanes cost what one lane costs, and that is a property of the split
+rather than of the hardware.** The regenerated sizes are three rounded-up
+quarters and a remainder (`src/zstd_literals.h`), so the four trip counts
+differ by at most three symbols, and four lanes of ONE warp running the
+same loop over nearly equal counts diverge for at most those three
+iterations. Four streams on four warps would buy nothing and spend three
+more warps buying it.
+
+**The fourth stream's size is bounded before any reader starts, and it is
+bounded once.** The jump table declares three compressed sizes and the
+fourth stream takes `stream_bytes - declared_total`, refused when the
+declared total reaches or passes the payload - equality included, because a
+stream of zero bytes has no start marker to read. That subtraction happens
+on the lane that read the header and the four spans are then broadcast;
+four lanes each re-deriving it would be four chances to derive it
+differently.
+
+Warps 1 to 3 wait.
+
+**D. The sequence pipeline, one tile at a time.** Barrier, then for each
+tile of at most 128 sequences:
+
+- D1, warp 0 lane 0: decode this tile's sequences, resolving each one's
+  `Offset_Value` against the frame's repeat history as it goes. Both halves
+  are serial chains over the same sequences, the bit cursor for one and the
+  three-slot history for the other, so they are one loop on one lane rather
+  than two passes over a materialised tile. Everything else waits.
+- D2, barrier, then all 128 threads: the block-relative destination and
+  literal cursor of every sequence in the tile. Two scans, one over
+  `literals_length + match_length` and one over `literals_length`, each
+  seeded by the carry the previous tile left.
+- D3, thread `t` takes sequence `t` of the tile: its literal run and its
+  match copy. One sequence per thread is what fixes the tile at 128, and it
+  is what warps 2 and 3 are for.
+- D4, barrier, and the two running sums carry forward.
+
+The last tile also carries the leftover literals, the bytes after the final
+sequence's literal run, which `ZstdExecPrefixSum`'s one-past-the-end
+destination is what locates. That copy is byte-parallel over all 128
+threads.
+
+**What warps 2 and 3 do for most of a frame is wait**, and the reason is
+14.2 rather than this map. 128 threads is the smallest block at which the
+table set stops binding the SM's block count, so the second two warps are
+bought by the occupancy arithmetic and then spent in D3. A map that found
+them work in stages B, C and D1 would be writing the second spellings 14.7
+refuses.
+
+### 14.9 The tile, and the three units it re-shapes
+
+The tile exists because the alternative fits nowhere. A block may declare
+`Block_Maximum_Size / 3` sequences - the bound `ZstdParseSeqSectionHeader`
+applies before a bit is read, since every sequence emits at least a
+three-byte match - which is 43690 for a 128 KiB block. The units as written
+take the whole set at once: `ZstdDecodeSequences` fills an array of
+`sequence_count`, `ZstdExecPrefixSum` fills `sequence_count + 1`
+destinations, and `ZstdExecuteBlock` walks both. At 16 bytes a
+`ZstdSequence` and 8 a destination, that is over a megabyte for one block,
+which is 14.3's argument against the phase pipeline arriving a second time
+from inside the fused shape.
+
+So sequences are produced and consumed 128 at a time and the block never
+holds more than one tile. That reaches three units, and each is a change to
+the unit rather than a copy of it:
+
+- **The sequence loop needs a resumable form.** `ZstdDecodeSequences`
+  starts a reader, decodes every sequence, and requires the stream to end
+  exactly at the last one. A tiled decode needs the reader and the three
+  FSE states to survive the call, with the end check moved to the tile
+  holding the final sequence. The whole-set form stays and calls the
+  resumable one.
+- **The prefix sum needs a carry in and a carry out.** `ZstdExecPrefixSum`
+  starts its running destination and its literals cursor at zero. The
+  resumable form takes both and returns both, and the block maximum is
+  compared against the running total rather than against the tile's own -
+  which is the same comparison moved, not a weaker one.
+- **The execution needs a per-sequence entry.** `ZstdExecuteBlock`'s loop
+  body is already independent per sequence in everything but the
+  `literal_at` cursor, which D2 now supplies. Extracting that body into its
+  own function, called once per lane on the device and in a loop by the
+  whole-block form on the host, keeps every rung of the execution reject
+  ladder in one place. That ladder holds the two offset bounds and the
+  plan-consistency check, which are the last things in this format that
+  should acquire a second spelling.
+
+**None of the three may be a device-only function.** A resumable form with
+no host caller is a unit the oracle diff never runs, and the M5 ladder's
+claim is that the device compiles the twinned headers unchanged.
+
+**The tile record is five 32-bit fields and every narrowing is checked.**
+Literals length, match length, resolved offset, block-relative destination
+and block-relative literal cursor. The first, second, fourth and fifth are
+bounded by `Block_Maximum_Size`, at most 128 KiB, by the prefix sum before
+they are written; the third is bounded by the window, at most 8 MB by 12.2,
+by the execution before the copy. The units carry all five as `uint64_t`
+because a frame's own quantities are, so the narrowing is refused where it
+would truncate rather than performed and hoped for - one comparison per
+field, on the lane that writes it.
+
+### 14.10 The cost, against the budget 14.2 fixed
+
+Shared memory per block, derived rather than estimated:
+
+| region                                       | bytes |
+| -------------------------------------------- | ----- |
+| the table set of 14.1                        | 9472  |
+| tile: 128 records of five 4-byte fields      | 2560  |
+| tile: the one-past-the-end destination       | 4     |
+| block scalars: frame state, headers, cursors | 256   |
+| total                                        | 12292 |
+
+Eight blocks is 98336 bytes, inside the roughly 100 KiB 14.2 reads for
+sm_86, with 4064 bytes left over, 508 per block. **That remainder is not
+slack, it is what absorbs whatever the driver reserves per block**, which
+is not measured on this route and is read out at the pull request that
+lands the kernel. If it turns out to be more than 508 bytes the tile halves
+to 64 records before anything else moves, and the map pays two warps of
+D3's fan-out rather than a resident frame.
+
+The table-build scratch adds nothing to that total. `ZstdSeqScratch` is 212
+bytes and three of them are live at once in stage B; `ZstdLiteralsScratch`
+is 564, of which the 256-byte weight-description table is already the last
+row of 14.1's table set. That is 1200 bytes at the widest, and it overlays
+the tile region, which holds nothing until stage D.
+
+**The sequence baselines become a resident table, in `__constant__` memory
+rather than shared.** `src/zstd_seq.h` recomputes a literals-length or
+match-length baseline by summing the widths below it on every lookup, and
+says in its own header that a resident table is a performance shape
+belonging to the kernel that needs it. This map takes it: 36 and 53
+four-byte baselines plus the extra-bit width of each code, under half a
+kilobyte, costing the budget above nothing because it is neither shared
+memory nor per frame. The values are the format's rather than the stream's,
+which is what makes them constant at all. It is still a second spelling of
+a twinned function, so it carries the lock that class asks for, a test
+walking every code of both alphabets and requiring the table to equal the
+function. Without the lock the table is the kind of guard that reads as
+coverage.
+
+**The register cost is budgeted here and measured at #203, and those are
+not the same statement.** 14.2's arithmetic is 32 resident warps at 64
+registers per thread. This map spends registers unevenly: the lane running
+D1 holds a bit reader, three FSE states, three cells and the repeat history
+at once, while the 127 threads waiting beside it hold almost nothing, and a
+block's allocation is per thread and takes the maximum, so the busy lane
+sets the whole block's. Nothing here measures that. What decides whether
+14.2 still holds is the achieved count `-Xptxas -v` reports at the kernel's
+own pull request, which is 14.5 rung 2.
+
+### 14.11 What would falsify the map
+
+- **A measured per-phase split in which D1 is the majority of a frame's
+  time.** It is the one stage with a single active lane and no way to widen
+  it without the second spelling 14.7 refuses, so if it dominates, the
+  lever worth paying a twin for is a three-lane team over the three
+  interleaved states. The property that makes one possible is written down
+  here so it is not rediscovered: for one sequence, all six bit widths are
+  known before any bit is consumed. The three peeks and the three updates
+  read the SAME cell, because a state is advanced only after its extra bits
+  are taken, so the three symbols and the three `nb_bits` arrive together;
+  the extras are at most 31, 16 and 16 bits and the updates at most 9, 9
+  and 8, so one sequence consumes at most 89 bits at six offsets that are
+  all computable from the three states before the first of them is read.
+  #235 to #239 are where that would be tried.
+- **A measured literals phase that dominates**, which is 14.6's first
+  trigger reaching this map rather than a second trigger beside it. Stage C
+  is four lanes of one warp and stage D3 is 128, so a frame whose time is
+  mostly stage C is a frame this block shape decodes with 124 threads
+  parked.
+- **A per-block shared reservation above 508 bytes.** The tile halves
+  first. Only if the arithmetic still misses at a tile of one sequence does
+  14.2's block size move, and that is 14.6's business rather than this
+  section's.
+- **A resumable form that cannot be written without a device-only body.**
+  If any of 14.9's three extractions turns out to need one, the tile is not
+  affordable and the frame needs a workspace, which reopens 14.3 and the
+  batch ABI together and is recorded rather than absorbed.
+- **A baseline table that disagrees with the function it replaces.** The
+  lock in 14.10 is what would say so, and it reds the build rather than
+  producing wrong bytes, which is the whole reason it is a lock and not a
+  comment.
 
 ## 15. M6 HIP port design (settled via the #110 design panel, 2026-08-23)
 
