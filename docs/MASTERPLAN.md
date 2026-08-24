@@ -581,12 +581,22 @@ bytes as well as cudec's, so a reject branch is demonstrably in parity
 rather than merely present.
 
 **Where this section is a commitment and where it is a description.** The
-parser core has landed; the seam and the batch entry have not. Each
+parser core, the seam and the batch entry have all landed; what has not is
+the device gate set (#154), the bench rung and the measured pass. Each
 subsection below says which it is, so the document cannot be read as a
 report of shipped code. The tree is the authority for the second kind and
 the commands that read it are given inline.
 
 ### The seam: what a parser owes the chunk decoder
+
+**Landed** as `src/chunk_decode.cuh` and `src/decode_sequence.h`, and the
+paragraphs below are what was committed to rather than a report of the
+result. The requirement list is stated at the head of the kernel header,
+where the code that breaks when one of them is missed can be read beside it,
+and the header carries one requirement this section did not name: a reported
+match offset below 2^32, which is what makes the 32-bit gather arm's
+narrowing lossless. It holds structurally from the offset field's width in
+both formats rather than from a check on parsed input.
 
 **A commitment.** The chunk decoder becomes
 `template <class Parser, bool ParseOnly>` in `src/chunk_decode.cuh`: the
@@ -713,14 +723,22 @@ the three outcomes are unchanged - and it buys the batch entry the declared
 length without parsing the varint twice. The panel's objection to a _seam_
 method stands; this is a parser-local one.
 
-**Not yet executed:** the panel also called for promoting the LZ4 sequence
-type to one shared element vocabulary in `src/decode_sequence.h`. The
-parser core kept a format-local element type instead, so there are two
-today. Materializing the seam is where that is either executed or overturned
-with a stated reason; it cannot be left implicit, because one shared element
-vocabulary is what the "copy engine checks nothing" rule rests on.
+**Executed with the seam:** the panel also called for promoting the LZ4
+sequence type to one shared element vocabulary in `src/decode_sequence.h`,
+and the parser core had kept a format-local element type instead. There is
+one type now. `DecodeSequence` carries a literals half and a match half;
+LZ4 fills both, and Snappy fills exactly one and leaves the other empty,
+which is what let the `is_copy` flag go rather than be carried across the
+seam. The copy engine runs both halves unconditionally and has nothing to
+branch on, which is the "copy engine checks nothing" rule with one contract
+behind it instead of two. `tests/CMakeLists.txt` locks the single source the
+way it already locks `cuda_raii.h` and the batch limit.
 
 ### The batch entry
+
+**Landed** in `include/cudec.h` and `src/batch.cu`; the paragraphs below are
+the commitment it was built to. Its contract conformance - every documented
+synchronous reject, one call each, from C99 - is the sibling rung (#152).
 
 **A commitment.** `cudec_snappy_decompress_batch` carries the
 `cudec_lz4_decompress_batch` contract with no deltas: device-side argument
@@ -738,8 +756,10 @@ supported surface as raw Snappy streams; M3 ships the batch entry only, and
 generalizing the streaming path to Snappy was a separate scope decision, filed
 rather than smuggled in here and now settled below.
 
-Today `include/cudec.h` declares no Snappy entry (`grep -c snappy
-include/cudec.h` reports 0). The batch-entry rung carries it.
+The entry is declared, and the count that used to read zero is derived
+rather than restated here:
+
+    grep -c snappy include/cudec.h
 
 ### The framing format: out of scope, with the evidence
 
