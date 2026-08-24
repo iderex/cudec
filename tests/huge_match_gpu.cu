@@ -1,6 +1,6 @@
 /* The match longer than 2^32, decoded on the device (issue #331).
  *
- * src/lz4_decode.cuh runs the closed-form overlap gather at two arithmetic
+ * src/chunk_decode.cuh runs the closed-form overlap gather at two arithmetic
  * widths and picks the 32-bit one under `seq.match_len <= UINT32_MAX`. Every
  * other test in the tree stays far below that bound, so deleting the test and
  * leaving the narrow arm unconditional left the whole suite green - a guard

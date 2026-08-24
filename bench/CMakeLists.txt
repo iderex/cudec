@@ -1,7 +1,7 @@
 # The benchmark harness: honest numbers or none - every report emits its
 # methodology block (docs/MASTERPLAN.md section 5). The CPU-oracle path is
 # always timed; --gpu adds the device-resident GPU decode path (gpu_bench.cu,
-# which shares the shipped kernel via src/lz4_decode.cuh). Consumer-only by
+# which shares the shipped kernel via src/chunk_decode.cuh). Consumer-only by
 # rule: this directory links project targets and never modifies them (the
 # conformance snapshot in tests/ runs before it).
 find_package(CUDAToolkit REQUIRED)

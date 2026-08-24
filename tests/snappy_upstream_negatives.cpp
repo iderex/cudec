@@ -92,7 +92,7 @@ cudec_status TwinVerdict(const Bytes& stream, uint64_t* produced,
         *rung = parser.reject;
         return status;
     }
-    cudec_detail::SnappyElement element;
+    cudec_detail::DecodeSequence element;
     bool done = false;
     uint64_t fuel = static_cast<uint64_t>(size) + 2;
     while (true) {

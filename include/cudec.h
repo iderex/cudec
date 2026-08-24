@@ -107,6 +107,36 @@ cudec_status cudec_lz4_decompress_batch(const void* const* d_src_ptrs,
                                         cudec_chunk_result* d_results,
                                         cudec_stream_t stream);
 
+/* Batch Snappy block decode. The contract above holds argument for
+ * argument: the same device-side arrays, the same per-chunk result
+ * semantics, the same synchronous validation rejects with the same
+ * CUDEC_ERR_INVALID_ARGUMENT and the same launch limit, the same
+ * asynchronous launch on `stream`, and the same pending-CUDA-error
+ * semantics. Nothing about the batch contract varies by format.
+ *
+ * The supported surface is the RAW Snappy stream - the varint-prefixed
+ * block google/snappy's Compress and Uncompress produce. The Snappy FRAMING
+ * format (stream identifier, framed chunks, masked CRC-32C) is not
+ * decoded here and no entry point decodes it, so a framed stream is a
+ * malformed raw one and is rejected as CUDEC_ERR_CORRUPT_INPUT rather than
+ * partially decoded.
+ *
+ * The declared uncompressed length that opens every raw stream is
+ * attacker-controlled and is never used to size anything: it is checked
+ * against that chunk's d_dst_capacities entry before an element is parsed,
+ * and a declaration above the capacity reports CUDEC_ERR_OUTPUT_TOO_SMALL.
+ * Every later overrun of the declared length reports
+ * CUDEC_ERR_CORRUPT_INPUT: once a stream has declared its own length, an
+ * element that runs past it is inconsistent rather than short of room, and
+ * a larger destination would not make it valid. */
+cudec_status cudec_snappy_decompress_batch(const void* const* d_src_ptrs,
+                                           const size_t* d_src_sizes,
+                                           void* const* d_dst_ptrs,
+                                           const size_t* d_dst_capacities,
+                                           size_t chunk_count,
+                                           cudec_chunk_result* d_results,
+                                           cudec_stream_t stream);
+
 /* Decode a single LZ4 frame (the .lz4 container: magic, frame descriptor,
  * data blocks, end mark, optional checksums) from host memory into host
  * memory, using the GPU batch decoder internally. Synchronous.

@@ -58,7 +58,7 @@ int RequireTerminates(const std::string& context, const Bytes& stream,
         std::memcpy(tight.get(), stream.data(), stream_size);
     }
     cudec_detail::Lz4Parser parser{tight.get(), stream_size, dst_capacity};
-    cudec_detail::Lz4Sequence seq;
+    cudec_detail::DecodeSequence seq;
 
     const uint64_t budget = static_cast<uint64_t>(stream_size) + 1;
     uint64_t steps = 0;

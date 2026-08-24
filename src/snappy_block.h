@@ -15,19 +15,21 @@
  * `decompressor->eof() && writer->CheckLength()` enforces on both ends.
  *
  * Two differences from LZ4 shape the code. An element is a literal OR a
- * copy rather than a literal run followed by a match, so SnappyElement
- * carries one range and a kind. And a length never continues across an
+ * copy rather than a literal run followed by a match, so exactly one half
+ * of the shared DecodeSequence is filled and the other is left empty - the
+ * copy engine runs both halves either way and needs no kind flag to branch
+ * on (src/decode_sequence.h). And a length never continues across an
  * unbounded chain of extension bytes: an element's header is the tag plus
  * at most four trailing bytes, which is snappy's kMaximumTagLength, so the
  * per-element termination argument needs no fuel counter.
  *
- * Widths, for the kernel that will consume this: the declared length is a
+ * Widths, for the kernel that consumes this: the declared length is a
  * varint32, so every output position, every copy offset and every element
- * length provably fits in 32 bits. The fields below are 64-bit anyway,
- * because the caller's capacity is a size_t and mixing the two widths in
- * the bound comparisons is where an overflow would hide. Whether the
- * DEVICE side should carry 32-bit copies of them is a kernel-shape question
- * and is not settled here.
+ * length provably fits in 32 bits. The shared element's fields are 64-bit
+ * anyway, because the caller's capacity is a size_t and mixing the two
+ * widths in the bound comparisons is where an overflow would hide. Whether
+ * the DEVICE side should carry 32-bit copies of them is a measured
+ * kernel-shape question (issue #292) and is not settled here.
  *
  * Edge semantics are settled empirically by oracle parity - whenever
  * snappy rejects, this parser must reject (tests/snappy_parser_twin.cpp).
@@ -37,21 +39,9 @@
 #define CUDEC_SNAPPY_BLOCK_H
 
 #include "cudec.h"
+#include "decode_sequence.h"
 
 #include <stdint.h>
-
-/* Guarded: src/lz4_block.h defines the same macro for the same reason, and
- * a device translation unit that decodes both formats includes both
- * headers. The definitions are identical, so an unguarded second one is
- * legal rather than an error - which is exactly why it would go unnoticed
- * if they ever stopped being identical. */
-#ifndef CUDEC_HOST_DEVICE
-#if defined(__CUDACC__)
-#define CUDEC_HOST_DEVICE __host__ __device__
-#else
-#define CUDEC_HOST_DEVICE
-#endif
-#endif
 
 namespace cudec_detail {
 
@@ -145,36 +135,33 @@ CUDEC_HOST_DEVICE inline cudec_status SnappyRefuse(SnappyReject branch,
     return status;
 }
 
-/* One parsed element, in absolute offsets.
+/* An element is reported in the shared vocabulary of
+ * src/decode_sequence.h, which the chunk decoder's copy engine is the sole
+ * consumer of. Snappy's element is a literal OR a copy, never both, so
+ * exactly one of the two halves is non-empty and the other has length zero.
  *
- * A LITERAL (is_copy false) copies `length` bytes from src[from ..
- * from+length) to dst[to .. to+length). `from` indexes the source stream
- * and `to` the destination; they count in different buffers and no
- * inequality relates them.
+ * A LITERAL fills the literals half: literals_len bytes from
+ * src[literals_src ..) to dst[literals_dst ..). The two positions index
+ * different buffers and no inequality relates them. match_len is zero.
  *
- * A COPY (is_copy true) replicates `length` bytes inside dst, reading from
- * dst[from ..]. The read may run into bytes this element is itself writing,
- * which is the pattern-repeating semantics an overlapping Snappy copy has,
- * so a caller executing it sequentially must copy byte by byte in
- * increasing order (offset = to - from, and a warp gather reduces by that
- * offset). `from < to` always holds: an offset of zero is refused.
+ * A COPY fills the match half: match_len bytes replicated inside dst,
+ * reading from dst[match_src ..). The read may run into bytes this element
+ * is itself writing, which is the pattern-repeating semantics an
+ * overlapping Snappy copy has, so a sequential executor must copy byte by
+ * byte in increasing order and a warp gather reduces by
+ * offset = match_dst - match_src. match_src < match_dst always holds: an
+ * offset of zero is refused. literals_len is zero.
  *
- * The TERMINAL element, the one handed back with *done set, is a literal of
- * length 0 with `from` 0 and `to` equal to the declared length. Executing
- * it copies nothing. It is spelled out rather than left undefined because
- * a caller that executes unconditionally before testing *done reads all
- * four fields.
+ * The TERMINAL element, the one handed back with *done set, has both
+ * lengths zero and every position zero. Executing it copies nothing. It is
+ * spelled out rather than left undefined because a caller that executes
+ * unconditionally before testing *done reads every field.
  *
- * What the parser has already proved when it hands one back: for a literal,
- * from + length <= the source size; for a copy, from < to and
- * to + length <= the declared output length; and in both cases
- * to + length <= the declared length <= the caller's capacity. */
-struct SnappyElement {
-    uint64_t from;
-    uint64_t to;
-    uint64_t length;
-    bool is_copy;
-};
+ * What the parser has already proved when it hands one back: for a
+ * literal, literals_src + literals_len <= the source size; for a copy,
+ * match_src < match_dst and match_dst + match_len <= the declared output
+ * length; and in both cases the write end is at or below the declared
+ * length, which is itself at or below the caller's capacity. */
 
 /* The preamble alone, for a caller that must BOUND its destination before
  * any element exists - the batch entry point checks the declared length
@@ -285,7 +272,7 @@ struct SnappyParser {
      * offset bytes - and each is a counted for whose trip count is bounded
      * by a compile-time maximum of five, four and four; the tag selects a
      * value inside that bound and cannot raise it. */
-    CUDEC_HOST_DEVICE cudec_status Next(SnappyElement* element, bool* done) {
+    CUDEC_HOST_DEVICE cudec_status Next(DecodeSequence* element, bool* done) {
         *done = false;
         if (finished) {
             /* Called past the terminal element. */
@@ -308,10 +295,7 @@ struct SnappyParser {
                 return SnappyRefuse(kSnappyRejectUnderProduction,
                                     CUDEC_ERR_CORRUPT_INPUT, &reject);
             }
-            element->from = 0;
-            element->to = dst_pos;
-            element->length = 0;
-            element->is_copy = false;
+            *element = DecodeSequence{};
             finished = true;
             *done = true;
             return CUDEC_OK;
@@ -367,10 +351,10 @@ struct SnappyParser {
                 return SnappyRefuse(kSnappyRejectLiteralOverProduction,
                                     CUDEC_ERR_CORRUPT_INPUT, &reject);
             }
-            element->from = src_pos;
-            element->to = dst_pos;
-            element->length = length;
-            element->is_copy = false;
+            *element = DecodeSequence{};
+            element->literals_src = src_pos;
+            element->literals_dst = dst_pos;
+            element->literals_len = length;
             src_pos += length;
             dst_pos += length;
             return CUDEC_OK;
@@ -426,10 +410,10 @@ struct SnappyParser {
             return SnappyRefuse(kSnappyRejectCopyOverProduction,
                                 CUDEC_ERR_CORRUPT_INPUT, &reject);
         }
-        element->from = dst_pos - offset;
-        element->to = dst_pos;
-        element->length = length;
-        element->is_copy = true;
+        *element = DecodeSequence{};
+        element->match_src = dst_pos - offset;
+        element->match_dst = dst_pos;
+        element->match_len = length;
         dst_pos += length;
         return CUDEC_OK;
     }

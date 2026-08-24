@@ -62,7 +62,7 @@ inline cudec_status SnappyTwinDrive(const unsigned char* src,
                                     SnappyTwinObserver* observer) {
     out->assign(static_cast<size_t>(capacity), 0);
     cudec_detail::SnappyParser parser{src, src_size, capacity};
-    cudec_detail::SnappyElement element;
+    cudec_detail::DecodeSequence element;
     bool done = false;
     uint64_t fuel = src_size + 2;
     while (true) {
@@ -92,37 +92,39 @@ inline cudec_status SnappyTwinDrive(const unsigned char* src,
             parser.src_pos <= parser.src_size &&
             parser.dst_pos <= parser.declared &&
             parser.declared <= capacity &&
-            element.to + element.length <= parser.dst_pos &&
-            (element.is_copy ? element.from < element.to
-                             : element.from + element.length <=
-                                   parser.src_pos);
+            element.literals_dst + element.literals_len <= parser.dst_pos &&
+            element.literals_src + element.literals_len <= parser.src_pos &&
+            element.match_dst + element.match_len <= parser.dst_pos &&
+            (element.match_len == 0 || element.match_src < element.match_dst);
         if (!bounded) {
             std::fprintf(stderr,
                          "the parser left its bounds: src_pos=%llu/%llu "
-                         "dst_pos=%llu/%llu element from=%llu to=%llu len=%llu "
-                         "copy=%d\n",
+                         "dst_pos=%llu/%llu literals %llu->%llu len=%llu "
+                         "match %llu->%llu len=%llu\n",
                          static_cast<unsigned long long>(parser.src_pos),
                          static_cast<unsigned long long>(parser.src_size),
                          static_cast<unsigned long long>(parser.dst_pos),
                          static_cast<unsigned long long>(parser.declared),
-                         static_cast<unsigned long long>(element.from),
-                         static_cast<unsigned long long>(element.to),
-                         static_cast<unsigned long long>(element.length),
-                         element.is_copy ? 1 : 0);
+                         static_cast<unsigned long long>(element.literals_src),
+                         static_cast<unsigned long long>(element.literals_dst),
+                         static_cast<unsigned long long>(element.literals_len),
+                         static_cast<unsigned long long>(element.match_src),
+                         static_cast<unsigned long long>(element.match_dst),
+                         static_cast<unsigned long long>(element.match_len));
             observer->bounds_violations++;
             out->clear();
             return CUDEC_ERR_CORRUPT_INPUT;
         }
-        if (element.is_copy) {
-            for (uint64_t i = 0; i < element.length; i++) {
-                (*out)[static_cast<size_t>(element.to + i)] =
-                    (*out)[static_cast<size_t>(element.from + i)];
-            }
-        } else {
-            for (uint64_t i = 0; i < element.length; i++) {
-                (*out)[static_cast<size_t>(element.to + i)] =
-                    src[element.from + i];
-            }
+        /* Both halves are executed unconditionally, in the kernel's order,
+         * because that is the contract the copy engine works to; Snappy
+         * leaves one of the two empty on every element. */
+        for (uint64_t i = 0; i < element.literals_len; i++) {
+            (*out)[static_cast<size_t>(element.literals_dst + i)] =
+                src[element.literals_src + i];
+        }
+        for (uint64_t i = 0; i < element.match_len; i++) {
+            (*out)[static_cast<size_t>(element.match_dst + i)] =
+                (*out)[static_cast<size_t>(element.match_src + i)];
         }
         if (done) {
             break;

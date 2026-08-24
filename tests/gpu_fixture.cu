@@ -5,7 +5,14 @@
  * contract as the CPU twin (where cudec accepts, liblz4 accepts and the
  * bytes match; where liblz4 rejects, cudec rejects), with the documented
  * offset==0 stricter case allowed. On success the decoder writes exactly
- * bytes_written, so the poison beyond it must survive. */
+ * bytes_written, so the poison beyond it must survive.
+ *
+ * Both formats run through here, and the same plumbing drives both on
+ * purpose (issue #150): the two entry points differ in one template
+ * argument to one chunk decoder, so a difference this test could see would
+ * be a difference in the parser and nowhere else. The Snappy half is the
+ * pristine direction only - the mutant reject parity and the determinism
+ * gate for that format are the device gate set (#154). */
 #include "cudec.h"
 #include "fixtures.h"
 #include "require.h"
@@ -13,8 +20,13 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
+
+#ifndef CUDEC_SNAPPY_TESTDATA_DIR
+#error "CUDEC_SNAPPY_TESTDATA_DIR must name the pinned archive's testdata/"
+#endif
 
 namespace {
 
@@ -55,10 +67,17 @@ int UploadBatchTables(size_t n, const std::vector<const void*>& h_srcs,
     return 0;
 }
 
+/* The shape both public batch entries have. Taken as a parameter rather
+ * than branched on, so the plumbing below cannot treat one format
+ * differently from the other by accident. */
+using BatchEntry = cudec_status (*)(const void* const*, const size_t*,
+                                    void* const*, const size_t*, size_t,
+                                    cudec_chunk_result*, cudec_stream_t);
+
 /* Uploads a batch, runs it through the entry point on a created stream,
  * and returns the per-chunk results plus the downloaded (poisoned)
  * destination buffers. Plain int-returning so REQUIRE can early-abort. */
-int RunBatch(const std::vector<Chunk>& chunks,
+int RunBatch(const std::vector<Chunk>& chunks, BatchEntry entry,
              std::vector<cudec_chunk_result>* results,
              std::vector<std::vector<unsigned char>>* dst_bytes) {
     const size_t n = chunks.size();
@@ -93,8 +112,8 @@ int RunBatch(const std::vector<Chunk>& chunks,
 
     cudaStream_t stream;
     REQUIRE_CUDA(cudaStreamCreate(&stream));
-    REQUIRE(cudec_lz4_decompress_batch(d_srcs, d_sizes, d_dsts, d_caps, n,
-                                       d_results, stream) == CUDEC_OK);
+    REQUIRE(entry(d_srcs, d_sizes, d_dsts, d_caps, n, d_results, stream) ==
+            CUDEC_OK);
     REQUIRE_CUDA(cudaStreamSynchronize(stream));
     REQUIRE_CUDA(cudaStreamDestroy(stream));
 
@@ -130,6 +149,17 @@ int CheckDecodedOk(const char* ctx, const cudec_chunk_result& result,
     return 0;
 }
 
+/* One file out of the pinned snappy archive's testdata/, read whole. The
+ * bytes are proved by the archive's URL_HASH, so nothing is copied into
+ * this tree; a missing or unreadable file is an infrastructure failure and
+ * the caller reds on the empty result rather than skipping the entry. */
+std::vector<unsigned char> ReadTestdata(const char* name) {
+    const std::string path = std::string(CUDEC_SNAPPY_TESTDATA_DIR) + "/" + name;
+    std::ifstream in(path.c_str(), std::ios::binary);
+    return std::vector<unsigned char>(std::istreambuf_iterator<char>(in),
+                                      std::istreambuf_iterator<char>());
+}
+
 }  // namespace
 
 int main() {
@@ -152,7 +182,8 @@ int main() {
     }
     std::vector<cudec_chunk_result> results;
     std::vector<std::vector<unsigned char>> dsts;
-    REQUIRE(RunBatch(pairs, &results, &dsts) == 0);
+    REQUIRE(RunBatch(pairs, cudec_lz4_decompress_batch, &results, &dsts) ==
+            0);
     for (size_t i = 0; i < fixtures.size(); i++) {
         REQUIRE(CheckDecodedOk(pairs[i].context.c_str(), results[i],
                                fixtures[i].original, dsts[i]) == 0);
@@ -185,7 +216,8 @@ int main() {
         mutant_chunks.push_back(Chunk{mutant_contexts[i], &mutant_streams[i],
                                       mutant_capacities[i]});
     }
-    REQUIRE(RunBatch(mutant_chunks, &results, &dsts) == 0);
+    REQUIRE(RunBatch(mutant_chunks, cudec_lz4_decompress_batch, &results,
+                     &dsts) == 0);
     size_t rejected_count = 0;
     size_t stricter_count = 0;
     std::string stricter_ctx;
@@ -259,11 +291,74 @@ int main() {
         }
     }
 
-    std::printf("PASS: %zu pairs decoded byte-exact + %zu mutants in oracle "
-                "parity (%zu oracle-rejected, %zu offset==0 stricter) + 40000 "
-                "grid-stride wraparound chunks on the GPU decoder; failure "
-                "contract and poison beyond bytes_written intact\n",
+    /* Batch 4: the generated Snappy corpus through the Snappy
+     * instantiation of the same chunk decoder, at the same slack capacity,
+     * so the exactly-bytes_written guarantee is exercised on this format's
+     * primary success path too. A wider capacity cannot make a valid raw
+     * stream decode differently: the declaration is compared against it and
+     * every later bound is taken from the declaration. */
+    const auto snappy = MakeSnappyFixtures();
+    REQUIRE(!snappy.empty());
+    std::vector<Chunk> snappy_pairs;
+    for (const auto& f : snappy) {
+        snappy_pairs.push_back(
+            Chunk{f.name, &f.compressed, f.original.size() + 8});
+    }
+    REQUIRE(RunBatch(snappy_pairs, cudec_snappy_decompress_batch, &results,
+                     &dsts) == 0);
+    for (size_t i = 0; i < snappy.size(); i++) {
+        REQUIRE(CheckDecodedOk(snappy_pairs[i].context.c_str(), results[i],
+                               snappy[i].original, dsts[i]) == 0);
+    }
+
+    /* Batch 5: the whole vendored corpus, compressed by the oracle and
+     * decoded on the device, at exact capacity. The generated fixtures
+     * above are built against the format's own boundaries and are small;
+     * these are real inputs of a size where a page of literals, the 64-byte
+     * copy cap and the compressor's 65536-byte block split all occur many
+     * times over, which is the only place a lane-fan-out defect that
+     * survives a short stream would show. Named one by one rather than
+     * globbed: a directory that quietly lost a file would otherwise shrink
+     * this batch and still pass. The three baddata*.snappy entries are not
+     * here - they are already decoded streams and are the negative corpus
+     * of tests/snappy_upstream_negatives.cpp. */
+    static const char* const kTestdata[] = {
+        "alice29.txt", "asyoulik.txt",   "fireworks.jpeg", "geo.protodata",
+        "html",        "html_x_4",       "kppkn.gtb",      "lcet10.txt",
+        "paper-100k.pdf", "plrabn12.txt", "urls.10K"};
+    constexpr size_t kTestdataCount = sizeof(kTestdata) / sizeof(*kTestdata);
+    std::vector<std::vector<unsigned char>> corpus_original(kTestdataCount);
+    std::vector<std::vector<unsigned char>> corpus_compressed(kTestdataCount);
+    std::vector<std::string> corpus_names(kTestdataCount);
+    size_t corpus_bytes = 0;
+    for (size_t i = 0; i < kTestdataCount; i++) {
+        corpus_original[i] = ReadTestdata(kTestdata[i]);
+        REQUIRE_CTX(!corpus_original[i].empty(), "testdata %s unreadable",
+                    kTestdata[i]);
+        corpus_compressed[i] = SnappyCompressBlock(corpus_original[i]);
+        corpus_names[i] = std::string("testdata/") + kTestdata[i];
+        corpus_bytes += corpus_original[i].size();
+    }
+    std::vector<Chunk> corpus_chunks;
+    for (size_t i = 0; i < kTestdataCount; i++) {
+        corpus_chunks.push_back(Chunk{corpus_names[i], &corpus_compressed[i],
+                                      corpus_original[i].size()});
+    }
+    REQUIRE(RunBatch(corpus_chunks, cudec_snappy_decompress_batch, &results,
+                     &dsts) == 0);
+    for (size_t i = 0; i < kTestdataCount; i++) {
+        REQUIRE(CheckDecodedOk(corpus_names[i].c_str(), results[i],
+                               corpus_original[i], dsts[i]) == 0);
+    }
+
+    std::printf("PASS: %zu LZ4 pairs decoded byte-exact + %zu mutants in "
+                "oracle parity (%zu oracle-rejected, %zu offset==0 stricter) + "
+                "40000 grid-stride wraparound chunks + %zu Snappy pairs + %zu "
+                "vendored testdata files (%zu bytes) decoded byte-exact on the "
+                "GPU decoder; failure contract and poison beyond "
+                "bytes_written intact\n",
                 pairs.size(), mutant_chunks.size(), rejected_count,
-                stricter_count);
+                stricter_count, snappy_pairs.size(), kTestdataCount,
+                corpus_bytes);
     return 0;
 }

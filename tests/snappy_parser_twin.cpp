@@ -101,7 +101,7 @@ bool LivenessHolds(const Bytes& stream, const char** why) {
     }
     cudec_detail::SnappyParser parser{tight.get(), stream_size,
                                       kSnappyOracleMaxOutput};
-    cudec_detail::SnappyElement element;
+    cudec_detail::DecodeSequence element;
     bool done = false;
     uint64_t fuel = static_cast<uint64_t>(stream_size) + 2;
     while (true) {
@@ -656,7 +656,7 @@ int main() {
         Bytes valid = Preamble(4);
         Append(&valid, Literal(Ascii("abcd")));
         cudec_detail::SnappyParser parser{valid.data(), valid.size(), 4};
-        cudec_detail::SnappyElement element;
+        cudec_detail::DecodeSequence element;
         bool done = false;
         uint64_t fuel = valid.size() + 2;
         while (!done) {

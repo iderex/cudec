@@ -46,7 +46,7 @@
  * increasing order - the same semantics src/lz4_block.h and src/snappy_block.h
  * carry, and the run-fill an offset of one produces is the extreme case. The
  * device form of the same statement is the closed-form modular gather
- * src/lz4_decode.cuh already uses, dst[to + i] = dst[to - offset + (i mod
+ * src/chunk_decode.cuh already uses, dst[to + i] = dst[to - offset + (i mod
  * offset)], which is defined for every i because an offset of zero is refused
  * below. A vector copy of the range would produce different bytes, not a
  * faster version of the same ones.

@@ -1,15 +1,51 @@
-/* The warp-per-chunk LZ4 decode kernel, templated on the copy mode so the
- * shipped decoder and the bench's parse-only ceiling share ONE parse (an
- * honest ceiling - masterplan section 9). The public entry (src/batch.cu)
- * instantiates Full; the bench instantiates ParseOnly. Each translation
- * unit emits only the instantiation it launches, so the shipped library
- * carries no parse-only kernel. Internal header, not part of the ABI. */
-#ifndef CUDEC_LZ4_DECODE_CUH
-#define CUDEC_LZ4_DECODE_CUH
+/* The warp-per-chunk chunk decoder: one kernel, templated on the format
+ * parser and on the copy mode. The parser is a template parameter rather
+ * than a hard-wired type because everything below it - the fuel cap, the
+ * two copy loops, the __syncwarp() placement, the geometry guards, the
+ * failure contract - is format-independent, and a second copy of it per
+ * format would be a second place for the fail-closed discipline to drift
+ * (masterplan section 10, "The seam"). src/batch.cu instantiates it once
+ * per format; the bench instantiates ParseOnly for its honest parse-only
+ * ceiling (masterplan section 9). Each translation unit emits only the
+ * instantiations it launches, so the shipped library carries no parse-only
+ * kernel. Internal header, not part of the ABI.
+ *
+ * What a Parser owes, and what this kernel is entitled to assume. The
+ * requirements are stated here because this is the code that breaks when
+ * one of them is not met:
+ *
+ *  - construction from the chunk's source pointer, source size and
+ *    destination capacity, and nothing else;
+ *  - one entry point, Next(DecodeSequence*, bool*), returning exactly three
+ *    outcomes: an element to execute and call again, the single success
+ *    exit with *done set, or a reject status;
+ *  - LIVENESS: every call that hands back a non-terminal element consumes
+ *    at least one source byte. The fuel bound below is derived from the
+ *    source size, so a parser that can return without advancing breaks
+ *    termination for the whole family, not only for its own format;
+ *  - LANE-UNIFORMITY: the parser reads source bytes and its own state and
+ *    nothing else. All 32 lanes run it redundantly in lockstep, and that is
+ *    sound only while every lane computes the same answer;
+ *  - ALL input validation inside the parser. The copy loops below perform
+ *    no input-derived bound check of their own, by design: a parser that
+ *    hands back an element it has not fully bounded has already failed
+ *    closed-ness and nothing here will catch it;
+ *  - a dst_pos member holding the bytes produced, read once on success;
+ *  - a reported match offset (match_dst - match_src) that is at least 1 and
+ *    below 2^32. The lower bound keeps the closed-form gather from a
+ *    modulo by zero; the upper one is what makes the 32-bit gather arm
+ *    lossless. Both hold structurally from the offset field's width in
+ *    every format on this seam, and neither is re-checked here.
+ *
+ * The parse is redundant across lanes rather than broadcast, and the
+ * element type is shared across formats rather than associated with each
+ * parser - both settled at the #85 design panel and not re-opened here. */
+#ifndef CUDEC_CHUNK_DECODE_CUH
+#define CUDEC_CHUNK_DECODE_CUH
 
 #include "batch_limits.h"
 #include "cudec.h"
-#include "lz4_block.h"
+#include "decode_sequence.h"
 
 #include <cuda_runtime.h>
 
@@ -26,11 +62,11 @@ constexpr unsigned kBlockThreads = kWarpSize * kBlockWarps;  /* 128 */
  * ordering at the two copy boundaries. ParseOnly elides the copies and the
  * syncs to isolate the parse cost - it writes no output and is a bench
  * ceiling only, never shipped. */
-template <bool ParseOnly>
+template <class Parser, bool ParseOnly>
 __global__ void __launch_bounds__(kBlockThreads)
-    lz4_decode_batch(const void* const* src_ptrs, const size_t* src_sizes,
-                     void* const* dst_ptrs, const size_t* dst_caps,
-                     size_t chunk_count, cudec_chunk_result* results) {
+    chunk_decode_batch(const void* const* src_ptrs, const size_t* src_sizes,
+                       void* const* dst_ptrs, const size_t* dst_caps,
+                       size_t chunk_count, cudec_chunk_result* results) {
     const unsigned lane = threadIdx.x % kWarpSize;
     const size_t warp_in_grid =
         (blockIdx.x * blockDim.x + threadIdx.x) / kWarpSize;
@@ -83,11 +119,12 @@ __global__ void __launch_bounds__(kBlockThreads)
         unsigned char* dst = static_cast<unsigned char*>(dst_ptrs[chunk]);
 
         const size_t src_size = src_sizes[chunk];
-        Lz4Parser parser{src, src_size, dst_caps[chunk]};
-        Lz4Sequence seq;
+        Parser parser{src, src_size, dst_caps[chunk]};
+        DecodeSequence seq;
         cudec_status status = CUDEC_OK;
         bool done = false;
-        /* Fuel: Next consumes at least the token byte, so a chunk of n
+        /* Fuel: the seam's liveness requirement says every non-terminal
+         * call consumes at least one source byte, so a chunk of n
          * source bytes admits at most n + 1 calls - a budget no input the
          * parser accepts or rejects can reach. The saturating form matters:
          * a plain n + 1 would wrap to 0 for a SIZE_MAX chunk size and cap a
@@ -114,8 +151,12 @@ __global__ void __launch_bounds__(kBlockThreads)
                      * sm_86 has no integer-divide hardware, so a modulo by
                      * a runtime divisor is a software sequence, and the
                      * 64-bit one costs roughly twice the 32-bit one - paid
-                     * once per match byte per lane. `offset` is the LZ4
-                     * 2-byte offset field and never exceeds 65535, but `i`
+                     * once per match byte per lane. `offset` comes out of a
+                     * format's offset FIELD, whose width bounds it below
+                     * 2^32 structurally rather than by a check on parsed
+                     * input - two bytes for LZ4, at most four for Snappy -
+                     * which is the seam requirement stated at the top of
+                     * this header, and it is why off32 loses nothing. `i`
                      * is bounded only by match_len, which the ABI's size_t
                      * capacities admit above 2^32, so the narrowing is
                      * sound only under the test. No field is narrowed and
@@ -202,4 +243,4 @@ inline cudec_status validate_batch_args(const void* const* d_src_ptrs,
 
 }  // namespace cudec_detail
 
-#endif /* CUDEC_LZ4_DECODE_CUH */
+#endif /* CUDEC_CHUNK_DECODE_CUH */
