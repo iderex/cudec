@@ -29,6 +29,15 @@ Issue-driven, gate-driven:
   nvCOMP is proprietary: never copy its headers or source, and cudec claims no
   compatibility with it (nominative references and CPU-only benchmark
   comparisons are fine).
+  **GDeflate is the one deliberate exception**, and it is narrow. That format
+  has no single canonical specification, and the artifact that carries a
+  patent grant is the Apache-2.0 code rather than the draft: the M4 work may
+  read and derive from the DirectStorage `GDeflate/` reference and the NVIDIA
+  fork of libdeflate, and every reliance is recorded at the site and in the
+  pull request - which file, what was taken, why. Section 16 of
+  [MASTERPLAN.md](docs/MASTERPLAN.md) is where that posture and its reason
+  live; it widens to no other format and to no other decoder, and it is
+  reasoning discipline rather than a statement that anything is patent-safe.
 - **Termination**: every loop whose exit depends on a value read from the
   bitstream carries an explicit decrementing fuel cap, sized so no input the
   validation ladder admits can reach it. A decoder that hangs on hostile input
@@ -121,13 +130,37 @@ racecheck checks shared-memory hazards only. A clean run says nothing about
 global-memory races, and reading it as clearance for them is the mistake this
 sentence exists to stop.
 
-The gate is written down here in full, and issue #258 records that no route to
-a device it can attach to is available today: under WSL2 the device is in WDDM
-mode, the debugger interface the sanitizer needs is absent, and all four tools
-report the same two initialization errors on a program with no fault in it. So
-the sweep is owed and currently cannot be produced on that route. Say that in
-the pull request, with the command that shows it, rather than leaving the block
-looking answered.
+The gate is written down here in full, and it is **parked**. No route to a
+device the four tools can attach to exists on this project's route, and the
+one attempt that could have produced one was made and failed. Under WSL2 the
+device is in WDDM mode, the debugger interface the sanitizer needs is absent,
+and all four tools report the same two initialization errors against a program
+with nothing wrong in it. Re-measured on 2026-08-24 against the newest pairing
+this machine can hold (driver 610.88, CUDA 13.3, compute-sanitizer 2026.2.1.0),
+run in the WSL distribution directly rather than in the container above:
+
+```
+for t in memcheck racecheck initcheck synccheck; do
+  compute-sanitizer --tool "$t" --error-exitcode 1 ./clean; done
+every tool: exit=1
+========= Error: Failed to initialize WDDM debugger interface. Please run EnableDebuggerInterface.bat as an administrator
+========= Error: Device not supported. Please refer to the "Supported Devices" section of the sanitizer documentation
+```
+
+A seeded 4 MiB out-of-bounds write does exit nonzero under memcheck, and that
+nonzero says nothing: what surfaces is the runtime's own
+`cudaErrorIllegalAddress` on `cudaDeviceSynchronize` with a host backtrace, no
+`Invalid __global__ write` and no device backtrace. The same fault run without
+the sanitizer produces the same information.
+
+Parked means owed and unproducible, not waived and not moved. It was not moved
+to a paid GPU runner: that is a standing cost, and it comes back as its own
+issue if device-side coverage becomes load-bearing. What would unpark it is a
+machine whose device offers a debugger interface, and the untried route is the
+Windows-native CUDA toolchain, which ships the `EnableDebuggerInterface.bat`
+the first error names. Until then, say in the pull request that the sweep could
+not be produced, with the command that shows it, rather than leaving the block
+looking answered. Issue #258 holds the parking.
 
 ### The fuzz gate
 

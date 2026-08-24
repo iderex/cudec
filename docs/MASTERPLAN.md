@@ -217,11 +217,14 @@ is not an empty AMD field), and **hackability**.
   the CUDA version it was produced against. **racecheck detects
   shared-memory hazards only** - global-memory races are outside its scope,
   and a clean sweep is never read as clearance for them. Today the gate is
-  owed and unproducible on the maintainer route: under WSL2 the device is in
-  WDDM mode, the debugger interface the tools need is absent, and all four
-  report the same two initialization errors against a program with no fault in
-  it, which #258 records with its commands. That is a gap in the evidence, not
-  a dispensation from the gate.
+  **parked**: owed and unproducible on the maintainer route, under WSL2 the
+  device is in WDDM mode, the debugger interface the tools need is absent, and
+  all four report the same two initialization errors against a program with no
+  fault in it. Re-measured against the newest driver and toolkit pairing the
+  machine can hold and unchanged by it, which #258 records with its commands
+  and CONTRIBUTING.md carries beside the invocation. Parked is a gap in the
+  evidence and not a dispensation from the gate: it was not moved to a paid GPU
+  runner, and what would lift it is a device offering a debugger interface.
 - **Oracle pinning policy**: oracles are vendored via FetchContent from
   maintainer-uploaded release assets, pinned by a self-computed SHA-256
   cross-checked against a second packaging ecosystem; auto-generated
@@ -1201,8 +1204,8 @@ Recording where the verification apparatus came from is worth doing on its
 own terms, and it means the vendoring rung has nothing left to invent.
 
 **This subsection is about attribution only.** The patent position and the
-implementation-provenance posture are a separate, maintainer-gated
-decision, and nothing here pre-empts or softens it.
+implementation-provenance posture were a separate, maintainer-gated
+decision; it is taken, and section 16 carries it. Nothing here softens it.
 
 ## 12. M5 Zstd v1 decode subset (RFC 8878)
 
@@ -2395,3 +2398,85 @@ The platform facts in 15.2 and 15.3 were read from the vendor documentation
 for this section. No ROCm toolchain and no AMD device were available while
 it was written, so nothing here is a measurement, and the first numbers for
 this backend arrive with #243 and the community route.
+
+## 16. Legal guardrails
+
+The standing rules about where implementation knowledge may come from, in
+one place, plus the GDeflate posture that section 11 deferred to a decision.
+This is internal reasoning discipline about how the code is produced. It is
+not legal advice, and nothing here states or implies that cudec is patent-safe
+for anybody who uses it.
+
+### 16.1 The standing rules
+
+- **Public specifications only, everywhere except GDeflate.** LZ4 block and
+  frame, Snappy, DEFLATE (RFC 1951) and Zstd (RFC 8878) are implemented from
+  their published specifications. liblz4, zlib, snappy and libzstd are test
+  oracles: they settle correctness by differential test, and their code is
+  never a source to derive from. They ship under BSD and zlib terms, and
+  pasted lines would muddy the provenance of an Apache-2.0 tree for no gain
+  a differential test does not already give.
+- **nvCOMP is proprietary and stays untouched.** Never copy its headers or
+  its source, and claim no compatibility with it. Naming it and comparing
+  against it on the CPU side is fine; deriving from it is not.
+- **The EULA check happens before a head-to-head table is published, not
+  after.** Section 8.9 of the NVIDIA Software License Agreement is read
+  against any published cudec-vs-nvCOMP number first; the reasoning and the
+  current state of that check live in
+  [BENCHMARK-METHODOLOGY.md](BENCHMARK-METHODOLOGY.md).
+
+### 16.2 The GDeflate posture: spec plus recorded reliance
+
+GDeflate is the one format where the rule above is deliberately not the rule.
+The M4 work may read and derive from the Apache-2.0 reference artifacts: the
+`GDeflate/` subtree of `microsoft/DirectStorage` (the CPU codec and the HLSL
+GPU decoder, NVIDIA and Microsoft copyrights) and the NVIDIA fork of
+libdeflate. Section 11.7 pins both by hash for the oracle path; this
+subsection is about what an engineer writing the kernel may take from them.
+
+**Why the exception sits here and nowhere else.** The other four formats have
+a published specification and a permissively licensed reference, and the
+specification is enough. GDeflate has no single canonical specification at
+all - section 11.1 assembles it from an expired IETF draft, a reference
+implementation and a Vulkan extension - and the two hygienes pull in opposite
+directions on it:
+
+- A decoder written from `draft-uralsky-gdeflate-00` alone is copyright-clean
+  and **patent-bare**. BCP 78 grants copyright permission to implement a
+  draft. It grants no patent licence, and it never did.
+- Apache-2.0 section 3 carries an express patent grant from each contributor
+  for their contributions. Relying on the licensed artifacts is what attaches
+  that grant to the thing actually being built.
+
+So on this format the patent-bearing artifact is the licensed code, and
+refusing to read it would buy copyright hygiene this project can pay for
+another way while giving up the only patent grant on offer. The copyright
+side is handled by complying with Apache-2.0 rather than by avoidance:
+attribution, `LICENSE` and `NOTICE` where they are owed (11.9 reads what is
+actually owed here), and a recorded derivation for every reliance.
+
+**What an engineer on the M4 kernel may do.**
+
+- Read the DirectStorage `GDeflate/` reference and the libdeflate fork,
+  including for bit-level questions the dossier leaves open.
+- Derive structure, table layouts, constants and decode order from them.
+- Copy code from them where that is the honest description of what happened.
+
+**What that costs, every time, with no exception.**
+
+- **The reliance is recorded where the code lands**: which upstream file, what
+  was taken, and why. A comment at the site plus the pull request body is the
+  form; a derivation nobody wrote down is the one shape this posture does not
+  permit, because an unrecorded derivation gets the patent grant's benefit
+  while leaving the attribution obligation unpaid and unpayable later.
+- **The artifact is one of the two named above.** The posture is about
+  Apache-2.0 GDeflate references. It does not widen to any other decoder,
+  and it does not touch the nvCOMP rule in 16.1, which is unconditional.
+- **The oracle diff still decides correctness.** Reading the reference is a
+  source of implementation knowledge, never a substitute for byte parity
+  against it (11.7, and the ladder in 13.3).
+
+**What this does not say.** It does not say the M4 decoder is free of
+third-party patent claims, and it does not say that relying on Apache-2.0
+artifacts makes a user of cudec safe. It says which artifacts this project's
+own engineering may draw on, and what it writes down when it does.
