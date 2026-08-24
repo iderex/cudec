@@ -16,7 +16,8 @@
  * knobs. */
 #include "cudec.h"
 #include "fixtures.h"
-#include "lz4_decode.cuh"
+#include "chunk_decode.cuh"
+#include "lz4_block.h"
 #include "require.h"
 
 #include <cuda_runtime.h>
@@ -176,8 +177,9 @@ int RunDirect(const Batch& b, const Geometry& g) {
     REQUIRE(ResetDeviceState(b) == 0);
     cudaStream_t stream;
     REQUIRE_CUDA(cudaStreamCreate(&stream));
-    cudec_detail::lz4_decode_batch<false><<<g.blocks, g.threads, 0, stream>>>(
-        b.d_srcs, b.d_sizes, b.d_dsts, b.d_caps, b.n, b.d_results);
+    cudec_detail::chunk_decode_batch<cudec_detail::Lz4Parser, false>
+        <<<g.blocks, g.threads, 0, stream>>>(b.d_srcs, b.d_sizes, b.d_dsts,
+                                             b.d_caps, b.n, b.d_results);
     REQUIRE_CUDA(cudaGetLastError());
     REQUIRE_CUDA(cudaStreamSynchronize(stream));
     REQUIRE_CUDA(cudaStreamDestroy(stream));

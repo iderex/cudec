@@ -52,7 +52,7 @@ inline Lz4TwinResult Lz4TwinDecode(const unsigned char* stream,
     }
 
     cudec_detail::Lz4Parser parser{tight.get(), stream_size, capacity};
-    cudec_detail::Lz4Sequence sequence;
+    cudec_detail::DecodeSequence sequence;
     bool done = false;
     while (true) {
         const cudec_status status = parser.Next(&sequence, &done);

@@ -418,6 +418,16 @@ set_tests_properties(launch_fail PROPERTIES ENVIRONMENT
 cudec_add_test(smoke SOURCES smoke.cu GPU)
 cudec_add_test(gpu_fixture SOURCES gpu_fixture.cu LIBS cudec_test_fixtures
                GPU)
+# The vendored corpus the Snappy half of that test decodes, handed in as a
+# path for the same reason snappy_upstream_negatives gets one: the archive's
+# URL_HASH already proves those bytes, and copying them here would restate it
+# in eleven binary blobs. Guarded like the other GPU follow-ups, because the
+# host-only sanitizer build does not create the target.
+if(TARGET gpu_fixture)
+  target_compile_definitions(
+    gpu_fixture
+    PRIVATE CUDEC_SNAPPY_TESTDATA_DIR="${CUDEC_SNAPPY_SOURCE_DIR}/testdata")
+endif()
 cudec_add_test(frame_twin SOURCES frame_twin.cu LIBS lz4_frame_oracle GPU)
 # frame_twin verifies the library's own xxhash32.h against liblz4's XXH32.
 # Guarded: the host-only sanitizer build (issue #42) skips the GPU targets, so
@@ -584,6 +594,38 @@ foreach(_tu frame.cpp stream.cpp)
   endforeach()
 endforeach()
 
+# Single-source lock for the shared decode element (issue #150): the one
+# struct every format parser hands the chunk decoder lives once, in
+# src/decode_sequence.h, and the format headers and the kernel reach for it
+# there rather than restating it. The copy engine performs no input-derived
+# bound check of its own, so the element's contract is the whole of what
+# stands between a parser bug and an out-of-bounds write - and a second
+# definition under the same name is that one contract quietly forking into
+# two. Honest limit, as with the locks above: a re-copy under a fresh name is
+# out of reach of a text scan and is what review is for.
+set(_sequence_header ${CMAKE_CURRENT_SOURCE_DIR}/../src/decode_sequence.h)
+if(NOT EXISTS ${_sequence_header})
+  message(FATAL_ERROR "src/decode_sequence.h is missing: the shared decode "
+                      "element must be single-sourced there (issue #150)")
+endif()
+file(READ ${_sequence_header} _sequence_src)
+if(NOT _sequence_src MATCHES "struct DecodeSequence")
+  message(FATAL_ERROR "src/decode_sequence.h no longer defines 'struct "
+                      "DecodeSequence' (issue #150)")
+endif()
+foreach(_tu lz4_block.h snappy_block.h chunk_decode.cuh)
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_tu} _tu_src)
+  if(NOT _tu_src MATCHES "#include \"decode_sequence.h\"")
+    message(FATAL_ERROR "src/${_tu} no longer includes decode_sequence.h: the "
+                        "decode element is single-sourced there (issue #150)")
+  endif()
+  if(_tu_src MATCHES "struct DecodeSequence[ \t]*[{:]")
+    message(FATAL_ERROR "src/${_tu} defines a local 'struct DecodeSequence': "
+                        "the decode element is single-sourced in "
+                        "decode_sequence.h (issue #150)")
+  endif()
+endforeach()
+
 # Single-source lock for the batch launch limit (issue #39): the bound both
 # decode entry points enforce lives once, in src/batch_limits.h, and the two
 # callers read it from there. It used to be written twice and held in agreement
@@ -606,7 +648,7 @@ if(NOT _limits_src MATCHES "kMaxBatchChunks")
   message(FATAL_ERROR "src/batch_limits.h no longer defines kMaxBatchChunks "
                       "(issue #39)")
 endif()
-foreach(_tu lz4_decode.cuh stream.cpp)
+foreach(_tu chunk_decode.cuh stream.cpp)
   file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_tu} _tu_src)
   if(NOT _tu_src MATCHES "#include \"batch_limits.h\"")
     message(FATAL_ERROR "src/${_tu} no longer includes batch_limits.h: the "
@@ -837,7 +879,7 @@ function(cudec_check_snappy_locks src_dir out_violations)
   # exact, because the stripping replaces comment text in place instead of
   # dropping lines.
   cudec_code_lines(${_header} _header_lines)
-  foreach(_type SnappyParser SnappyElement)
+  foreach(_type SnappyParser)
     set(_defines FALSE)
     foreach(_line IN LISTS _header_lines)
       if(_line MATCHES "struct ${_type}")
@@ -864,7 +906,7 @@ function(cudec_check_snappy_locks src_dir out_violations)
     set(_names_parser FALSE)
     set(_includes_header FALSE)
     foreach(_line IN LISTS _source_lines)
-      foreach(_type SnappyParser SnappyElement)
+      foreach(_type SnappyParser)
         if(_line MATCHES "struct ${_type}[ \t]*[{:]")
           string(APPEND _violations
                  "  ${_source} defines a local 'struct ${_type}': the Snappy "
@@ -872,7 +914,7 @@ function(cudec_check_snappy_locks src_dir out_violations)
                  "(issue #173)\n")
         endif()
       endforeach()
-      if(_line MATCHES "SnappyParser|SnappyElement|SnappyDeclaredLength")
+      if(_line MATCHES "SnappyParser|SnappyDeclaredLength")
         set(_names_parser TRUE)
       endif()
       if(_line MATCHES "#include[ \t]+\"snappy_block.h\"")
@@ -984,7 +1026,7 @@ file(REMOVE_RECURSE ${_snappy_probe_root})
 # from it with string(REPLACE) and a list would come back joined on
 # semicolons - which is a stray separator written into a C header.
 #
-# The head is 21 lines, so an injected rung starts at line 22, which is the
+# The head is 18 lines, so an injected rung starts at line 19, which is the
 # number the two line-scoped rules are asserted on below.
 set(_probe_header_head "#ifndef PROBE_SNAPPY_H
 #define PROBE_SNAPPY_H
@@ -1000,9 +1042,6 @@ inline cudec_status SnappyRefuse(SnappyReject branch,
                                  SnappyReject* out) {
     return status;
 }
-struct SnappyElement {
-    uint64_t from;
-};
 struct SnappyParser {
     SnappyReject reject;
     cudec_status Next(bool first) {
@@ -1108,13 +1147,13 @@ set(_snappy_lock_probes
     "no_parser|no longer defines 'struct SnappyParser'"
     "local_copy|kernel.cu defines a local 'struct SnappyParser'"
     "no_include|kernel.cu names the Snappy parser without including"
-    "bare_return|snappy_block.h:22: refuses without going through SnappyRefuse"
-    "wrapped_refuse|snappy_block.h:22: a SnappyRefuse call with no ladder branch"
+    "bare_return|snappy_block.h:19: refuses without going through SnappyRefuse"
+    "wrapped_refuse|snappy_block.h:19: a SnappyRefuse call with no ladder branch"
     "branch_unused|ladder branch 'kSnappyRejectGamma' is declared and no refusal"
     "site_undeclared|a refusal site names 'kSnappyRejectGamma', which"
     "branch_shared|ladder branch 'kSnappyRejectAlpha' is named by 2 refusal"
     "no_enum|declares no reject ladder"
-    "bracket_above|snappy_block.h:23: refuses without going through")
+    "bracket_above|snappy_block.h:20: refuses without going through")
 foreach(_entry IN LISTS _snappy_lock_probes)
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\2" _expected "${_entry}")
@@ -1754,7 +1793,7 @@ file(WRITE ${_probe_dir}/scan_bitstream_field.cu
      "__device__ int probe(int v, unsigned offset) {\n"
      "    return __shfl_sync(0xFFFFFFFFu, v, offset);\n" "}\n")
 file(WRITE ${_probe_dir}/scan_sequence_field.cu
-     "__device__ int probe(int v, Lz4Sequence seq) {\n"
+     "__device__ int probe(int v, DecodeSequence seq) {\n"
      "    return __shfl_sync(0xFFFFFFFFu, v, seq.lane);\n" "}\n")
 file(WRITE ${_probe_dir}/scan_wrapped_collective.cu
      "__device__ int probe(int v, unsigned mask_from_token) {\n"
@@ -1832,7 +1871,7 @@ file(WRITE ${_probe_dir}/scan_for_unbalanced_eof.cu
 # The wrap AFTER the mask: the mask itself is valid, so only a balance-based
 # wrapped-collective rule catches this one.
 file(WRITE ${_probe_dir}/scan_wrapped_after_mask.cu
-     "__device__ int probe(int v, Lz4Sequence seq) {\n"
+     "__device__ int probe(int v, DecodeSequence seq) {\n"
      "    return __shfl_sync(0xFFFFFFFFu, v,\n"
      "                       seq.match_len % 32);\n" "}\n")
 # The two halves of the macro case, and they are one pair rather than two
@@ -1899,7 +1938,7 @@ file(WRITE ${_probe_dir}/scan_continuation_at_eof.cu
 # report's own text is what the probe asserts and the alternation cannot go
 # half-dead, plus the two silent shapes the rule exists to permit: the width
 # arriving as the template parameter, and the one line that binds the digits to
-# a name - which is the shape src/lz4_decode.cuh has carried since M1.
+# a name - which is the shape src/chunk_decode.cuh has carried since M1.
 file(WRITE ${_probe_dir}/scan_width_literal_32.cu
      "template <int WaveSize>
 "

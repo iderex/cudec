@@ -20,7 +20,8 @@
 #include "adversarial_blocks.h"
 #include "cudec.h"
 #include "fixtures.h"
-#include "lz4_decode.cuh"
+#include "chunk_decode.cuh"
+#include "lz4_block.h"
 #include "require.h"
 
 #include <cuda_runtime.h>
@@ -204,8 +205,9 @@ int RequireGeometryRefused(const Batch& b, const UnsupportedGeometry& g) {
     cudaEvent_t finished;
     REQUIRE_CUDA(cudaStreamCreate(&stream));
     REQUIRE_CUDA(cudaEventCreateWithFlags(&finished, cudaEventDisableTiming));
-    cudec_detail::lz4_decode_batch<false><<<g.blocks, g.threads, 0, stream>>>(
-        b.d_srcs, b.d_sizes, b.d_dsts, b.d_caps, b.n, b.d_results);
+    cudec_detail::chunk_decode_batch<cudec_detail::Lz4Parser, false>
+        <<<g.blocks, g.threads, 0, stream>>>(b.d_srcs, b.d_sizes, b.d_dsts,
+                                             b.d_caps, b.n, b.d_results);
     REQUIRE_CUDA(cudaGetLastError());
     REQUIRE_CUDA(cudaEventRecord(finished, stream));
     const auto start = std::chrono::steady_clock::now();

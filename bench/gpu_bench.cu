@@ -6,7 +6,8 @@
 
 #include "bench_stats.h"
 #include "cudec.h"
-#include "lz4_decode.cuh"
+#include "chunk_decode.cuh"
+#include "lz4_block.h"
 
 #include <cuda_runtime.h>
 
@@ -30,7 +31,7 @@ cudec_status LaunchParseOnly(const void* const* s, const size_t* ss,
         return valid;
     }
     (void)cudaGetLastError();
-    cudec_detail::lz4_decode_batch<true>
+    cudec_detail::chunk_decode_batch<cudec_detail::Lz4Parser, true>
         <<<cudec_detail::decode_grid_blocks(n), cudec_detail::kBlockThreads, 0,
            stream>>>(s, ss, d, dc, n, r);
     return cudaGetLastError() == cudaSuccess ? CUDEC_OK : CUDEC_ERR_CUDA;

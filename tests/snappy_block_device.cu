@@ -58,7 +58,7 @@ CUDEC_HOST_DEVICE inline void RunParser(const unsigned char* src,
                                         unsigned long long capacity,
                                         Trace* trace) {
     cudec_detail::SnappyParser parser{src, src_size, capacity};
-    cudec_detail::SnappyElement element;
+    cudec_detail::DecodeSequence element;
     bool done = false;
     unsigned long long digest = 14695981039346656037ull;
     unsigned long long elements = 0;
@@ -77,10 +77,12 @@ CUDEC_HOST_DEVICE inline void RunParser(const unsigned char* src,
         if (status != CUDEC_OK) {
             break;
         }
-        digest = Mix(digest, element.from);
-        digest = Mix(digest, element.to);
-        digest = Mix(digest, element.length);
-        digest = Mix(digest, element.is_copy ? 1u : 0u);
+        digest = Mix(digest, element.literals_src);
+        digest = Mix(digest, element.literals_dst);
+        digest = Mix(digest, element.literals_len);
+        digest = Mix(digest, element.match_src);
+        digest = Mix(digest, element.match_dst);
+        digest = Mix(digest, element.match_len);
         elements++;
         if (done) {
             break;

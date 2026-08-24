@@ -427,7 +427,7 @@ int main() {
         const auto& f = fixtures.back();
         cudec_detail::Lz4Parser parser{f.compressed.data(),
                                        f.compressed.size(), SIZE_MAX};
-        cudec_detail::Lz4Sequence seq;
+        cudec_detail::DecodeSequence seq;
         bool done = false;
         while (true) {
             const cudec_status status = parser.Next(&seq, &done);

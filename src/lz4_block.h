@@ -19,21 +19,9 @@
 #define CUDEC_LZ4_BLOCK_H
 
 #include "cudec.h"
+#include "decode_sequence.h"
 
 #include <stdint.h>
-
-/* Guarded: src/snappy_block.h defines the same macro for the same reason,
- * and a device translation unit that decodes both formats includes both
- * headers. The definitions are identical, so an unguarded second one is
- * legal rather than an error - which is exactly why it would go unnoticed
- * if they ever stopped being identical. */
-#ifndef CUDEC_HOST_DEVICE
-#if defined(__CUDACC__)
-#define CUDEC_HOST_DEVICE __host__ __device__
-#else
-#define CUDEC_HOST_DEVICE
-#endif
-#endif
 
 namespace cudec_detail {
 
@@ -58,21 +46,6 @@ constexpr unsigned kLz4TokenLiteralShift = 4;
  * up to iend instead would ACCEPT streams liblz4 rejects (fail-open). */
 constexpr uint64_t kLz4LiteralReadMargin = kLz4RunMask;         /* 15 */
 constexpr uint64_t kLz4MatchReadMargin = kLz4LastLiterals - 1;  /* 4 */
-
-/* One parsed sequence, in absolute offsets. The literals live in src;
- * the match gathers from the already-written region of dst (match_len is
- * zero only for the literals-only tail). Executing a sequence means:
- * copy literals_len bytes src[literals_src..] -> dst[literals_dst..],
- * then match_len bytes dst[match_src + (i mod offset)] -> dst[match_dst + i]
- * (equivalently a sequential chasing copy; offset = match_dst - match_src). */
-struct Lz4Sequence {
-    uint64_t literals_src;
-    uint64_t literals_dst;
-    uint64_t literals_len;
-    uint64_t match_src;
-    uint64_t match_dst;
-    uint64_t match_len;
-};
 
 struct Lz4Parser {
     const unsigned char* src;
@@ -136,7 +109,7 @@ struct Lz4Parser {
      * over truncated, mutated, and crafted streams in
      * tests/termination.cpp, and backed by a fuel cap in every driver
      * loop so a regression rejects rather than hangs. */
-    CUDEC_HOST_DEVICE cudec_status Next(Lz4Sequence* sequence, bool* done) {
+    CUDEC_HOST_DEVICE cudec_status Next(DecodeSequence* sequence, bool* done) {
         *done = false;
         if (src_pos >= src_size) {
             return CUDEC_ERR_CORRUPT_INPUT; /* a token must exist */

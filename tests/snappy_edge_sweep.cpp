@@ -135,7 +135,7 @@ cudec_status TwinDecode(const Bytes& stream, Bytes* out) {
         return header;
     }
     out->assign(static_cast<size_t>(parser.declared), 0);
-    cudec_detail::SnappyElement element;
+    cudec_detail::DecodeSequence element;
     bool done = false;
     uint64_t fuel = static_cast<uint64_t>(stream_size) + 2;
     while (true) {
@@ -155,10 +155,10 @@ cudec_status TwinDecode(const Bytes& stream, Bytes* out) {
         const bool bounded =
             parser.src_pos <= parser.src_size &&
             parser.dst_pos <= parser.declared &&
-            element.to + element.length <= parser.dst_pos &&
-            (element.is_copy
-                 ? element.from < element.to
-                 : element.from + element.length <= parser.src_pos);
+            element.literals_dst + element.literals_len <= parser.dst_pos &&
+            element.literals_src + element.literals_len <= parser.src_pos &&
+            element.match_dst + element.match_len <= parser.dst_pos &&
+            (element.match_len == 0 || element.match_src < element.match_dst);
         if (!bounded) {
             std::fprintf(stderr, "the parser left its bounds on a %zu-byte "
                                  "stream\n",
@@ -167,11 +167,13 @@ cudec_status TwinDecode(const Bytes& stream, Bytes* out) {
             out->clear();
             return CUDEC_ERR_CORRUPT_INPUT;
         }
-        for (uint64_t i = 0; i < element.length; i++) {
-            const size_t to = static_cast<size_t>(element.to + i);
-            (*out)[to] = element.is_copy
-                             ? (*out)[static_cast<size_t>(element.from + i)]
-                             : tight[static_cast<size_t>(element.from + i)];
+        for (uint64_t i = 0; i < element.literals_len; i++) {
+            (*out)[static_cast<size_t>(element.literals_dst + i)] =
+                tight[static_cast<size_t>(element.literals_src + i)];
+        }
+        for (uint64_t i = 0; i < element.match_len; i++) {
+            (*out)[static_cast<size_t>(element.match_dst + i)] =
+                (*out)[static_cast<size_t>(element.match_src + i)];
         }
         if (done) {
             break;
