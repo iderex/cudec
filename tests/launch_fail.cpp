@@ -1,4 +1,4 @@
-/* The launch-failure branch of cudec_lz4_decompress_batch, exercised with
+/* The launch-failure branch of both batch entry points, exercised with
  * defined behavior (deferred gap 1 from the #2 review): a process with
  * zero visible CUDA devices makes every launch submission fail
  * deterministically, so CI's GPU-lessness becomes the test condition and
@@ -36,7 +36,21 @@ int main() {
     REQUIRE(cudec_lz4_decompress_batch(srcs, sizes, dsts, caps, 1, results,
                                        nullptr) == CUDEC_ERR_CUDA);
 
+    /* The Snappy entry's two halves, in the same order and for the same
+     * reason (issue #152). The second one is what a shared validator cannot
+     * prove on its own: validation passing is the point where the two
+     * entries stop being the same code, and an entry that dropped the
+     * post-launch error check would return CUDEC_OK here while submitting
+     * nothing. */
+    REQUIRE(cudec_snappy_decompress_batch(nullptr, sizes, dsts, caps, 1,
+                                          results, nullptr) ==
+            CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, caps, 1, results,
+                                          nullptr) == CUDEC_ERR_CUDA);
+    REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, caps, 1, results,
+                                          nullptr) == CUDEC_ERR_CUDA);
+
     std::printf("PASS: launch-failure branch reports CUDEC_ERR_CUDA with "
-                "zero visible devices\n");
+                "zero visible devices, on both batch entries\n");
     return 0;
 }
