@@ -13,6 +13,7 @@
  * be a difference in the parser and nowhere else. The Snappy half is the
  * pristine direction only - the mutant reject parity and the determinism
  * gate for that format are the device gate set (#154). */
+#include "adversarial_snappy_blocks.h"
 #include "cudec.h"
 #include "fixtures.h"
 #include "require.h"
@@ -311,7 +312,69 @@ int main() {
                                snappy[i].original, dsts[i]) == 0);
     }
 
-    /* Batch 5: the whole vendored corpus, compressed by the oracle and
+    /* Batch 5: the Snappy mutant corpus, held to the same two-direction
+     * oracle-parity contract as the LZ4 one (issue #154). The capacity is the
+     * pristine original's size: a mutant that declares more is refused at the
+     * preamble, which is the one place a declared length is compared against
+     * a capacity at all.
+     *
+     * The stricter set is pinned at zero rather than at an identity, and that
+     * is a statement rather than a missing case. Snappy's decoder has one
+     * documented point where cudec is stricter - the four-byte literal length
+     * spelling 0xFFFFFFFF, which wraps to zero in the reference's 32-bit
+     * addition - and no mutation of a compressor-produced stream constructs
+     * it. The host twin pins that divergence on hand-built bytes; here the
+     * aggregate is what makes the named exception readable as the whole of
+     * it. */
+    std::vector<std::vector<unsigned char>> snappy_mutants;
+    std::vector<std::string> snappy_mutant_contexts;
+    std::vector<size_t> snappy_mutant_capacities;
+    std::vector<bool> snappy_oracle_accepts;
+    std::vector<std::vector<unsigned char>> snappy_oracle_outputs;
+    for (const auto& f : snappy) {
+        for (auto& m : MutateSnappyStream(f.compressed, f.seed)) {
+            std::vector<unsigned char> decoded;
+            const bool ok = SnappyOracleDecodes(m.stream, &decoded);
+            snappy_oracle_accepts.push_back(ok);
+            snappy_oracle_outputs.push_back(
+                ok ? decoded : std::vector<unsigned char>{});
+            snappy_mutants.push_back(std::move(m.stream));
+            snappy_mutant_contexts.push_back(f.name + "/" + m.description);
+            snappy_mutant_capacities.push_back(f.original.size());
+        }
+    }
+    std::vector<Chunk> snappy_mutant_chunks;
+    for (size_t i = 0; i < snappy_mutants.size(); i++) {
+        snappy_mutant_chunks.push_back(Chunk{snappy_mutant_contexts[i],
+                                             &snappy_mutants[i],
+                                             snappy_mutant_capacities[i]});
+    }
+    REQUIRE(RunBatch(snappy_mutant_chunks, cudec_snappy_decompress_batch,
+                     &results, &dsts) == 0);
+    size_t snappy_rejected = 0;
+    size_t snappy_stricter = 0;
+    for (size_t i = 0; i < snappy_mutant_chunks.size(); i++) {
+        const char* ctx = snappy_mutant_chunks[i].context.c_str();
+        if (results[i].status == CUDEC_OK) {
+            REQUIRE_CTX(snappy_oracle_accepts[i],
+                        "cudec accepts, snappy rejects: %s", ctx);
+            REQUIRE(CheckDecodedOk(ctx, results[i], snappy_oracle_outputs[i],
+                                   dsts[i]) == 0);
+        } else {
+            REQUIRE_CTX(results[i].bytes_written == 0, "reject bw: %s", ctx);
+            REQUIRE_CTX(results[i].reserved == 0, "reject reserved: %s", ctx);
+            if (snappy_oracle_accepts[i]) {
+                snappy_stricter++;
+                std::fprintf(stderr, "stricter than snappy: %s\n", ctx);
+            } else {
+                snappy_rejected++;
+            }
+        }
+    }
+    REQUIRE(snappy_rejected > 0);
+    REQUIRE(snappy_stricter == 0);
+
+    /* Batch 6: the whole vendored corpus, compressed by the oracle and
      * decoded on the device, at exact capacity. The generated fixtures
      * above are built against the format's own boundaries and are small;
      * these are real inputs of a size where a page of literals, the 64-byte
@@ -351,14 +414,110 @@ int main() {
                                corpus_original[i], dsts[i]) == 0);
     }
 
+    /* Batch 7: the hand-built hostile corpus, through the public entry and
+     * a real warp (issue #154). tests/snappy_block_device.cu parses the same
+     * bytes with one thread on both compilers; this is the arm that runs
+     * them under the copy engine, where 32 lanes fan out over an overlapping
+     * gather and a stream that behaves serially can still misbehave.
+     *
+     * The oracle decides every verdict, in both directions, with the one
+     * documented exception counted rather than exempted: cudec refuses the
+     * four-byte literal length that wraps to zero in the reference's 32-bit
+     * addition, and that stream is the whole of the stricter set. Pinning it
+     * by name rather than by count is what keeps the exception from growing
+     * quietly. */
+    const auto hostile = MakeAdversarialSnappyBlocks();
+    REQUIRE(!hostile.empty());
+    std::vector<bool> hostile_accepts;
+    std::vector<std::vector<unsigned char>> hostile_outputs;
+    std::vector<Chunk> hostile_chunks;
+    for (const auto& b : hostile) {
+        std::vector<unsigned char> decoded;
+        const bool ok = SnappyOracleDecodes(b.stream, &decoded);
+        hostile_accepts.push_back(ok);
+        hostile_outputs.push_back(ok ? decoded
+                                     : std::vector<unsigned char>{});
+    }
+    for (const auto& b : hostile) {
+        hostile_chunks.push_back(Chunk{b.name, &b.stream, b.dst_capacity});
+    }
+    REQUIRE(RunBatch(hostile_chunks, cudec_snappy_decompress_batch, &results,
+                     &dsts) == 0);
+    size_t hostile_accepted = 0;
+    size_t hostile_rejected = 0;
+    std::vector<std::string> hostile_stricter;
+    for (size_t i = 0; i < hostile_chunks.size(); i++) {
+        const char* ctx = hostile_chunks[i].context.c_str();
+        if (results[i].status == CUDEC_OK) {
+            REQUIRE_CTX(hostile_accepts[i],
+                        "cudec accepts, snappy rejects: %s", ctx);
+            REQUIRE(CheckDecodedOk(ctx, results[i], hostile_outputs[i],
+                                   dsts[i]) == 0);
+            hostile_accepted++;
+        } else {
+            /* A capacity refusal and a stream refusal are different
+             * statuses, and both are documented: only the declared length
+             * against the caller's capacity reports OUTPUT_TOO_SMALL. */
+            REQUIRE_CTX(results[i].status == CUDEC_ERR_CORRUPT_INPUT ||
+                            results[i].status == CUDEC_ERR_OUTPUT_TOO_SMALL,
+                        "%s: undefined reject status %d", ctx,
+                        static_cast<int>(results[i].status));
+            REQUIRE_CTX(results[i].bytes_written == 0, "reject bw: %s", ctx);
+            REQUIRE_CTX(results[i].reserved == 0, "reject reserved: %s", ctx);
+            if (hostile_accepts[i]) {
+                hostile_stricter.push_back(hostile[i].name);
+            } else {
+                hostile_rejected++;
+            }
+        }
+    }
+    REQUIRE(hostile_accepted > 0);
+    REQUIRE(hostile_rejected > 0);
+    REQUIRE(hostile_stricter.size() == 1);
+    REQUIRE(hostile_stricter[0] == "literal-length-wraps-to-zero");
+    /* The capacity adversarials are the reason this corpus carries its own
+     * capacities, so their outcome is pinned rather than merely counted among
+     * the rejects. Two things are asserted and they are different: the status
+     * is the capacity refusal, which is the ONE place a declared length maps
+     * to OUTPUT_TOO_SMALL, and the destination is still whole - a 4 GiB claim
+     * is refused at the preamble, before an element is parsed and before a
+     * byte is written.
+     *
+     * That second half is not the general reject contract and is not claimed
+     * as one. A stream refused mid-decode has already executed the elements
+     * before the refusal, and the header says the destination is then
+     * unspecified; what it never is, on either path, is presented as a valid
+     * decode, which bytes_written == 0 above is. */
+    size_t capacity_refusals = 0;
+    for (size_t i = 0; i < hostile_chunks.size(); i++) {
+        if (hostile[i].name.rfind("declared-", 0) != 0 ||
+            hostile[i].name == "declared-exactly-capacity") {
+            continue;
+        }
+        const char* name = hostile[i].name.c_str();
+        REQUIRE_CTX(results[i].status == CUDEC_ERR_OUTPUT_TOO_SMALL,
+                    "%s: expected the capacity refusal, got %d", name,
+                    static_cast<int>(results[i].status));
+        for (size_t j = 0; j < dsts[i].size(); j++) {
+            REQUIRE_CTX(dsts[i][j] == kDstPoison, "%s: wrote at %zu", name, j);
+        }
+        capacity_refusals++;
+    }
+    REQUIRE(capacity_refusals > 0);
+
     std::printf("PASS: %zu LZ4 pairs decoded byte-exact + %zu mutants in "
                 "oracle parity (%zu oracle-rejected, %zu offset==0 stricter) + "
                 "40000 grid-stride wraparound chunks + %zu Snappy pairs + %zu "
-                "vendored testdata files (%zu bytes) decoded byte-exact on the "
-                "GPU decoder; failure contract and poison beyond "
-                "bytes_written intact\n",
+                "Snappy mutants in oracle parity (%zu oracle-rejected, %zu "
+                "stricter) + %zu vendored testdata files (%zu bytes) decoded "
+                "byte-exact on the GPU decoder; failure contract and poison "
+                "beyond bytes_written intact; %zu hand-built hostile Snappy "
+                "streams in oracle parity (%zu accepted, %zu rejected, one "
+                "documented stricter)\n",
                 pairs.size(), mutant_chunks.size(), rejected_count,
-                stricter_count, snappy_pairs.size(), kTestdataCount,
-                corpus_bytes);
+                stricter_count, snappy_pairs.size(),
+                snappy_mutant_chunks.size(), snappy_rejected, snappy_stricter,
+                kTestdataCount, corpus_bytes, hostile_chunks.size(),
+                hostile_accepted, hostile_rejected);
     return 0;
 }
