@@ -428,6 +428,18 @@ if(TARGET gpu_fixture)
     gpu_fixture
     PRIVATE CUDEC_SNAPPY_TESTDATA_DIR="${CUDEC_SNAPPY_SOURCE_DIR}/testdata")
 endif()
+# The wave-width parameter (issue #241). It is the one property in this tree
+# that the hardware here cannot falsify: every other GPU test runs at one
+# width, so a wave64 instantiation that stopped compiling, or a block shape
+# that stopped following the parameter, would leave the whole suite green.
+# This test makes the second instantiation a build product and runs the
+# shipped one, and it needs the internal kernel header from src/ to reach
+# either.
+cudec_add_test(wave_width_gpu SOURCES wave_width_gpu.cu GPU)
+if(TARGET wave_width_gpu)
+  target_include_directories(wave_width_gpu
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+endif()
 cudec_add_test(frame_twin SOURCES frame_twin.cu LIBS lz4_frame_oracle GPU)
 # frame_twin verifies the library's own xxhash32.h against liblz4's XXH32.
 # Guarded: the host-only sanitizer build (issue #42) skips the GPU targets, so

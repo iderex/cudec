@@ -195,7 +195,8 @@ using DirectLaunch = void (*)(const Batch&, const Geometry&, cudaStream_t);
 
 template <class Parser>
 void LaunchDirect(const Batch& b, const Geometry& g, cudaStream_t stream) {
-    cudec_detail::chunk_decode_batch<Parser, false>
+    cudec_detail::chunk_decode_batch<Parser, false,
+                                    cudec_detail::kCudaWaveSize>
         <<<g.blocks, g.threads, 0, stream>>>(b.d_srcs, b.d_sizes, b.d_dsts,
                                              b.d_caps, b.n, b.d_results);
 }

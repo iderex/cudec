@@ -1,5 +1,6 @@
 /* The warp-per-chunk chunk decoder: one kernel, templated on the format
- * parser and on the copy mode. The parser is a template parameter rather
+ * parser, on the copy mode and on the wave width. The parser is a parameter
+ * rather
  * than a hard-wired type because everything below it - the fuel cap, the
  * two copy loops, the __syncwarp() placement, the geometry guards, the
  * failure contract - is format-independent, and a second copy of it per
@@ -8,7 +9,15 @@
  * per format; the bench instantiates ParseOnly for its honest parse-only
  * ceiling (masterplan section 9). Each translation unit emits only the
  * instantiations it launches, so the shipped library carries no parse-only
- * kernel. Internal header, not part of the ABI.
+ * kernel and, for the same reason, no wave64 kernel: the CUDA launches all
+ * name kCudaWaveSize. Internal header, not part of the ABI.
+ *
+ * THE WIDTH IS A PARAMETER BECAUSE THE HARDWARE HERE CANNOT FALSIFY A WRONG
+ * ONE (issue #241). Every lane-stride and geometry constant below is derived
+ * from WaveSize, so a hardcoded lane count cannot survive in a place only a
+ * wave64 device would expose. The parse uses no shuffle and no ballot, so no
+ * 64-bit lane mask arises and the port is the strides and the geometry
+ * guards rather than a second decode.
  *
  * What a Parser owes, and what this kernel is entitled to assume. The
  * requirements are stated here because this is the code that breaks when
@@ -24,8 +33,8 @@
  *    source size, so a parser that can return without advancing breaks
  *    termination for the whole family, not only for its own format;
  *  - LANE-UNIFORMITY: the parser reads source bytes and its own state and
- *    nothing else. All 32 lanes run it redundantly in lockstep, and that is
- *    sound only while every lane computes the same answer;
+ *    nothing else. Every lane of the wave runs it redundantly in lockstep,
+ *    and that is sound only while every lane computes the same answer;
  *  - ALL input validation inside the parser. The copy loops below perform
  *    no input-derived bound check of their own, by design: a parser that
  *    hands back an element it has not fully bounded has already failed
@@ -52,7 +61,24 @@
 namespace cudec_detail {
 
 constexpr unsigned kBlockWarps = 4;
-constexpr unsigned kBlockThreads = kWarpSize * kBlockWarps;  /* 128 */
+
+/* The block shape is derived from the wave width rather than written down:
+ * four waves to a block, whatever a wave is on the device being built for
+ * (issue #241). At wave32 this is the 128 threads the shipped launches have
+ * always used; at wave64 it is 256, which is the same four waves and not a
+ * different block shape. */
+template <int WaveSize>
+inline constexpr unsigned kBlockThreadsFor =
+    static_cast<unsigned>(WaveSize) * kBlockWarps;
+
+/* The one width this CUDA build instantiates. It is named here rather than
+ * written as digits at each launch, for the reason issue #211 gives, and it
+ * is a compile-time constant on purpose: the runtime-width dispatch is a
+ * sibling issue, and until it lands the CUDA translation units emit exactly
+ * one kernel per format. */
+constexpr int kCudaWaveSize = static_cast<int>(kWarpSize);
+
+constexpr unsigned kBlockThreads = kBlockThreadsFor<kCudaWaveSize>;
 
 /* One warp per chunk over a grid-stride loop. All 32 lanes run the
  * validated parser redundantly in lockstep and fan out by lane for every
@@ -62,26 +88,35 @@ constexpr unsigned kBlockThreads = kWarpSize * kBlockWarps;  /* 128 */
  * ordering at the two copy boundaries. ParseOnly elides the copies and the
  * syncs to isolate the parse cost - it writes no output and is a bench
  * ceiling only, never shipped. */
-template <class Parser, bool ParseOnly>
-__global__ void __launch_bounds__(kBlockThreads)
+template <class Parser, bool ParseOnly, int WaveSize>
+__global__ void __launch_bounds__(kBlockThreadsFor<WaveSize>)
     chunk_decode_batch(const void* const* src_ptrs, const size_t* src_sizes,
                        void* const* dst_ptrs, const size_t* dst_caps,
                        size_t chunk_count, cudec_chunk_result* results) {
-    const unsigned lane = threadIdx.x % kWarpSize;
+    /* Every lane-stride and geometry constant below is this one value. The
+     * cast is here rather than at each use so the parameter's own type stays
+     * the `int` the width family is written in, and the arithmetic below
+     * stays unsigned. */
+    constexpr unsigned kWaveSize = static_cast<unsigned>(WaveSize);
+
+    const unsigned lane = threadIdx.x % kWaveSize;
     const size_t warp_in_grid =
-        (blockIdx.x * blockDim.x + threadIdx.x) / kWarpSize;
+        (blockIdx.x * blockDim.x + threadIdx.x) / kWaveSize;
     const size_t total_warps =
-        (static_cast<size_t>(gridDim.x) * blockDim.x) / kWarpSize;
+        (static_cast<size_t>(gridDim.x) * blockDim.x) / kWaveSize;
     /* The chunk-to-lane mapping is sound only when the grid holds at least
      * one whole warp and every block is a whole number of warps. Both
      * failures are geometry rather than input, and both are silent:
      *  - fewer than one whole warp in the grid makes the grid-stride below
      *    advance by zero and spin forever;
-     *  - a block that is not a warp multiple splits a chunk's warp across two
-     *    blocks (<<<2, 16>>> and <<<2, 48>>> both do), so `lane` only ever
-     *    takes the low half of its range while the copy loops stride by
-     *    kWarpSize - every output byte at i % 32 >= 16 is written by nobody,
-     *    and the full-mask __syncwarp() is executed by half a warp.
+     *  - a block that is not a wave multiple splits a chunk's wave across two
+     *    blocks (a block of half a wave, or of one and a half, both do), so
+     *    `lane` only ever takes the low part of its range while the copy
+     *    loops stride by kWaveSize - every output byte whose index modulo the
+     *    wave width lands in the missing part is written by nobody, and the
+     *    full-mask __syncwarp() is executed by a fraction of a wave. Both
+     *    halves of that argument scale with the width rather than with the
+     *    digits they used to be written in.
      * The shipped entry always launches kBlockThreads, but the kernel must
      * not depend on its caller for either property. Both tests are
      * grid-uniform (gridDim/blockDim only), so neither can strand lanes at a
@@ -91,9 +126,11 @@ __global__ void __launch_bounds__(kBlockThreads)
      * gridDim.x * blockDim.x <= 2^32. That bound is DOCUMENTED rather than
      * enforced, and the reason is the asymmetry in what breaking it costs:
      * past it the index wraps modulo 2^32, but the guard below has already
-     * forced blockDim.x to a multiple of kWarpSize, so the wrapped base stays
-     * warp-aligned and the aliased block recomputes the SAME warp_in_grid
-     * values with a full 0-31 lane range. Two blocks then decode one chunk
+     * forced blockDim.x to a multiple of kWaveSize, so the wrapped base stays
+     * wave-aligned and the aliased block recomputes the SAME warp_in_grid
+     * values with a full lane range. That argument rests on the wrap modulus
+     * being a multiple of the wave width, which holds for every power-of-two
+     * width and so survives the port unchanged. Two blocks then decode one chunk
      * redundantly and write byte-identical values to the same addresses -
      * duplicated work, not missing bytes and not a hang, and the output stays
      * bit-identical. Enforcing it costs an occupancy step: three spellings
@@ -104,7 +141,7 @@ __global__ void __launch_bounds__(kBlockThreads)
      * redundant-but-correct output on a geometry needing 33 million blocks -
      * against a decode_grid_blocks cap of 8192, and unreachable through the
      * public ABI - is not a trade worth making. */
-    if (total_warps == 0 || blockDim.x % kWarpSize != 0) {
+    if (total_warps == 0 || blockDim.x % kWaveSize != 0) {
         return;
     }
 
@@ -140,7 +177,8 @@ __global__ void __launch_bounds__(kBlockThreads)
                 break;
             }
             if constexpr (!ParseOnly) {
-                for (uint64_t i = lane; i < seq.literals_len; i += kWarpSize) {
+                for (uint64_t i = lane; i < seq.literals_len;
+                     i += kWaveSize) {
                     dst[seq.literals_dst + i] = src[seq.literals_src + i];
                 }
                 /* The match may read literal bytes just written above. */
@@ -169,14 +207,14 @@ __global__ void __launch_bounds__(kBlockThreads)
                     if (seq.match_len <= UINT32_MAX) {
                         const uint32_t off32 = static_cast<uint32_t>(offset);
                         for (uint64_t i = lane; i < seq.match_len;
-                             i += kWarpSize) {
+                             i += kWaveSize) {
                             dst[seq.match_dst + i] =
                                 dst[seq.match_src +
                                     (static_cast<uint32_t>(i) % off32)];
                         }
                     } else {
                         for (uint64_t i = lane; i < seq.match_len;
-                             i += kWarpSize) {
+                             i += kWaveSize) {
                             dst[seq.match_dst + i] =
                                 dst[seq.match_src + (i % offset)];
                         }

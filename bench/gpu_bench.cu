@@ -40,7 +40,7 @@ cudec_status LaunchParseOnly(const void* const* s, const size_t* ss,
         return valid;
     }
     (void)cudaGetLastError();
-    cudec_detail::chunk_decode_batch<Parser, true>
+    cudec_detail::chunk_decode_batch<Parser, true, cudec_detail::kCudaWaveSize>
         <<<cudec_detail::decode_grid_blocks(n), cudec_detail::kBlockThreads, 0,
            stream>>>(s, ss, d, dc, n, r);
     return cudaGetLastError() == cudaSuccess ? CUDEC_OK : CUDEC_ERR_CUDA;
