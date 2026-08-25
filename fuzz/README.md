@@ -17,6 +17,7 @@ sed -n 's/^cudec_add_fuzz_target(\([A-Za-z0-9_]*\).*/\1/p' fuzz/CMakeLists.txt \
 | target                     | parser                 | reference                                    |
 | -------------------------- | ---------------------- | -------------------------------------------- |
 | `fuzz_lz4_block`           | `src/lz4_block.h`      | `LZ4_decompress_safe`, liblz4 1.10.0         |
+| `fuzz_lz4_frame`           | `src/lz4_frame.h`      | `LZ4F_decompress`, liblz4 1.10.0             |
 | `fuzz_snappy_block`        | `src/snappy_block.h`   | `snappy::RawUncompress`, google/snappy 1.2.2 |
 | `fuzz_gdeflate_tilestream` | `src/tilestream.h`     | none; invariants over what it accepts        |
 | `fuzz_zstd_frame`          | `src/zstd_frame.h`     | `ZSTD_getFrameHeader`, zstd 1.5.7            |
@@ -29,7 +30,7 @@ accepts, the reference must accept the same bytes and produce the identical
 output and size. The opposite direction is asserted only where a target can
 show the two sides were given the same question to answer, because a parser
 that is stricter than its reference is usually the fail-closed contract
-working, not a defect. Two targets can. `fuzz_zstd_fse` hands the
+working, not a defect. Three targets can. `fuzz_zstd_fse` hands the
 reference the alphabet and accuracy-log ceilings the unit under test was given,
 over a padded copy that keeps the reference's own end-of-buffer handling out of
 the comparison, and holds both sides to each other from there.
@@ -41,6 +42,13 @@ twelve, and it identifies a refusal as that one by re-reading the description at
 the reference's ceiling rather than by guessing from the rung. Where a
 deliberate strictness exists instead, it is pinned in the twin test rather than
 here (`tests/parser_twin.cpp` holds the LZ4 `offset == 0` family).
+`fuzz_lz4_frame` is the third: both sides walk one `.lz4` container from its
+magic number, so a frame `LZ4F_decompress` decodes end to end and the parser
+calls corrupt is a valid container refused rather than a strictness. It
+declares two, a skippable frame and a block header whose 31-bit length masks to
+zero, identifies each from the bytes rather than from the verdict, and both are
+pinned as negatives in `tests/frame_host_negative.cpp` (`skippable-frame` and
+`block-blen-zero`) so neither exemption is a hole nothing covers.
 
 `fuzz_zstd_decode` is the only target that enters more than one unit, and the
 two things it can say follow from that. It runs the same host driver the CPU

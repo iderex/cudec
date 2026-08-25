@@ -66,6 +66,20 @@ cudec_add_fuzz_target(fuzz_lz4_block_selftest SOURCES fuzz_lz4_block.cpp LIBS
 target_compile_definitions(fuzz_lz4_block_selftest
                            PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
 
+# The LZ4 frame envelope (issue #141): the container above the block target,
+# and the one LZ4 surface a hostile .lz4 file reaches before any block is
+# looked at. It links lz4_frame_oracle rather than lz4_oracle because the
+# reference here is liblz4's frame API - LZ4F_decompress over the whole
+# container, checksums included - and that lives in the frame translation
+# units the block oracle does not carry. The target's own header says which
+# of the two host-only shapes issue #141 asks about it took, and why.
+cudec_add_fuzz_target(fuzz_lz4_frame SHARE 1 SOURCES fuzz_lz4_frame.cpp LIBS
+                      lz4_frame_oracle)
+cudec_add_fuzz_target(fuzz_lz4_frame_selftest SOURCES fuzz_lz4_frame.cpp LIBS
+                      lz4_frame_oracle)
+target_compile_definitions(fuzz_lz4_frame_selftest
+                           PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
+
 # The Snappy pair (issue #90), the same two binaries for the same two reasons.
 cudec_add_fuzz_target(fuzz_snappy_block SHARE 1 SOURCES fuzz_snappy_block.cpp
                       LIBS snappy_oracle)
