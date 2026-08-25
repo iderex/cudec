@@ -945,9 +945,10 @@ per call.
 
 ## M3: the Snappy CPU denominator (issue #164)
 
-There is no Snappy kernel yet. This entry is the denominator a later device
-number will be read against, and the harness says so in its own report rather
-than leaving a reader to infer it from the absence of a GPU row.
+There was no Snappy kernel when this ran. This entry is the denominator, and
+the harness says so in its own report rather than leaving a reader to infer it
+from the absence of a GPU row. The device numbers read against it were
+recorded later and are in the M3 GPU baselines section below.
 
 Two corpus shapes, because the format and the batch API disagree about what a
 unit is. Snappy's own framing is one stream per file; the shape this library
@@ -1025,8 +1026,9 @@ and its decoded bytes per element. A corpus that drifts off its shape reds
 `bench_snappy_worst_selfcheck` or `bench_snappy_worstlit_selfcheck` rather
 than quietly reporting a worst case it no longer measures.
 
-There is still no Snappy kernel, so these are denominators and carry no cudec
-number. Recorded 2026-08-10 inside the digest-pinned
+There was still no Snappy kernel when these ran, so they are denominators and
+carry no cudec number; the device rows read against them are in the M3 GPU
+baselines section below. Recorded 2026-08-10 inside the digest-pinned
 `nvidia/cuda:12.6.2-devel-ubuntu24.04` container. Reproduce with
 `bench_snappy --worstlit --warmup 3 --runs 30` and
 `bench_snappy --worst --warmup 3 --runs 30`.
@@ -1081,6 +1083,150 @@ than a serial copy, while the parse chain stays serial per chunk. Which corpus
 floors the GPU is a measurement nobody has taken, and neither this section nor
 the element counts settle it. It is recorded here so that whoever takes it has
 the CPU ordering in front of them rather than an assumption.
+
+## M3: first recorded Snappy GPU baselines and the ParseOnly ceiling (issue #167)
+
+The first device numbers for the Snappy path, read against the CPU
+denominators recorded in the two sections above. Every block below carries its
+own CPU rows, so the ratio in each one is against that run's own denominator
+rather than against a number quoted from another session.
+
+What is timed. `cudec_snappy_decompress_batch`, device-resident: the
+compressed batch is uploaded once and the timed region is the decode launch
+alone, CUDA-event timed, so H2D and D2H are excluded. Before any timing the
+batch is decoded once and every chunk is checked to return `CUDEC_OK` with
+exactly its original byte count; the harness refuses to report a number for a
+batch that did not.
+
+The ParseOnly ceiling is instantiable for Snappy and is reported. It is the
+same `chunk_decode_batch` with the copies elided, reached through the parser
+template seam rather than through a second kernel, so the parse it measures is
+the parse the shipped path runs and not a copy of it. That is what makes it a
+ceiling on this design and on the phase 1 of any two-phase design that would
+share the parse.
+
+Recorded 2026-08-25 inside the digest-pinned
+`nvidia/cuda:12.6.2-devel-ubuntu24.04` container
+(`sha256:738fba0fbdb225b7a2931c58a5c8f03a84d3cd2f6a84975826a157339ef750b8`,
+nvcc 12.6) on the RTX 3080 named in each block, at 3 warmup + 30 measured
+runs. Reproduce with `bench_snappy --gpu bench/corpora/silesia/*`,
+`bench_snappy --worst --gpu` and `bench_snappy --worstlit --gpu`. The Silesia
+corpus digests are the ones the CPU denominator section above recorded, so the
+two sections were built from byte-identical corpora.
+
+```
+## bench_snappy report
+- decoder: CPU oracle, snappy::RawUncompress (google/snappy 1.2.2), single thread. The GPU rows below time cudec's own decoder through cudec_snappy_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 12.6
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 64 KiB-chunked streams, 3239 streams, 211.94 MB original, 101.36 MB compressed (ratio 0.478), compressed in-harness by the pinned snappy oracle
+- corpus digest: be088850546d917c (XXH64 over per-stream length and XXH64, little-endian, in corpus order)
+- stream sizes: min 8066 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is snappy::RawUncompress only (no allocation, no length parse); every stream round-trip-verified against the original once before timing; percentiles are nearest-rank
+- wall per run: p50 191.581 ms / p90 202.740 ms / p99 206.972 ms
+- decode throughput: p50 1.106 GB/s / p90 1.045 GB/s / p99 1.024 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3239 chunks, every chunk verified to its original size before timing): p50 15.574 ms, 13.609 GB/s
+- GPU parse-only ceiling (copies elided, the identical lockstep parse through the chunk-decoder template seam): p50 10.746 ms, 19.723 GB/s
+- GPU vs the CPU denominator in this report: 12.30x (CPU p50 191.581 ms, GPU p50 15.574 ms)
+```
+
+```
+## bench_snappy report
+- decoder: CPU oracle, snappy::RawUncompress (google/snappy 1.2.2), single thread. The GPU rows below time cudec's own decoder through cudec_snappy_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 12.6
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, whole-file streams, 12 streams, 211.94 MB original, 101.35 MB compressed (ratio 0.478), compressed in-harness by the pinned snappy oracle
+- corpus digest: 7bd83d9e3b24fd44 (XXH64 over per-stream length and XXH64, little-endian, in corpus order)
+- stream sizes: min 5345280 / median 10085684 / max 51220480 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is snappy::RawUncompress only (no allocation, no length parse); every stream round-trip-verified against the original once before timing; percentiles are nearest-rank
+- wall per run: p50 190.693 ms / p90 197.636 ms / p99 209.044 ms
+- decode throughput: p50 1.111 GB/s / p90 1.072 GB/s / p99 1.014 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 12 chunks, every chunk verified to its original size before timing): p50 3381.903 ms, 0.063 GB/s
+- GPU parse-only ceiling (copies elided, the identical lockstep parse through the chunk-decoder template seam): p50 1805.522 ms, 0.117 GB/s
+- GPU vs the CPU denominator in this report: 0.06x (CPU p50 190.693 ms, GPU p50 3381.903 ms)
+```
+
+```
+## bench_snappy report
+- decoder: CPU oracle, snappy::RawUncompress (google/snappy 1.2.2), single thread. The GPU rows below time cudec's own decoder through cudec_snappy_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 12.6
+- cudec: 100
+- corpus: max element density (constructed), 64 KiB-chunked streams, 3200 streams, 209.72 MB original, 104.88 MB compressed (ratio 0.500), hand-constructed in-harness as back-to-back minimum-cost copies at offset 1, which the reference compressor never emits; every stream validated by the pinned snappy oracle before timing
+- corpus digest: 1a7d7e76546da248 (XXH64 over per-stream length and XXH64, little-endian, in corpus order)
+- stream sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is snappy::RawUncompress only (no allocation, no length parse); every stream round-trip-verified against the original once before timing; percentiles are nearest-rank
+- wall per run: p50 1356.534 ms / p90 1420.085 ms / p99 1438.338 ms
+- decode throughput: p50 0.155 GB/s / p90 0.148 GB/s / p99 0.146 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3200 chunks, every chunk verified to its original size before timing): p50 26.082 ms, 8.041 GB/s
+- GPU parse-only ceiling (copies elided, the identical lockstep parse through the chunk-decoder template seam): p50 17.912 ms, 11.708 GB/s
+- GPU vs the CPU denominator in this report: 52.01x (CPU p50 1356.534 ms, GPU p50 26.082 ms)
+- element density: 52432000 elements, 0.4999 per compressed byte, 3.9998 decoded bytes each
+```
+
+```
+## bench_snappy report
+- decoder: CPU oracle, snappy::RawUncompress (google/snappy 1.2.2), single thread. The GPU rows below time cudec's own decoder through cudec_snappy_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 12.6
+- cudec: 100
+- corpus: max parse work per output byte (constructed), 64 KiB-chunked streams, 3200 streams, 209.72 MB original, 419.44 MB compressed (ratio 2.000), hand-constructed in-harness as one length-1 literal element per output byte, which the reference compressor never emits; every stream validated by the pinned snappy oracle before timing
+- corpus digest: a475ef89da01c0e4 (XXH64 over per-stream length and XXH64, little-endian, in corpus order)
+- stream sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-corpus decode; the timed region is snappy::RawUncompress only (no allocation, no length parse); every stream round-trip-verified against the original once before timing; percentiles are nearest-rank
+- wall per run: p50 1078.347 ms / p90 1100.253 ms / p99 1107.216 ms
+- decode throughput: p50 0.194 GB/s / p90 0.191 GB/s / p99 0.189 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3200 chunks, every chunk verified to its original size before timing): p50 58.537 ms, 3.583 GB/s
+- GPU parse-only ceiling (copies elided, the identical lockstep parse through the chunk-decoder template seam): p50 38.142 ms, 5.498 GB/s
+- GPU vs the CPU denominator in this report: 18.42x (CPU p50 1078.347 ms, GPU p50 58.537 ms)
+- element density: 209715200 elements, 0.5000 per compressed byte, 1.0000 decoded bytes each
+```
+
+**The parse is the bound on every corpus, and it is not close.** Eliding both
+copy loops removes 31% of the chunked-Silesia decode time (15.574 ms to 10.746
+ms), 31% on the copy chain (26.082 to 17.912) and 35% on the parse chain
+(58.537 to 38.142). Two thirds of the kernel's time is the redundant 32-lane
+lockstep parse in all three regimes. That is the same conclusion the LZ4 pass
+reached, and it is now measured for Snappy rather than transferred: the lever
+filed against these baselines that attacks the parse (#161) has a two-thirds
+share to move, and the ones that attack the copy stage (#163, #165) have a
+third.
+
+**The device is floored by the parse-bound corpus, not by the copy chain, and
+the CPU ordering is the opposite.** The adversarial-denominator section above
+records the reference decoder finishing the parse chain 20% SOONER than the
+copy chain, and says explicitly that which corpus floors the GPU is a
+measurement nobody has taken. Taken here: the copy chain runs at 8.041 GB/s
+and the parse chain at 3.583 GB/s, so the GPU is 2.2x apart in the direction
+the CPU is 1.25x apart the other way. The reason is the machinery each regime
+meets. The reference pays a serial byte-at-a-time overlapping copy for an
+offset-1 element, which the kernel answers with the closed-form modular
+gather; the parse stays serial per chunk on both. **So the DoS-resistance
+margin for M3, and the number the pre-registered accept rule of #161, #163 and
+#165 turns on, is the 3.583 GB/s parse-bound row rather than the copy chain.**
+
+**Against LZ4 on the same device, the same protocol and a comparable corpus,
+Snappy decodes slower and its ceiling is lower.** The M1 Silesia rows report
+18.1 GB/s decode with a 34.6 GB/s parse-only ceiling; the chunked Silesia rows
+here report 13.609 and 19.723. The two corpora are the same Silesia bytes at a
+near-identical ratio (0.483 against 0.478), so what is left is the format: a
+Snappy copy element carries at most 64 bytes where an LZ4 match is unbounded,
+so the same output costs more elements and the serial parse chain per chunk is
+longer. The adversarial rows land in the same place, LZ4's worst-4Bmatch at
+8.1 GB/s with a 15.3 GB/s ceiling against Snappy's copy chain at 8.041 and
+11.708.
+
+**The whole-file shape is a statement about the batch shape rather than about
+the decoder, and it is recorded here so that nobody quotes it as one.** Twelve
+streams is twelve warps on a device with 68 SMs, so that row measures one warp
+decoding up to 51 MB serially: 0.063 GB/s, 17x SLOWER than the
+single-threaded reference. The chunked shape over the identical bytes is 216x
+faster. That is the whole argument for the 64 KiB page unit the batch API is
+built around, and it is why the chunked row and not this one is the M3
+baseline. A caller holding whole-file Snappy streams has to cut them before
+this API can help, and the format's own framing does not do it for them.
 
 ## M5: the Zstd CPU denominator (issue #227)
 

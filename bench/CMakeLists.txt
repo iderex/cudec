@@ -70,24 +70,39 @@ add_test(NAME bench_frame_selfcheck COMMAND bench_lz4 --frame --selfcheck)
 set_tests_properties(bench_frame_selfcheck PROPERTIES LABELS gpu RUN_SERIAL
                                                       TRUE)
 
-# The Snappy CPU denominator (issue #164). No CUDA in it at all: there is no
-# Snappy kernel yet, so the only decoder this times is the reference, and the
-# binary needs neither a device nor a kernel header. It links the same
-# oracle target tests/ pins and the same fixture library, because the Snappy
-# streams in this project have ONE provenance (tests/fixtures.h) and a bench
-# that compressed its own would be a second one nobody reconciles.
-add_executable(bench_snappy bench_snappy.cpp)
+# The Snappy CPU denominator (issue #164) and, since issue #167, the device
+# rows read against it. It links the same oracle target tests/ pins and the
+# same fixture library, because the Snappy streams in this project have ONE
+# provenance (tests/fixtures.h) and a bench that compressed its own would be a
+# second one nobody reconciles.
+#
+# gpu_bench.cu is compiled into this target as well as into bench_lz4, rather
+# than made a library the two share: it is one small translation unit, and a
+# library would have to be built with the CUDA properties both binaries
+# already declare for themselves. What that costs is stated rather than
+# discovered - this binary carries the LZ4 parse-only instantiation it never
+# launches, which is bench tooling and not the shipped library, where the
+# guarantee that no parse-only kernel ships is src/chunk_decode.cuh's and is
+# untouched by this.
+add_executable(bench_snappy bench_snappy.cpp gpu_bench.cu)
 target_link_libraries(bench_snappy PRIVATE cudec cudec_test_fixtures
-                                           snappy_oracle)
-# The corpus digest reads src/xxhash64.h, the hash already in the tree.
+                                           snappy_oracle CUDA::cudart)
+# The corpus digest reads src/xxhash64.h, the hash already in the tree;
+# gpu_bench.cu includes the internal kernel header from the same directory.
 target_include_directories(bench_snappy PRIVATE
                            ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-set_target_properties(bench_snappy PROPERTIES CXX_STANDARD 17
-                                              CXX_STANDARD_REQUIRED ON)
+set_target_properties(
+  bench_snappy PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+                          CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+                          CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 # -O2 unconditionally for the reason bench_lz4 gives above: the documented
 # container command sets no CMAKE_BUILD_TYPE, and an -O0 reference decoder
-# would be timed instead of the reference decoder.
-target_compile_options(bench_snappy PRIVATE -Wall -Wextra -Werror -O2)
+# would be timed instead of the reference decoder. The CUDA path carries the
+# project's strict device flags, as it does for bench_lz4.
+target_compile_options(
+  bench_snappy
+  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-O2>
+          ${CUDEC_CUDA_STRICT_FLAGS})
 
 # Same rot protection as the entries above, and one more thing besides. The
 # selfcheck builds both corpus shapes from a fixed PRNG and asserts the
