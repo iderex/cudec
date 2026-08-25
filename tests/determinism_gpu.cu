@@ -7,17 +7,23 @@
  * streams. All of that changes which warp decodes which chunk and in what
  * order - and none of it may change a single output byte.
  *
- * One corpus, one reference decode through the shipped entry point, then five
- * runs each across five grid/block geometries plus a three-stream split, with
- * the whole destination arena re-poisoned before every run and compared in
- * full - decoded bytes AND the untouched poison beyond bytes_written - along
- * with every per-chunk result record. The geometries are launched directly on
- * the shipped kernel because the public ABI deliberately exposes no launch
- * knobs. */
+ * Per format: one corpus, one reference decode through the shipped entry
+ * point, then five runs each across five grid/block geometries plus a
+ * three-stream split, with the whole destination arena re-poisoned before
+ * every run and compared in full - decoded bytes AND the untouched poison
+ * beyond bytes_written - along with every per-chunk result record. The
+ * geometries are launched directly on the shipped kernel because the public
+ * ABI deliberately exposes no launch knobs.
+ *
+ * Both formats run it (issue #154). The geometry axis belongs to the chunk
+ * decoder rather than to a parser, and the two share one, so a format left
+ * out here would leave the shared mapping unproven for exactly the
+ * instantiation nobody looked at. */
 #include "cudec.h"
 #include "fixtures.h"
 #include "chunk_decode.cuh"
 #include "lz4_block.h"
+#include "snappy_block.h"
 #include "require.h"
 
 #include <cuda_runtime.h>
@@ -54,14 +60,18 @@ struct Chunk {
     size_t dst_capacity;
 };
 
+using Mutator = std::vector<Mutant> (*)(const std::vector<unsigned char>&,
+                                        uint64_t);
+
 /* Pristine fixtures and their whole mutant corpora: accepted and rejected
  * chunks side by side, so the compare covers the reject path's result records
  * and untouched destinations too, not just successful output. */
-std::vector<Chunk> MakeChunks(const std::vector<Fixture>& fixtures) {
+std::vector<Chunk> MakeChunks(const std::vector<Fixture>& fixtures,
+                              Mutator mutate) {
     std::vector<Chunk> chunks;
     for (const Fixture& f : fixtures) {
         chunks.push_back({f.name, f.compressed, f.original.size()});
-        for (const Mutant& m : MutateStream(f.compressed, f.seed)) {
+        for (const Mutant& m : mutate(f.compressed, f.seed)) {
             chunks.push_back(
                 {f.name + "/" + m.description, m.stream, f.original.size()});
         }
@@ -173,13 +183,34 @@ std::vector<Geometry> Geometries(size_t chunk_count) {
     };
 }
 
-int RunDirect(const Batch& b, const Geometry& g) {
+/* One format's two ways in: its public entry, and a direct launch of its
+ * instantiation of the one chunk decoder, which is how a geometry the public
+ * ABI exposes no knob for is reached. Both are function pointers so the whole
+ * sequence below runs unchanged per format - a second copy of it would be a
+ * second place for one format's axis to quietly stop being covered. */
+using BatchEntry = cudec_status (*)(const void* const*, const size_t*,
+                                    void* const*, const size_t*, size_t,
+                                    cudec_chunk_result*, cudec_stream_t);
+using DirectLaunch = void (*)(const Batch&, const Geometry&, cudaStream_t);
+
+template <class Parser>
+void LaunchDirect(const Batch& b, const Geometry& g, cudaStream_t stream) {
+    cudec_detail::chunk_decode_batch<Parser, false>
+        <<<g.blocks, g.threads, 0, stream>>>(b.d_srcs, b.d_sizes, b.d_dsts,
+                                             b.d_caps, b.n, b.d_results);
+}
+
+struct Format {
+    const char* name;
+    BatchEntry entry;
+    DirectLaunch launch;
+};
+
+int RunDirect(const Format& f, const Batch& b, const Geometry& g) {
     REQUIRE(ResetDeviceState(b) == 0);
     cudaStream_t stream;
     REQUIRE_CUDA(cudaStreamCreate(&stream));
-    cudec_detail::chunk_decode_batch<cudec_detail::Lz4Parser, false>
-        <<<g.blocks, g.threads, 0, stream>>>(b.d_srcs, b.d_sizes, b.d_dsts,
-                                             b.d_caps, b.n, b.d_results);
+    f.launch(b, g, stream);
     REQUIRE_CUDA(cudaGetLastError());
     REQUIRE_CUDA(cudaStreamSynchronize(stream));
     REQUIRE_CUDA(cudaStreamDestroy(stream));
@@ -187,13 +218,12 @@ int RunDirect(const Batch& b, const Geometry& g) {
 }
 
 /* The shipped entry point, once over the whole batch. */
-int RunShippedEntry(const Batch& b) {
+int RunShippedEntry(const Format& f, const Batch& b) {
     REQUIRE(ResetDeviceState(b) == 0);
     cudaStream_t stream;
     REQUIRE_CUDA(cudaStreamCreate(&stream));
-    REQUIRE(cudec_lz4_decompress_batch(b.d_srcs, b.d_sizes, b.d_dsts,
-                                       b.d_caps, b.n, b.d_results,
-                                       stream) == CUDEC_OK);
+    REQUIRE(f.entry(b.d_srcs, b.d_sizes, b.d_dsts, b.d_caps, b.n, b.d_results,
+                    stream) == CUDEC_OK);
     REQUIRE_CUDA(cudaStreamSynchronize(stream));
     REQUIRE_CUDA(cudaStreamDestroy(stream));
     return 0;
@@ -203,7 +233,7 @@ int RunShippedEntry(const Batch& b) {
  * chunk k is decoded by a different warp of a different launch than in any
  * other geometry, and the sub-batches complete in an order the test does not
  * control. Per-chunk independence means the output must not notice. */
-int RunSplitStreams(const Batch& b, unsigned stream_count) {
+int RunSplitStreams(const Format& f, const Batch& b, unsigned stream_count) {
     REQUIRE(ResetDeviceState(b) == 0);
     std::vector<cudaStream_t> streams(stream_count);
     for (unsigned s = 0; s < stream_count; s++) {
@@ -218,10 +248,9 @@ int RunSplitStreams(const Batch& b, unsigned stream_count) {
         const size_t count = (begin + per <= b.n) ? per : b.n - begin;
         /* cudec_chunk_result is 16 bytes, so an element offset keeps the
          * 16-byte alignment the ABI requires of d_results. */
-        REQUIRE(cudec_lz4_decompress_batch(
-                    b.d_srcs + begin, b.d_sizes + begin, b.d_dsts + begin,
-                    b.d_caps + begin, count, b.d_results + begin,
-                    streams[s]) == CUDEC_OK);
+        REQUIRE(f.entry(b.d_srcs + begin, b.d_sizes + begin,
+                        b.d_dsts + begin, b.d_caps + begin, count,
+                        b.d_results + begin, streams[s]) == CUDEC_OK);
     }
     for (unsigned s = 0; s < stream_count; s++) {
         REQUIRE_CUDA(cudaStreamSynchronize(streams[s]));
@@ -266,12 +295,14 @@ int CompareAgainstReference(
     return 0;
 }
 
-}  // namespace
-
-int main() {
-    const std::vector<Fixture> fixtures = MakeLz4BlockFixtures();
+/* The whole sequence for one format: build the batch, take a reference decode
+ * through the shipped entry, then re-run it across every geometry and the
+ * stream split and require the byte image and every result record to be
+ * identical. */
+int RunFormat(const Format& f, const std::vector<Fixture>& fixtures,
+              Mutator mutate, size_t* chunks_out, size_t* decoded_out) {
     REQUIRE(!fixtures.empty());
-    const std::vector<Chunk> chunks = MakeChunks(fixtures);
+    const std::vector<Chunk> chunks = MakeChunks(fixtures, mutate);
     REQUIRE(!chunks.empty());
 
     Batch batch;
@@ -280,7 +311,7 @@ int main() {
     /* The reference: the shipped entry point on the shipped geometry. */
     std::vector<unsigned char> ref_dst;
     std::vector<cudec_chunk_result> ref_results;
-    REQUIRE(RunShippedEntry(batch) == 0);
+    REQUIRE(RunShippedEntry(f, batch) == 0);
     REQUIRE(Download(batch, &ref_dst, &ref_results) == 0);
     size_t decoded_chunks = 0;
     for (const cudec_chunk_result& r : ref_results) {
@@ -296,24 +327,57 @@ int main() {
     std::vector<cudec_chunk_result> results;
     for (const Geometry& g : Geometries(batch.n)) {
         for (int run = 0; run < kRunsPerGeometry; run++) {
-            REQUIRE(RunDirect(batch, g) == 0);
+            REQUIRE(RunDirect(f, batch, g) == 0);
             REQUIRE(Download(batch, &dst, &results) == 0);
-            REQUIRE(CompareAgainstReference(
-                        batch,
-                        std::string(g.name) + "/run-" + std::to_string(run),
-                        ref_dst, ref_results, dst, results) == 0);
+            REQUIRE(CompareAgainstReference(batch,
+                                            std::string(f.name) + "/" +
+                                                g.name + "/run-" +
+                                                std::to_string(run),
+                                            ref_dst, ref_results, dst,
+                                            results) == 0);
         }
     }
     for (int run = 0; run < kRunsPerGeometry; run++) {
-        REQUIRE(RunSplitStreams(batch, 3) == 0);
+        REQUIRE(RunSplitStreams(f, batch, 3) == 0);
         REQUIRE(Download(batch, &dst, &results) == 0);
-        REQUIRE(CompareAgainstReference(
-                    batch, "3-streams/run-" + std::to_string(run), ref_dst,
-                    ref_results, dst, results) == 0);
+        REQUIRE(CompareAgainstReference(batch,
+                                        std::string(f.name) +
+                                            "/3-streams/run-" +
+                                            std::to_string(run),
+                                        ref_dst, ref_results, dst,
+                                        results) == 0);
     }
+    *chunks_out = batch.n;
+    *decoded_out = decoded_chunks;
+    return 0;
+}
 
-    std::printf("determinism_gpu: %zu chunks (%zu decoded) bit-identical "
-                "across 6 launch configurations x %d runs\n",
-                batch.n, decoded_chunks, kRunsPerGeometry);
+}  // namespace
+
+int main() {
+    /* Both formats, one sequence. The geometry axis is a property of the
+     * chunk decoder rather than of a parser, so a format that skipped it
+     * would leave the shared kernel's mapping unproven for exactly the
+     * instantiation nobody looked at. */
+    const Format formats[] = {
+        {"lz4", cudec_lz4_decompress_batch,
+         LaunchDirect<cudec_detail::Lz4Parser>},
+        {"snappy", cudec_snappy_decompress_batch,
+         LaunchDirect<cudec_detail::SnappyParser>},
+    };
+    const std::vector<Fixture> corpora[] = {MakeLz4BlockFixtures(),
+                                            MakeSnappyFixtures()};
+    const Mutator mutators[] = {MutateStream, MutateSnappyStream};
+
+    for (size_t i = 0; i < 2; i++) {
+        size_t chunk_count = 0;
+        size_t decoded_chunks = 0;
+        REQUIRE(RunFormat(formats[i], corpora[i], mutators[i], &chunk_count,
+                          &decoded_chunks) == 0);
+        std::printf("determinism_gpu: %s %zu chunks (%zu decoded) "
+                    "bit-identical across 6 launch configurations x %d runs\n",
+                    formats[i].name, chunk_count, decoded_chunks,
+                    kRunsPerGeometry);
+    }
     return 0;
 }

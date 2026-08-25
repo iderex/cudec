@@ -581,8 +581,8 @@ bytes as well as cudec's, so a reject branch is demonstrably in parity
 rather than merely present.
 
 **Where this section is a commitment and where it is a description.** The
-parser core, the seam and the batch entry have all landed; what has not is
-the device gate set (#154), the bench rung and the measured pass. Each
+parser core, the seam, the batch entry and the device gate set have all
+landed; what has not is the bench rung and the measured pass. Each
 subsection below says which it is, so the document cannot be read as a
 report of shipped code. The tree is the authority for the second kind and
 the commands that read it are given inline.
