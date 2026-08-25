@@ -677,6 +677,16 @@ predicate on cost (#36) does not transfer: the same predicate here is taken by
 every element on the adversarial corpus rather than by none, and costs
 nothing. No kernel code shipped.
 
+**Measured outcome (issue #165, 2026-08-25): Snappy's literal shape is LZ4's,
+and the wide literal copy loses a second time.** The premise that Snappy emits
+more and longer literals on the same data is refuted by a measured histogram:
+on Silesia its literal element count is 4% BELOW LZ4's and its literal bytes
+within 2%, and its 42% extra elements are all copies, which is the 64-byte cap
+splitting what LZ4 spends one unbounded match on. A 4-byte-per-lane literal
+copy regresses every corpus, hardest on the two where it cannot trigger at
+all. What ships is the `--literals` histogram mode, so the next attempt on
+this stage reads a trigger rate instead of arguing one.
+
 Success is reported only at exact source consumption AND exact production
 of the declared length, which is what the reference enforces on both ends.
 Under-production, over-production and trailing bytes all reject.

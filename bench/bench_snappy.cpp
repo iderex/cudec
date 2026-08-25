@@ -17,6 +17,8 @@
 #include "cudec.h"
 #include "fixtures.h"
 #include "gpu_bench.h"
+#include "literal_hist.h"
+#include "snappy_block.h"
 #include "xxhash64.h"
 
 #include <snappy.h>
@@ -585,7 +587,30 @@ bool PrintGpuRows(const Corpus& corpus, double cpu_p50_seconds, size_t warmup,
     return true;
 }
 
-bool RunCorpus(Corpus* corpus, size_t warmup, size_t runs, bool gpu) {
+/* The literal-length distribution of one corpus (issue #165), walked with
+ * the shipped parser so the elements counted are the elements the decoder
+ * executes. A stream this harness just built and round-trip-verified must
+ * parse, so a refusal is a defect and is reported as one rather than
+ * skipped. */
+bool PrintLiteralDistribution(const Corpus& corpus) {
+    cudec_bench::LiteralHistogram hist;
+    for (size_t i = 0; i < corpus.compressed.size(); i++) {
+        if (!cudec_bench::AccumulateLiteralLengths<cudec_detail::SnappyParser>(
+                corpus.compressed[i].data(), corpus.compressed[i].size(),
+                corpus.originals[i].size(), &hist)) {
+            std::fprintf(stderr,
+                         "the parser refused stream %zu of a corpus this "
+                         "harness built and verified\n",
+                         i);
+            return false;
+        }
+    }
+    cudec_bench::PrintLiteralHistogram(hist);
+    return true;
+}
+
+bool RunCorpus(Corpus* corpus, size_t warmup, size_t runs, bool gpu,
+               bool literals) {
     Tally(corpus);
     if (corpus->original_bytes == 0) {
         std::fprintf(stderr, "corpus is empty - nothing to benchmark\n");
@@ -615,6 +640,9 @@ bool RunCorpus(Corpus* corpus, size_t warmup, size_t runs, bool gpu) {
     }
     std::sort(times.begin(), times.end());
     PrintReport(*corpus, times, warmup, runs, gpu);
+    if (literals && !PrintLiteralDistribution(*corpus)) {
+        return false;
+    }
     if (gpu && !PrintGpuRows(*corpus, cudec_bench::Percentile(times, 50),
                              warmup, runs)) {
         return false;
@@ -680,6 +708,7 @@ int main(int argc, char** argv) {
     bool worst = false;
     bool worstlit = false;
     bool gpu = false;
+    bool literals = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -695,6 +724,8 @@ int main(int argc, char** argv) {
             worstlit = true;
         } else if (arg == "--gpu") {
             gpu = true;
+        } else if (arg == "--literals") {
+            literals = true;
         } else if (arg == "--runs" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n", kMaxRuns);
@@ -712,7 +743,8 @@ int main(int argc, char** argv) {
         } else if (!arg.empty() && arg[0] == '-') {
             std::fprintf(stderr, "usage: bench_snappy [--runs N] [--warmup N] "
                                  "[--whole] [--chunked] [--worst] "
-                                 "[--worstlit] [--gpu] [--selfcheck] "
+                                 "[--worstlit] [--gpu] [--literals] "
+                                 "[--selfcheck] "
                                  "[corpus files...]\n");
             return 2;
         } else {
@@ -782,7 +814,7 @@ int main(int argc, char** argv) {
                     : CheckLiteralDensity(corpus, elements))) {
             return 1;
         }
-        if (!RunCorpus(&corpus, warmup, runs, gpu)) {
+        if (!RunCorpus(&corpus, warmup, runs, gpu, literals)) {
             return 1;
         }
         std::printf("- element density: %zu elements, %.4f per compressed "
@@ -851,7 +883,7 @@ int main(int argc, char** argv) {
             }
         }
         CompressAll(&corpus);
-        if (!RunCorpus(&corpus, warmup, runs, gpu)) {
+        if (!RunCorpus(&corpus, warmup, runs, gpu, literals)) {
             return 1;
         }
         if (selfcheck && !CheckDigest(corpus, shape == Shape::kWhole
