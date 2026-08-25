@@ -657,6 +657,17 @@ against the **actual** width the tag implies, not against a blanket
 five-byte lookahead: a stream ending in a one-byte literal is valid, and a
 blanket lookahead would reject it and hand the twin an oracle-diff failure.
 
+**Measured outcome (issue #161, 2026-08-25): the blanket five-byte LOAD is
+rejected too, on throughput rather than on validity.** The paragraph above
+settles the check; whether the same five bytes should be FETCHED in one
+bounded burst, with the check left as it is, was a separate question and is
+now measured. A fixed-width window loses 10.6-10.9% on the copy chain and
+29.2-32.4% on the parse-bound corpus, because the window is fixed and the
+headers are not: it pays for bytes the element does not carry, in proportion
+to the element rate. It gains only on the whole-file shape, where twelve
+warps leave the device idle enough for early loads to hide latency. No kernel
+code shipped; `docs/BENCHMARKS.md` carries the tables and the mechanism.
+
 Success is reported only at exact source consumption AND exact production
 of the declared length, which is what the reference enforces on both ends.
 Under-production, over-production and trailing bytes all reject.
