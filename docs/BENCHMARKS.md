@@ -1228,6 +1228,89 @@ built around, and it is why the chunked row and not this one is the M3
 baseline. A caller holding whole-file Snappy streams has to cut them before
 this API can help, and the format's own framing does not do it for them.
 
+### M3 perf lever (issue #161): the bounded 5-byte header window is rejected by both worst cases
+
+The one parse-side lever the format makes available. A Snappy element header
+is a tag byte plus at most four length or offset bytes, so a single
+fixed-width burst covers a whole header and field extraction becomes register
+shifts instead of loads that wait on the tag. LZ4 has no such lever - its
+token carries `0xFF` continuation chains, so no fixed lookahead covers one of
+its headers - which is why no prior pass covers this.
+
+What was measured. In `SnappyParser::Next`, `window` is filled with
+`min(5, src_size - src_pos)` bytes in one counted loop of compile-time bound
+five before the tag is examined, and the literal length and the copy offset
+are then extracted from it by shift and mask, replacing the two data-dependent
+byte loops. The two header-truncation checks stay exactly where they were and
+say exactly what they said, so no byte above the fill is ever consumed and the
+loop cannot touch a byte past the chunk. The masterplan's warning about a
+blanket lookahead is about the CHECK, which this lever does not change; it is
+the loads that were made blanket, and this pass is the measurement of that.
+
+Measured 2026-08-25 in the digest-pinned
+`nvidia/cuda:12.6.2-devel-ubuntu24.04` container on the RTX 3080, baseline and
+patched binaries built from the same tree and A/B-interleaved in one session,
+3 warmup + 30 CUDA-event-timed runs per invocation. All 49 ctest gates were
+green on the patched parser first. Two interleaved passes on the three
+64 KiB-chunked corpora; one on the whole-file shape, whose 3.4-second runs buy
+no precision the verdict needs.
+
+The Delta column is throughput speedup (`baseline_ms / window_ms − 1`,
+per-pass), one basis for every row.
+
+| Corpus                  | Baseline p50    | Header window p50 | Delta (throughput speedup) |
+| ----------------------- | --------------- | ----------------- | -------------------------- |
+| Silesia, 64 KiB-chunked | 16.754 / 15.793 | 17.144 / 16.860   | **−2.3% / −6.3%**          |
+| `--worst` (copy chain)  | 26.654 / 26.216 | 29.904 / 29.315   | **−10.9% / −10.6%**        |
+| `--worstlit` (parse)    | 61.336 / 57.424 | 86.649 / 84.934   | **−29.2% / −32.4%**        |
+| Silesia, whole-file     | 3395.727        | 3198.165          | **+6.2%**                  |
+
+The parse-only ceiling moves further in both directions, which is what
+identifies the lever as acting where it was aimed rather than somewhere else:
+
+| Corpus                  | Baseline ceiling p50 | Header window ceiling p50 | Delta               |
+| ----------------------- | -------------------- | ------------------------- | ------------------- |
+| Silesia, 64 KiB-chunked | 11.830 / 11.155      | 11.969 / 11.652           | **−1.2% / −4.3%**   |
+| `--worst` (copy chain)  | 17.823 / 18.012      | 19.774 / 19.460           | **−9.9% / −7.4%**   |
+| `--worstlit` (parse)    | 40.362 / 38.893      | 64.381 / 64.640           | **−37.3% / −39.8%** |
+| Silesia, whole-file     | 1822.823             | 1604.276                  | **+13.6%**          |
+
+**The window is fixed and the headers are not, and the loss is that
+difference times the element rate.** The parse-bound corpus is one length-1
+literal per output byte, so every header there is the tag alone: the lever
+issues five loads where one is wanted, at the highest element rate the format
+admits, and pays 29-32% of the decode and 37-40% of the parse. The copy chain
+is all two-byte headers - tag plus one offset byte - so it pays 2.5 bytes of
+traffic for every one it needs and loses 10.6-10.9%. Silesia's mixture of
+inline literals and copy forms is the least dense of the three and loses the
+least, 2.3-6.3%. The ordering across the three corpora is the ordering of
+their header waste, which is the mechanism rather than a coincidence.
+
+**The one win names its own condition and it is the condition the batch API
+exists to avoid.** The whole-file shape is twelve streams, so twelve warps on
+a device with 68 SMs, and there nothing else is competing for issue slots:
+loads sent early hide latency that no other warp is covering, and the lever
+gains 6.2% on the decode and 13.6% on the ceiling. Every corpus that occupies
+the device loses. So the lever is a latency-hiding trick that only pays while
+the device is idle, and a batch too small to occupy the device has a cheaper
+answer than a parser change.
+
+**Rejected under the pre-registered accept rule** (issue #161: recorded
+improvement on at least one corpus with zero regression on the Snappy
+worst-case corpus). Both worst cases regress, and the parse-bound one - which
+the M3 baselines section above establishes as the row the DoS-resistance
+margin is read on - regress the hardest. No kernel code shipped, and
+`src/snappy_block.h` is untouched by this pass.
+
+**What the negative closes and what it leaves open.** It closes the fixed-
+width burst specifically: any variant that loads a constant number of header
+bytes pays the same waste at the same rate, so there is nothing to retune
+here. It does not close the parse chain, which the M3 baselines measured at
+two thirds of the kernel's time on every corpus. A lever that reads only the
+bytes the tag implies while still removing the dependency - the tag alone
+first, then a single width-selected load - was not built or measured, and is
+the shape a future attempt would have to take.
+
 ## M5: the Zstd CPU denominator (issue #227)
 
 There is no Zstd kernel yet. This entry is the denominator a later device
