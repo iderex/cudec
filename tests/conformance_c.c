@@ -76,6 +76,32 @@ int main(void) {
                                        aligned, 0) ==
             CUDEC_ERR_INVALID_ARGUMENT);
 
+    /* The same eight classes on the Snappy entry (issue #152). The contract
+     * is frozen and format-independent, and the two entries share one
+     * validator - which is exactly why this is written out call for call
+     * rather than trusted: a future entry that grew its own validation, or
+     * one wired to a different one, would pass a test that only counted on
+     * the sharing. Resolving the symbol from C99 at all is half of what
+     * this file is for. */
+    REQUIRE(cudec_snappy_decompress_batch(0, sizes, dsts, caps, 1, aligned,
+                                          0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_snappy_decompress_batch(srcs, 0, dsts, caps, 1, aligned,
+                                          0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, 0, caps, 1, aligned,
+                                          0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, 0, 1, aligned,
+                                          0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, caps, 1, 0, 0) ==
+            CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, caps, 1,
+                                          misaligned,
+                                          0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, caps, 0, aligned,
+                                          0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, caps, SIZE_MAX,
+                                          aligned,
+                                          0) == CUDEC_ERR_INVALID_ARGUMENT);
+
     /* The frame entry point resolves its own C linkage here. Every call
      * below is a documented argument reject that returns before any CUDA
      * call, so it runs on the GPU-less runner and never dereferences the

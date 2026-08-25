@@ -737,8 +737,12 @@ way it already locks `cuda_raii.h` and the batch limit.
 ### The batch entry
 
 **Landed** in `include/cudec.h` and `src/batch.cu`; the paragraphs below are
-the commitment it was built to. Its contract conformance - every documented
-synchronous reject, one call each, from C99 - is the sibling rung (#152).
+the commitment it was built to. Its contract conformance landed with it
+(#152): every documented synchronous reject, one call each, resolved from
+C99 in `tests/conformance_c.c`, and the launch-submission failure in
+`tests/launch_fail.cpp`. Both are written out call for call rather than
+inferred from the shared validator, because validation passing is the point
+where the two entries stop being the same code.
 
 **A commitment.** `cudec_snappy_decompress_batch` carries the
 `cudec_lz4_decompress_batch` contract with no deltas: device-side argument
