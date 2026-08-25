@@ -668,6 +668,15 @@ to the element rate. It gains only on the whole-file shape, where twelve
 warps leave the device idle enough for early loads to hide latency. No kernel
 code shipped; `docs/BENCHMARKS.md` carries the tables and the mechanism.
 
+**Measured outcome (issue #163, 2026-08-25): the copy stage is not
+loop-overhead-bound either.** Snappy caps a copy at 64 bytes, so most elements
+fit one warp pass, and a predicated single pass replacing the strided loop in
+the short regime changes nothing measurable - every corpus lands inside a
+drift control taken in the same runs. The LZ4 pass that refused a per-element
+predicate on cost (#36) does not transfer: the same predicate here is taken by
+every element on the adversarial corpus rather than by none, and costs
+nothing. No kernel code shipped.
+
 Success is reported only at exact source consumption AND exact production
 of the declared length, which is what the reference enforces on both ends.
 Under-production, over-production and trailing bytes all reject.

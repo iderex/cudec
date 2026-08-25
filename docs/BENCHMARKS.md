@@ -1311,6 +1311,95 @@ bytes the tag implies while still removing the dependency - the tag alone
 first, then a single width-selected load - was not built or measured, and is
 the shape a future attempt would have to take.
 
+### M3 perf lever (issue #163): the short-copy predicated pass is not separable from noise
+
+Snappy caps a copy element at 64 bytes, so at a 32-lane warp most elements are
+at most two strided iterations and usually one. The hypothesis was that the
+strided loop's setup and back edge, rather than the copy, are what the short
+regime pays, and that a single predicated pass would remove them.
+
+What was measured. In `chunk_decode_batch`, both copy stages gained a short
+arm: `if (len <= kWarpSize) { if (lane < len) <one store> } else { <the
+existing strided loop> }`, on the literal copy and on the 32-bit match gather.
+Every test is warp-uniform - all lanes parsed the same element - so no lane can
+leave early and strand the others at a `__syncwarp()`, and the closed-form
+modular gather is unchanged in both arms. All 49 ctest gates were green on the
+patched kernel first.
+
+**The parse-only ceiling is the drift control, and it is what makes this
+verdict readable.** ParseOnly elides both copy stages, so this lever cannot
+touch it by construction: any difference in that row between the two sides is
+session drift, measured in the same invocation as the number it is controlling
+for. That is not a device this project can reserve, and the control says how
+much of any delta is the machine.
+
+Measured 2026-08-25 in the digest-pinned
+`nvidia/cuda:12.6.2-devel-ubuntu24.04` container on the RTX 3080, baseline and
+patched binaries built from the same tree and A/B-interleaved in one session,
+3 warmup + 30 CUDA-event-timed runs per invocation. The worst cases ran FIRST,
+which is the trap this lever walks into. Two interleaved passes on the three
+64 KiB-chunked corpora, one on the whole-file shape. Every column is
+throughput speedup, `baseline_ms / short_arm_ms − 1`.
+
+| Corpus                  | Pass | Decode     | Ceiling (control) | Decode less control |
+| ----------------------- | ---- | ---------- | ----------------- | ------------------- |
+| `--worst` (copy chain)  | 1    | **+7.75%** | **+9.10%**        | **−1.35 pp**        |
+| `--worst` (copy chain)  | 2    | −0.10%     | −0.38%            | +0.28 pp            |
+| `--worstlit` (parse)    | 1    | +1.19%     | −0.21%            | +1.40 pp            |
+| `--worstlit` (parse)    | 2    | +0.77%     | +0.34%            | +0.43 pp            |
+| Silesia, 64 KiB-chunked | 1    | +0.96%     | +1.04%            | −0.08 pp            |
+| Silesia, 64 KiB-chunked | 2    | −1.48%     | −1.88%            | +0.40 pp            |
+| Silesia, whole-file     | 1    | +1.40%     | +1.04%            | +0.36 pp            |
+
+**The first row is the reason the control is in the table.** Read alone it is
+a 7.75% win on the adversarial copy corpus, which is exactly the result this
+lever was built to find, on exactly the corpus the accept rule turns on. The
+ceiling beside it moved 9.10% in the same direction, on a code path the lever
+does not contain, and the second pass of the same corpus has both columns at
+zero. That cell is the first invocation of the session on a cold clock, and
+without a control measured in the same run it would have been recorded as the
+lever's headline number.
+
+**Corrected, every cell straddles zero: −1.35 to +1.40 percentage points,
+against a control that itself swings ±1.9%.** There is no corpus on which an
+improvement can be recorded, so the pre-registered accept rule (issue #163:
+recorded improvement on at least one corpus with zero regression on the Snappy
+worst-case corpus) is not met on its first clause. Rejected. No kernel code
+shipped; `src/chunk_decode.cuh` is untouched.
+
+**What this retires is the hypothesis rather than the lever.** Snappy's copy
+stage is not loop-overhead-bound: removing the loop from the short regime
+entirely changes nothing measurable, on a corpus whose every element is a
+4-byte copy. The upside was bounded before the measurement anyway - the M3
+baselines above put the whole copy stage at 31-35% of the kernel's time - and
+this says the setup inside that share is not where it goes.
+
+**And the #36 trap did not transfer, which is worth recording in its own
+right.** Perf pass 1-3 rejected an LZ4 match-copy fast path because the added
+per-element predicate cost 5-9% at maximum sequence density. The same shape of
+predicate, added to the same kernel for Snappy, costs nothing measurable on
+either Snappy worst case. The difference is what the predicate buys: LZ4's
+arm was never taken on the offset-1 corpus, so it was pure cost, while
+Snappy's short arm is taken by every element there. A future lever in this
+stage does not inherit a debt from that pass.
+
+**The second candidate named in the issue was not built, and the reason is a
+settled design decision rather than effort.** Sub-warp fan-out - several
+elements copying concurrently instead of idling lanes on a short one -
+requires knowing the next element before the current copy retires, which means
+parsing ahead of the copy. This kernel's parse is redundant across all 32
+lanes in lockstep and single-pass, settled at the #85 panel and in the
+masterplan's decomposition question; running the parse ahead of the copies is
+the two-phase design that was measured and refused, not a fan-out variant. So
+that candidate is a re-opening of #15 and not a lever this pass could take.
+
+**One disclosure about the shape as built.** The short arm went into the
+shared `chunk_decode_batch`, so it would have changed the LZ4 instantiation
+too. Nothing ships, so no LZ4 corpora were re-measured and none of the M1 rows
+above are touched or restated by this pass. A future variant that did win
+would owe either those LZ4 numbers or a template gate that keeps the arm on
+the Snappy instantiation alone.
+
 ## M5: the Zstd CPU denominator (issue #227)
 
 There is no Zstd kernel yet. This entry is the denominator a later device
