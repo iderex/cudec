@@ -1400,6 +1400,115 @@ above are touched or restated by this pass. A future variant that did win
 would owe either those LZ4 numbers or a template gate that keeps the arm on
 the Snappy instantiation alone.
 
+### M3 perf lever (issue #165): the Snappy literal distribution, and the wide literal copy rejected a second time
+
+Perf pass 1 rejected a vectorized literal copy for LZ4 at −6% and gave a
+reason specific to a distribution: _"Silesia's literal runs are mostly < 16
+bytes, so the wide path rarely triggers and only adds setup/branch
+overhead."_ That is a statement about a trigger rate, so it does not transfer
+to a different format's literal shape by assertion. It transfers or it does
+not by measurement, and the distribution is what decides.
+
+**The distribution first, because it is the durable half of this pass.**
+Both harnesses gained a `--literals` mode (`bench/literal_hist.h`, shared so
+that one set of bucket edges and one print format serve both formats - two
+copies of the edges is how a comparison silently stops being one). It walks
+each stream with the SHIPPED parser, so the elements counted are the elements
+the decoder executes, and buckets the literal lengths. Reproduce with
+`bench_snappy --literals bench/corpora/silesia/*` and
+`bench_lz4 --literals bench/corpora/silesia/*`.
+
+Silesia, 64 KiB-chunked, the same source bytes through the two compressors:
+
+| Literal length | Snappy elements | Snappy bytes | LZ4 elements | LZ4 bytes |
+| -------------- | --------------- | ------------ | ------------ | --------- |
+| 1              | 38.5%           | 6.1%         | 36.0%        | 6.1%      |
+| 2-3            | 29.4%           | 10.9%        | 28.1%        | 11.1%     |
+| 4-7            | 17.3%           | 13.8%        | 18.9%        | 16.0%     |
+| 8-15           | 11.1%           | 19.6%        | 11.7%        | 21.8%     |
+| 16-31          | 2.9%            | 9.2%         | 3.8%         | 13.2%     |
+| 32-63          | 0.6%            | 4.0%         | 1.0%         | 6.8%      |
+| 64-255         | 0.2%            | 3.7%         | 0.4%         | 7.3%      |
+| 256+           | 0.0%            | 32.7%        | 0.1%         | 17.7%     |
+
+| Quantity                            | Snappy     | LZ4        |
+| ----------------------------------- | ---------- | ---------- |
+| Elements                            | 26,052,354 | 18,339,030 |
+| Literal elements                    | 7,274,444  | 7,560,402  |
+| Literal bytes                       | 45,773,418 | 44,916,934 |
+| Wide-path trigger, literal elements | 3.7%       | 5.3%       |
+| Wide-path trigger, literal bytes    | 49.6%      | 45.0%      |
+
+The two adversarial corpora are one line each: `--worst` is 6,400 literal
+elements in 52.4 M, all under four bytes, and `--worstlit` is 209,715,200
+literals of exactly one byte. The wide path's trigger on both is **0.0% of
+literal elements and 0.0% of literal bytes**, so those corpora can carry the
+added predicate and nothing else.
+
+**The premise this issue was written on is refuted.** It expected Snappy to
+emit more and longer literals than LZ4 on the same data. It emits slightly
+FEWER long ones by element share (3.7% against 5.3% at 16 bytes and up) and
+about the same by byte share, and its literal bytes and literal element counts
+are within 2% and 4% of LZ4's. The old rejection's premise therefore holds for
+this format too.
+
+**What Snappy's extra elements actually are, which the histogram settles as a
+by-product.** Snappy carries 42% more elements than LZ4 for identical output
+(26.05 M against 18.34 M) while its literal elements are 4% FEWER. Every extra
+element is a copy: 18.78 M against 10.78 M, 74% more. That is the 64-byte copy
+cap splitting what LZ4 spends one unbounded match on, and it is the mechanism
+behind the parse-chain gap the M3 baselines above record between the two
+formats. It was not the question this issue asked, and it is the answer to
+the one the baselines section raised.
+
+**The old sentence needs one correction, in the reader's favour.** "Rarely
+triggers" is true of ELEMENTS and false of BYTES: at 16 bytes and up the
+trigger is 3.7% of Snappy's literal elements but 49.6% of its literal bytes,
+and a wide copy's work scales with bytes. So the trigger rate alone did not
+settle it, and the A/B was owed rather than optional.
+
+**The A/B.** A 4-byte-per-lane literal copy for literals of 32 bytes and up,
+with a byte head and tail, guarded on the ABSOLUTE addresses rather than the
+offsets - the caller's `dst` carries no alignment guarantee and a misaligned
+32-bit access is undefined - so the wide arm runs where both sides share a
+4-byte phase and the head aligns them. All 49 ctest gates green on the patched
+kernel first. Same protocol as the two levers above: A/B-interleaved in one
+session, both binaries from the same tree, 3 warmup + 30 CUDA-event-timed runs,
+worst cases first, with the parse-only ceiling as the drift control - it elides
+the copies, so this lever cannot touch it and any movement there is the
+machine.
+
+| Corpus                  | Pass | Decode | Ceiling (control) | Decode less control |
+| ----------------------- | ---- | ------ | ----------------- | ------------------- |
+| `--worst` (copy chain)  | 1    | −4.12% | +0.20%            | −4.32 pp            |
+| `--worst` (copy chain)  | 2    | −3.93% | −0.05%            | −3.88 pp            |
+| `--worstlit` (parse)    | 1    | −9.43% | +1.09%            | −10.52 pp           |
+| `--worstlit` (parse)    | 2    | −9.50% | −0.04%            | −9.46 pp            |
+| Silesia, 64 KiB-chunked | 1    | −4.72% | −1.28%            | −3.44 pp            |
+| Silesia, 64 KiB-chunked | 2    | −7.33% | −1.28%            | −6.05 pp            |
+| Silesia, whole-file     | 1    | −5.01% | −0.01%            | −5.00 pp            |
+
+**Rejected under the pre-registered accept rule**, and this time with no cell
+even ambiguous: every corpus regresses, both worst cases regress, and the two
+that cannot trigger the wide arm at all regress the hardest. `--worstlit` at
+−9.5% is the added predicate alone, paid 209.7 M times against zero wide
+copies, which is the cleanest possible reading of what the arm costs. No
+kernel code shipped; `src/chunk_decode.cuh` is untouched.
+
+**The negative is stronger than perf pass 1's and it closes the question for
+this format.** That pass could be read as a statement about one distribution;
+this one has the distribution measured beside it, shows the byte-share trigger
+at half of all literal bytes, and STILL loses on the corpus where the arm
+triggers most. A wide literal path is not rejected here for failing to fire -
+it fires - but for costing more than it saves, at 21.6% of the output being
+literal bytes in the first place and the whole copy stage being 31-35% of the
+kernel's time.
+
+**What ships from this pass is the `--literals` mode.** The histogram is a
+standing instrument rather than a one-off: the next attempt on this stage, for
+any format on this seam, reads the trigger rate before writing a kernel
+instead of arguing about it.
+
 ## M5: the Zstd CPU denominator (issue #227)
 
 There is no Zstd kernel yet. This entry is the denominator a later device

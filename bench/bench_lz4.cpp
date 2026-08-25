@@ -7,6 +7,8 @@
 #include "cudec.h"
 #include "fixtures.h"
 #include "gpu_bench.h"
+#include "literal_hist.h"
+#include "lz4_block.h"
 
 #include <lz4.h>
 #include <lz4frame.h>
@@ -1106,6 +1108,7 @@ int main(int argc, char** argv) {
     size_t warmup = 3;
     bool selfcheck = false;
     bool gpu = false;
+    bool literals = false;
     bool gpu_stream_ctx = false;
     bool worst4b = false;
     bool longmatch = false;
@@ -1116,6 +1119,8 @@ int main(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--selfcheck") {
             selfcheck = true;
+        } else if (arg == "--literals") {
+            literals = true;
         } else if (arg == "--gpu") {
             gpu = true;
         } else if (arg == "--gpu-stream-ctx") {
@@ -1147,7 +1152,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: bench_lz4 [--runs N] [--warmup N] [--gpu] "
                          "[--gpu-stream-ctx] [--worst4b] [--longmatch] "
-                         "[--assetlike] [--frame] [--selfcheck] "
+                         "[--assetlike] [--frame] [--literals] "
+                         "[--selfcheck] "
                          "[corpus files...]\n");
             return 2;
         } else {
@@ -1326,6 +1332,30 @@ int main(int argc, char** argv) {
     std::sort(times.begin(), times.end());
 
     PrintReport(corpus, times, warmup, runs);
+
+    /* The literal-length distribution (issue #165), walked with the shipped
+     * parser. It is here rather than only in the Snappy harness because the
+     * question the Snappy pass asks is a COMPARISON against this format, and
+     * an LZ4 histogram quoted from a different bucketing would not answer
+     * it. A stream this harness just built and byte-verified must parse, so
+     * a refusal is a defect and is reported as one. */
+    if (literals) {
+        cudec_bench::LiteralHistogram hist;
+        for (size_t i = 0; i < corpus.compressed.size(); i++) {
+            if (!cudec_bench::AccumulateLiteralLengths<
+                    cudec_detail::Lz4Parser>(corpus.compressed[i].data(),
+                                             corpus.compressed[i].size(),
+                                             corpus.originals[i].size(),
+                                             &hist)) {
+                std::fprintf(stderr,
+                             "the parser refused chunk %zu of a corpus this "
+                             "harness built and verified\n",
+                             i);
+                return 1;
+            }
+        }
+        cudec_bench::PrintLiteralHistogram(hist);
+    }
 
     if (gpu) {
         std::vector<const unsigned char*> comp_ptrs(corpus.compressed.size());
