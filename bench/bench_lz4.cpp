@@ -8,7 +8,6 @@
 #include "fixtures.h"
 #include "gpu_bench.h"
 
-#include <cuda_runtime.h>
 #include <lz4.h>
 #include <lz4frame.h>
 
@@ -774,26 +773,13 @@ double DecodeAllSeconds(const Corpus& corpus, unsigned char* scratch) {
     return std::chrono::duration<double>(end - start).count();
 }
 
+/* The device line moved to gpu_bench (issue #167): the Snappy harness needs
+ * the identical string, and a methodology block is comparable across reports
+ * only while every report names the machine the same way. */
 std::string CudaDeviceLine() {
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
-        return "none visible to this process (the GPU decode path arrives "
-               "with M1)";
-    }
-    cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) {
-        return "device query failed";
-    }
-    int driver = 0;
-    int runtime = 0;
-    (void)cudaDriverGetVersion(&driver);
-    (void)cudaRuntimeGetVersion(&runtime);
-    return std::string(prop.name) + " (sm_" + std::to_string(prop.major) +
-           std::to_string(prop.minor) + "), driver " +
-           std::to_string(driver / 1000) + "." +
-           std::to_string((driver % 100) / 10) + ", runtime " +
-           std::to_string(runtime / 1000) + "." +
-           std::to_string((runtime % 100) / 10);
+    char line[256];
+    (void)cudec_bench_gpu_device_line(line, sizeof(line));
+    return std::string(line);
 }
 
 /* Strict count parsing: whole-string decimal in [min, max] - rejects

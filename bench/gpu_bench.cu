@@ -8,6 +8,7 @@
 #include "cudec.h"
 #include "chunk_decode.cuh"
 #include "lz4_block.h"
+#include "snappy_block.h"
 
 #include <cuda_runtime.h>
 
@@ -15,13 +16,21 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 namespace {
 
 /* Parse-only ceiling variant: the identical redundant lockstep parse with
  * the copies elided, launched exactly like the shipped decode. It ceilings
- * both single-pass and any two-phase phase-1 (which shares this parse). */
+ * both single-pass and any two-phase phase-1 (which shares this parse).
+ *
+ * Templated on the parser rather than written once per format, for the same
+ * reason src/chunk_decode.cuh is: the launch shape, the argument validation
+ * and the grid are format-independent, and a second copy of them here would
+ * be a second place for the bench and the shipped path to drift apart. Only
+ * the instantiations named below are emitted. */
+template <class Parser>
 cudec_status LaunchParseOnly(const void* const* s, const size_t* ss,
                              void* const* d, const size_t* dc, size_t n,
                              cudec_chunk_result* r, cudaStream_t stream) {
@@ -31,7 +40,7 @@ cudec_status LaunchParseOnly(const void* const* s, const size_t* ss,
         return valid;
     }
     (void)cudaGetLastError();
-    cudec_detail::chunk_decode_batch<cudec_detail::Lz4Parser, true>
+    cudec_detail::chunk_decode_batch<Parser, true>
         <<<cudec_detail::decode_grid_blocks(n), cudec_detail::kBlockThreads, 0,
            stream>>>(s, ss, d, dc, n, r);
     return cudaGetLastError() == cudaSuccess ? CUDEC_OK : CUDEC_ERR_CUDA;
@@ -42,11 +51,16 @@ cudec_status LaunchParseOnly(const void* const* s, const size_t* ss,
         if ((call) != cudaSuccess) return false; \
     } while (0)
 
+/* The one launch shape every timed variant here has: the batch ABI's own
+ * argument list. Named once so the timing loop and the format entries below
+ * cannot disagree about it. */
+using LaunchFn = cudec_status (*)(const void* const*, const size_t*,
+                                  void* const*, const size_t*, size_t,
+                                  cudec_chunk_result*, cudaStream_t);
+
 /* Event-times `launch` over `runs` iterations after `warmup`, returning the
  * p50 milliseconds. */
-bool TimeKernel(cudec_status (*launch)(const void* const*, const size_t*,
-                                       void* const*, const size_t*, size_t,
-                                       cudec_chunk_result*, cudaStream_t),
+bool TimeKernel(LaunchFn launch,
                 const void** d_s, size_t* d_ss, void** d_d, size_t* d_dc,
                 size_t n, cudec_chunk_result* d_r, cudaStream_t stream,
                 int warmup, int runs, double* p50_ms) {
@@ -83,6 +97,12 @@ cudec_status LaunchFull(const void* const* s, const size_t* ss,
                         void* const* d, const size_t* dc, size_t n,
                         cudec_chunk_result* r, cudaStream_t stream) {
     return cudec_lz4_decompress_batch(s, ss, d, dc, n, r, stream);
+}
+
+cudec_status LaunchFullSnappy(const void* const* s, const size_t* ss,
+                              void* const* d, const size_t* dc, size_t n,
+                              cudec_chunk_result* r, cudaStream_t stream) {
+    return cudec_snappy_decompress_batch(s, ss, d, dc, n, r, stream);
 }
 
 double Median(std::vector<double>* t) {
@@ -160,11 +180,16 @@ bool TimeCtxCold(const void* const* h_src, const size_t* h_ssz,
     return true;
 }
 
-}  // namespace
-
-bool cudec_bench_gpu(const unsigned char* const* comp,
-                     const size_t* comp_sizes, const size_t* orig_sizes,
-                     size_t n, int warmup, int runs, cudec_gpu_result* out) {
+/* The device-resident measurement itself, format-agnostic: the two launchers
+ * are the only thing that differs between the formats on this seam, so the
+ * upload, the correctness precondition, the timing protocol and the
+ * throughput arithmetic are written once and both entries below share them.
+ * A second copy per format would be a second protocol, and two numbers
+ * produced by two protocols are not comparable. */
+bool BenchBatch(LaunchFn full, LaunchFn parse_only,
+                const unsigned char* const* comp, const size_t* comp_sizes,
+                const size_t* orig_sizes, size_t n, int warmup, int runs,
+                cudec_gpu_result* out) {
     std::vector<const void*> h_s(n);
     std::vector<void*> h_d(n);
     std::vector<size_t> h_ss(n), h_dc(n);
@@ -207,7 +232,7 @@ bool cudec_bench_gpu(const unsigned char* const* comp,
 
     /* Correctness precondition: every chunk must decode OK, or the numbers
      * are meaningless (honest-numbers discipline). */
-    if (LaunchFull(d_s, d_ss, d_d, d_dc, n, d_r, stream) != CUDEC_OK) {
+    if (full(d_s, d_ss, d_d, d_dc, n, d_r, stream) != CUDEC_OK) {
         return false;
     }
     BG_CUDA(cudaStreamSynchronize(stream));
@@ -224,12 +249,12 @@ bool cudec_bench_gpu(const unsigned char* const* comp,
 
     double full_ms = 0.0;
     double parse_ms = 0.0;
-    if (!TimeKernel(LaunchFull, d_s, d_ss, d_d, d_dc, n, d_r, stream, warmup,
-                    runs, &full_ms)) {
+    if (!TimeKernel(full, d_s, d_ss, d_d, d_dc, n, d_r, stream, warmup, runs,
+                    &full_ms)) {
         return false;
     }
-    if (!TimeKernel(LaunchParseOnly, d_s, d_ss, d_d, d_dc, n, d_r, stream,
-                    warmup, runs, &parse_ms)) {
+    if (!TimeKernel(parse_only, d_s, d_ss, d_d, d_dc, n, d_r, stream, warmup,
+                    runs, &parse_ms)) {
         return false;
     }
 
@@ -244,6 +269,48 @@ bool cudec_bench_gpu(const unsigned char* const* comp,
     /* Buffers are reclaimed at process exit; the bench is a short-lived
      * one-shot, like the test harness. */
     return true;
+}
+
+}  // namespace
+
+bool cudec_bench_gpu_device_line(char* out, size_t n) {
+    if (out == nullptr || n == 0) {
+        return false;
+    }
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+        std::snprintf(out, n, "none visible to this process");
+        return false;
+    }
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) {
+        std::snprintf(out, n, "device query failed");
+        return false;
+    }
+    int driver = 0;
+    int runtime = 0;
+    (void)cudaDriverGetVersion(&driver);
+    (void)cudaRuntimeGetVersion(&runtime);
+    std::snprintf(out, n, "%s (sm_%d%d), driver %d.%d, runtime %d.%d",
+                  prop.name, prop.major, prop.minor, driver / 1000,
+                  (driver % 100) / 10, runtime / 1000, (runtime % 100) / 10);
+    return true;
+}
+
+bool cudec_bench_gpu(const unsigned char* const* comp,
+                     const size_t* comp_sizes, const size_t* orig_sizes,
+                     size_t n, int warmup, int runs, cudec_gpu_result* out) {
+    return BenchBatch(LaunchFull, LaunchParseOnly<cudec_detail::Lz4Parser>,
+                      comp, comp_sizes, orig_sizes, n, warmup, runs, out);
+}
+
+bool cudec_bench_gpu_snappy(const unsigned char* const* comp,
+                            const size_t* comp_sizes, const size_t* orig_sizes,
+                            size_t n, int warmup, int runs,
+                            cudec_gpu_result* out) {
+    return BenchBatch(LaunchFullSnappy,
+                      LaunchParseOnly<cudec_detail::SnappyParser>, comp,
+                      comp_sizes, orig_sizes, n, warmup, runs, out);
 }
 
 bool cudec_bench_gpu_stream_ctx(const unsigned char* const* comp,

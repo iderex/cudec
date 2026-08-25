@@ -5,6 +5,14 @@
 
 #include <cstddef>
 
+/* The one description of the device a GPU row was produced on - name, sm_
+ * version, driver and runtime - written into `out` and truncated to `n`.
+ * It lives here rather than in each harness because a methodology block is
+ * only comparable across reports while every report names the machine the
+ * same way, and two copies of this string are two ways. Returns false, and
+ * writes the reason, when no device is visible to the process. */
+bool cudec_bench_gpu_device_line(char* out, size_t n);
+
 struct cudec_gpu_result {
     size_t chunks;
     size_t output_bytes;
@@ -21,6 +29,16 @@ struct cudec_gpu_result {
 bool cudec_bench_gpu(const unsigned char* const* comp,
                      const size_t* comp_sizes, const size_t* orig_sizes,
                      size_t n, int warmup, int runs, cudec_gpu_result* out);
+
+/* The same measurement over the Snappy batch entry (issue #167): the shipped
+ * cudec_snappy_decompress_batch, and the parse-only ceiling of the same
+ * parser through the chunk-decoder template seam. It reports through the
+ * struct above rather than one of its own, because the two formats are timed
+ * by the identical protocol and a second struct would let them drift apart. */
+bool cudec_bench_gpu_snappy(const unsigned char* const* comp,
+                            const size_t* comp_sizes, const size_t* orig_sizes,
+                            size_t n, int warmup, int runs,
+                            cudec_gpu_result* out);
 
 struct cudec_stream_ctx_result {
     size_t chunks;

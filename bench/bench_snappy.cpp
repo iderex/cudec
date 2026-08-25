@@ -1,8 +1,8 @@
-/* The Snappy benchmark harness: the CPU denominator every later GPU number
- * is read against. There is no Snappy kernel yet, so this measures the
- * reference decoder alone, and it says so in its own report rather than
- * leaving a reader to infer it (docs/MASTERPLAN.md section 5, honest
- * numbers).
+/* The Snappy benchmark harness: the CPU denominator every GPU number is read
+ * against, and - under --gpu (issue #167) - the device rows themselves. The
+ * default run measures the reference decoder alone and says so in its own
+ * report rather than leaving a reader to infer it (docs/MASTERPLAN.md
+ * section 5, honest numbers).
  *
  * Two corpus shapes, because the batch API and the format disagree about
  * what a unit is. Snappy's own framing is a whole stream per file; the
@@ -16,6 +16,7 @@
 #include "bench_stats.h"
 #include "cudec.h"
 #include "fixtures.h"
+#include "gpu_bench.h"
 #include "xxhash64.h"
 
 #include <snappy.h>
@@ -481,7 +482,7 @@ bool MakeBuffers(const Corpus& corpus,
 }
 
 void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
-                 size_t warmup, size_t runs) {
+                 size_t warmup, size_t runs, bool gpu) {
     std::vector<size_t> sizes;
     for (const auto& original : corpus.originals) {
         sizes.push_back(original.size());
@@ -489,13 +490,21 @@ void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
     std::sort(sizes.begin(), sizes.end());
     const double to_gbps = static_cast<double>(corpus.original_bytes) / 1e9;
 
+    char device[256];
+    (void)cudec_bench_gpu_device_line(device, sizeof(device));
+
     std::printf("## bench_snappy report\n");
     std::printf("- decoder: CPU oracle, snappy::RawUncompress (google/snappy "
-                "%d.%d.%d), single thread. cudec has no Snappy kernel yet, so "
-                "this report is the denominator and carries no cudec "
-                "number\n",
-                SNAPPY_MAJOR, SNAPPY_MINOR, SNAPPY_PATCHLEVEL);
+                "%d.%d.%d), single thread%s\n",
+                SNAPPY_MAJOR, SNAPPY_MINOR, SNAPPY_PATCHLEVEL,
+                gpu ? ". The GPU rows below time cudec's own decoder through "
+                      "cudec_snappy_decompress_batch, and the CPU rows are "
+                      "the denominator they are read against"
+                    : ". This run timed no cudec kernel - it is the "
+                      "denominator alone, and --gpu is what adds the device "
+                      "rows");
     std::printf("- host CPU: %s\n", cudec_bench::HostCpuName().c_str());
+    std::printf("- CUDA device: %s\n", device);
     std::printf("- cudec: %d\n", cudec_version());
     std::printf("- corpus: %s, %s, %zu streams, %.2f MB original, %.2f MB "
                 "compressed (ratio %.3f), %s\n",
@@ -529,7 +538,54 @@ void PrintReport(const Corpus& corpus, const std::vector<double>& sorted,
                 to_gbps / cudec_bench::Percentile(sorted, 99));
 }
 
-bool RunCorpus(Corpus* corpus, size_t warmup, size_t runs) {
+/* The device rows for one corpus, printed under the same methodology block
+ * as the CPU rows above them so the two cannot be quoted apart. The GPU
+ * decode is device-resident (H2D/D2H excluded) and CUDA-event timed, and
+ * cudec_bench_gpu_snappy refuses to time a batch whose chunks did not all
+ * decode to their original size, so a number here is never from an
+ * unverified decode.
+ *
+ * Three decimals on GB/s rather than the one bench_lz4 prints: the
+ * whole-file shape puts one warp on each of twelve streams, so its
+ * throughput lands two orders of magnitude below the chunked shape's and
+ * one decimal rounds the whole row to a single digit. */
+bool PrintGpuRows(const Corpus& corpus, double cpu_p50_seconds, size_t warmup,
+                  size_t runs) {
+    std::vector<const unsigned char*> comp_ptrs(corpus.compressed.size());
+    std::vector<size_t> comp_sizes(corpus.compressed.size());
+    std::vector<size_t> orig_sizes(corpus.originals.size());
+    for (size_t i = 0; i < corpus.compressed.size(); i++) {
+        comp_ptrs[i] = corpus.compressed[i].data();
+        comp_sizes[i] = corpus.compressed[i].size();
+        orig_sizes[i] = corpus.originals[i].size();
+    }
+    cudec_gpu_result g;
+    if (!cudec_bench_gpu_snappy(comp_ptrs.data(), comp_sizes.data(),
+                                orig_sizes.data(), corpus.originals.size(),
+                                static_cast<int>(warmup),
+                                static_cast<int>(runs), &g)) {
+        std::fprintf(stderr, "GPU bench failed\n");
+        return false;
+    }
+    std::printf("- GPU decode (device-resident, CUDA-event timed, %zu warmup "
+                "+ %zu runs, %zu chunks, every chunk verified to its original "
+                "size before timing): p50 %.3f ms, %.3f GB/s\n",
+                warmup, runs, g.chunks, g.full_ms_p50, g.full_gbps_p50);
+    std::printf("- GPU parse-only ceiling (copies elided, the identical "
+                "lockstep parse through the chunk-decoder template seam): p50 "
+                "%.3f ms, %.3f GB/s\n",
+                g.parse_only_ms_p50, g.parse_only_gbps_p50);
+    /* The ratio the milestone is read on: the device number against this
+     * report's own CPU denominator, computed from the two rows above rather
+     * than from a number quoted out of another run. */
+    std::printf("- GPU vs the CPU denominator in this report: %.2fx (CPU p50 "
+                "%.3f ms, GPU p50 %.3f ms)\n",
+                cpu_p50_seconds * 1e3 / g.full_ms_p50, cpu_p50_seconds * 1e3,
+                g.full_ms_p50);
+    return true;
+}
+
+bool RunCorpus(Corpus* corpus, size_t warmup, size_t runs, bool gpu) {
     Tally(corpus);
     if (corpus->original_bytes == 0) {
         std::fprintf(stderr, "corpus is empty - nothing to benchmark\n");
@@ -558,7 +614,11 @@ bool RunCorpus(Corpus* corpus, size_t warmup, size_t runs) {
         times.push_back(seconds);
     }
     std::sort(times.begin(), times.end());
-    PrintReport(*corpus, times, warmup, runs);
+    PrintReport(*corpus, times, warmup, runs, gpu);
+    if (gpu && !PrintGpuRows(*corpus, cudec_bench::Percentile(times, 50),
+                             warmup, runs)) {
+        return false;
+    }
     return true;
 }
 
@@ -619,6 +679,7 @@ int main(int argc, char** argv) {
     bool chunked = false;
     bool worst = false;
     bool worstlit = false;
+    bool gpu = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -632,6 +693,8 @@ int main(int argc, char** argv) {
             worst = true;
         } else if (arg == "--worstlit") {
             worstlit = true;
+        } else if (arg == "--gpu") {
+            gpu = true;
         } else if (arg == "--runs" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 1, kMaxRuns, &runs)) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n", kMaxRuns);
@@ -649,7 +712,7 @@ int main(int argc, char** argv) {
         } else if (!arg.empty() && arg[0] == '-') {
             std::fprintf(stderr, "usage: bench_snappy [--runs N] [--warmup N] "
                                  "[--whole] [--chunked] [--worst] "
-                                 "[--worstlit] [--selfcheck] "
+                                 "[--worstlit] [--gpu] [--selfcheck] "
                                  "[corpus files...]\n");
             return 2;
         } else {
@@ -659,6 +722,16 @@ int main(int argc, char** argv) {
     if (selfcheck) {
         warmup = 1;
         runs = 3;
+    }
+
+    /* The selfcheck is the rot check the GPU-less CI runner runs, so it stays
+     * CPU-only by construction rather than by whoever invokes it remembering
+     * to. Refused rather than silently ignored: a run that was asked for
+     * device rows and printed none reads as a machine with no device. */
+    if (gpu && selfcheck) {
+        std::fprintf(stderr, "--gpu and --selfcheck are exclusive: the "
+                             "selfcheck runs on the GPU-less runner\n");
+        return 2;
     }
 
     /* The adversarial corpora are constructed rather than compressed, and
@@ -709,7 +782,7 @@ int main(int argc, char** argv) {
                     : CheckLiteralDensity(corpus, elements))) {
             return 1;
         }
-        if (!RunCorpus(&corpus, warmup, runs)) {
+        if (!RunCorpus(&corpus, warmup, runs, gpu)) {
             return 1;
         }
         std::printf("- element density: %zu elements, %.4f per compressed "
@@ -778,7 +851,7 @@ int main(int argc, char** argv) {
             }
         }
         CompressAll(&corpus);
-        if (!RunCorpus(&corpus, warmup, runs)) {
+        if (!RunCorpus(&corpus, warmup, runs, gpu)) {
             return 1;
         }
         if (selfcheck && !CheckDigest(corpus, shape == Shape::kWhole
