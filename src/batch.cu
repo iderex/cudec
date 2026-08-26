@@ -30,7 +30,7 @@ cudec_status submit_batch(const void* const* d_src_ptrs,
      * call consumes the pending error state. */
     (void)cudaGetLastError();
 
-    cudec_detail::chunk_decode_batch<Parser, false>
+    cudec_detail::chunk_decode_batch<Parser, false, cudec_detail::kCudaWaveSize>
         <<<cudec_detail::decode_grid_blocks(chunk_count),
            cudec_detail::kBlockThreads, 0, stream>>>(
             d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,

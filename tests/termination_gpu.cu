@@ -205,7 +205,8 @@ int RequireGeometryRefused(const Batch& b, const UnsupportedGeometry& g) {
     cudaEvent_t finished;
     REQUIRE_CUDA(cudaStreamCreate(&stream));
     REQUIRE_CUDA(cudaEventCreateWithFlags(&finished, cudaEventDisableTiming));
-    cudec_detail::chunk_decode_batch<cudec_detail::Lz4Parser, false>
+    cudec_detail::chunk_decode_batch<cudec_detail::Lz4Parser, false,
+                                    cudec_detail::kCudaWaveSize>
         <<<g.blocks, g.threads, 0, stream>>>(b.d_srcs, b.d_sizes, b.d_dsts,
                                              b.d_caps, b.n, b.d_results);
     REQUIRE_CUDA(cudaGetLastError());
