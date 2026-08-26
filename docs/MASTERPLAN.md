@@ -2534,3 +2534,52 @@ actually owed here), and a recorded derivation for every reliance.
 third-party patent claims, and it does not say that relying on Apache-2.0
 artifacts makes a user of cudec safe. It says which artifacts this project's
 own engineering may draw on, and what it writes down when it does.
+
+## 17. The LZ4 frame subset, and which class refuses what (settled 2026-08-26, issue #379)
+
+The LZ4 frame walk landed with #141 and its accepted envelope was written into
+the ABI rather than here, at `cudec_lz4f_decompress` in `include/cudec.h`. That
+stays the one home for the envelope - a second copy in this file would drift
+against the contract callers actually compile against. What this section
+settles is the thing the ABI comment could not settle on its own: which refusal
+class a shape falls into, and why one shape moved.
+
+### 17.1 The classes are the same two 12.3 fixes, and they mean the same thing
+
+`CUDEC_ERR_CORRUPT_INPUT` means no conforming encoder produced these bytes.
+`CUDEC_ERR_UNSUPPORTED` means a conforming encoder did, and cudec does not
+decode that part of the format. The distinction is a contract with the caller:
+only the second is worth a CPU fallback. Section 12.3 argues it for Zstd; the
+argument is not format-specific and the LZ4 frame walk is held to it too.
+
+### 17.2 A skippable frame is `UNSUPPORTED`, not `CORRUPT_INPUT`
+
+The two container formats this tree parses share one magic range. The frame
+spec's "Skippable Frames" section gives `0x184D2A50` to `0x184D2A5F` and a
+four-byte little-endian `Frame_Size`, and liblz4's own frame API steps over one
+and reports a complete frame. So the bytes are a legal member of the container
+and the refusal is a scope line, exactly as 12.4 finds for the identical range
+on the Zstd side.
+
+Until #379 the LZ4 walk answered `CORRUPT_INPUT` about them, because a
+skippable frame simply is not the one magic number it accepted. That told a
+caller the file was damaged when it was not, and it made the two walks disagree
+about one range of bytes. Both are now `UNSUPPORTED`.
+
+What the change is NOT is a decision to step over skippable frames. Stepping
+over one means a chunk holds a frame sequence rather than a frame, which is the
+per-chunk result-shape question 12.5's first rung holds for Zstd and which the
+LZ4 batch entry has the same way. Until that rung is taken, one chunk is one
+frame here as well.
+
+### 17.3 What the move costs elsewhere, so it is not rediscovered
+
+`fuzz/fuzz_lz4_frame.cpp` asserts the stricter direction - a frame liblz4
+decodes end to end and the walk calls corrupt is the walk refusing a valid
+container - and it had to excuse the skippable range by name to do so. That
+exemption is gone rather than left as dead cover, because an exemption keyed on
+a magic number is a hole the day the status behind it changes back. The same
+target's twin-against-itself check on `UNSUPPORTED` gained the skippable magic
+as a third declared decline beside linked blocks and a dictionary id, and it
+tests the magic before the descriptor: eight bytes are a whole skippable frame,
+fewer than the smallest `.lz4` header.

@@ -231,26 +231,33 @@ int main() {
         REQUIRE(ExpectReject("bad-magic", f, CUDEC_ERR_CORRUPT_INPUT) == 0);
     }
     /* A SKIPPABLE FRAME (magic 0x184D2A50..5F): a legal member of the frame
-     * format that this decoder does not decode. liblz4's own frame API steps
-     * over it and reports a complete frame, so this is cudec being stricter
-     * than its reference on a container the format defines - the one such
-     * strictness in the LZ4 frame path that is about the magic number, and it
-     * is pinned here rather than left to be rediscovered because
-     * fuzz/fuzz_lz4_frame.cpp exempts exactly this shape from its
-     * stricter-direction check and an unpinned exemption is a hole.
+     * format that this decoder declines to step over. liblz4's own frame API
+     * steps over it and reports a complete frame, so the bytes are valid and
+     * the refusal is a scope line - which is why the status is UNSUPPORTED
+     * and not CORRUPT_INPUT (issue #379, MASTERPLAN section 17). The identical
+     * magic range answers UNSUPPORTED in src/zstd_frame.h, and the two
+     * container walks sharing these bytes now agree about them.
      *
-     * The status is CORRUPT_INPUT rather than the UNSUPPORTED that
-     * src/zstd_frame.h answers about the identical magic range. Whether the
-     * two paths should agree is a scope question rather than a defect in this
-     * walk, and it is issue #379. */
+     * All three rows are here rather than only the first, because the range
+     * is the guard: the two ends prove it covers the family the spec defines,
+     * and the neighbours one step outside it prove it has not swallowed the
+     * ordinary wrong magic that must stay CORRUPT_INPUT. */
     {
         Bytes f{0x50, 0x2A, 0x4D, 0x18}; /* the skippable magic, LE */
         Put32(&f, 4);                    /* Frame_Size */
         for (int i = 0; i < 4; i++) {
             f.push_back(0x00); /* the skipped user data */
         }
-        REQUIRE(ExpectReject("skippable-frame", f, CUDEC_ERR_CORRUPT_INPUT) ==
+        REQUIRE(ExpectReject("skippable-frame", f, CUDEC_ERR_UNSUPPORTED) == 0);
+        f[0] = 0x5F; /* the last of the sixteen spellings */
+        REQUIRE(ExpectReject("skippable-frame-last", f, CUDEC_ERR_UNSUPPORTED) ==
                 0);
+        f[0] = 0x4F; /* one below the range: not a frame at all */
+        REQUIRE(ExpectReject("below-skippable-range", f,
+                             CUDEC_ERR_CORRUPT_INPUT) == 0);
+        f[0] = 0x60; /* one above the range: not a frame at all */
+        REQUIRE(ExpectReject("above-skippable-range", f,
+                             CUDEC_ERR_CORRUPT_INPUT) == 0);
     }
     /* Version field != 01 (FLG bits 7-6). */
     REQUIRE(ExpectReject("bad-version", BuildFrame(0x20, 0x40, {b8}),

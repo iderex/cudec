@@ -45,10 +45,12 @@ here (`tests/parser_twin.cpp` holds the LZ4 `offset == 0` family).
 `fuzz_lz4_frame` is the third: both sides walk one `.lz4` container from its
 magic number, so a frame `LZ4F_decompress` decodes end to end and the parser
 calls corrupt is a valid container refused rather than a strictness. It
-declares two, a skippable frame and a block header whose 31-bit length masks to
-zero, identifies each from the bytes rather than from the verdict, and both are
-pinned as negatives in `tests/frame_host_negative.cpp` (`skippable-frame` and
-`block-blen-zero`) so neither exemption is a hole nothing covers.
+declares one, a block header whose 31-bit length masks to zero, identifies it
+from the bytes rather than from the verdict, and it is pinned as a negative in
+`tests/frame_host_negative.cpp` (`block-blen-zero`) so the exemption is not a
+hole nothing covers. A skippable frame was the second until the walk stopped
+calling it corrupt (#379); it is now refused as `UNSUPPORTED`, which this
+target's stricter-direction check never sees.
 
 `fuzz_zstd_decode` is the only target that enters more than one unit, and the
 two things it can say follow from that. It runs the same host driver the CPU

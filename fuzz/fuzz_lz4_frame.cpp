@@ -33,23 +33,27 @@
  * assertable too, and only because the twin and the reference are given the
  * same question here - both walk one .lz4 frame from its magic number - so a
  * frame liblz4 decodes and cudec calls CORRUPT_INPUT is cudec refusing a valid
- * container rather than cudec being carefully strict. Two strictnesses are
- * declared and identified rather than guessed at, and each is pinned by a
+ * container rather than cudec being carefully strict. ONE strictness is
+ * declared and identified rather than guessed at, and it is pinned by a
  * negative test in the tree:
  *
- *   - A skippable frame (magic 0x184D2A50..5F). liblz4 skips it and reports a
- *     complete frame; cudec decodes the one frame type its ABI documents.
- *     Pinned as `skippable-frame`. That cudec answers CORRUPT_INPUT about it
- *     where src/zstd_frame.h answers UNSUPPORTED about the identical magic
- *     range is a scope question rather than a defect in this walk, and it is
- *     issue #379.
  *   - A block header whose 31-bit length masks to zero with the uncompressed
  *     bit set. liblz4 masks first and reads it as the end mark; cudec reads it
  *     as a zero-length data block and refuses. Pinned as `block-blen-zero`.
  *
- * Both pins are rows in tests/frame_host_negative.cpp, so an exemption this
+ * The pin is a row in tests/frame_host_negative.cpp, so the exemption this
  * target grants is covered by the non-fuzz gate on every pull request rather
  * than living only in the sentence above.
+ *
+ * A SKIPPABLE FRAME USED TO BE THE SECOND EXEMPTION AND NO LONGER IS. The walk
+ * answered CORRUPT_INPUT about the magic range 0x184D2A50..5F that
+ * src/zstd_frame.h answers UNSUPPORTED about, so this target had to excuse
+ * every one of them by name; issue #379 moved the walk to UNSUPPORTED and the
+ * exemption went with it. The check below tests one status, so a skippable
+ * frame no longer reaches it at all and no bytes have to be recognised here to
+ * keep it quiet. That is the point of removing it rather than leaving it as
+ * dead cover: an exemption keyed on a magic number is a hole the day the
+ * status behind it changes back.
  *
  * WHAT IT DOES NOT CHECK, SAID PLAINLY. The class confusion fuzz_zstd_frame
  * asserts - a scope refusal (UNSUPPORTED) over bytes the reference refuses
@@ -89,11 +93,6 @@ constexpr size_t kMaxStream = 1u << 14;
  * not the code under test's, so it is a loose one-time allocation rather than
  * a tight per-run one; the twin's buffer below is tight for the usual reason. */
 constexpr size_t kMaxOracleOut = 8u << 20;
-
-/* The skippable-frame magic family: the low nibble is the frame's own index
- * and any of the sixteen spellings is a skippable frame to liblz4. */
-constexpr uint32_t kLz4SkippableMagicBase = 0x184D2A50u;
-constexpr uint32_t kLz4SkippableMagicMask = 0xFFFFFFF0u;
 
 void Trap(const char* what, size_t size) {
     std::fprintf(stderr, "DIVERGENCE: %s; stream=%zu\n", what, size);
@@ -259,21 +258,35 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     }
 
     /* An UNSUPPORTED answer claims the bytes are a legal frame this build
-     * declines, so the two declared declines must be visible in the bytes it
-     * answered about. The twin against itself, not against liblz4 - the
-     * comment at the top says why the parity form is not asserted. */
+     * declines, so one of the THREE declared declines must be visible in the
+     * bytes it answered about. The twin against itself, not against liblz4 -
+     * the comment at the top says why the parity form is not asserted.
+     *
+     * The skippable magic is tested first and separately because it is the one
+     * decline that is decided before the descriptor exists: eight bytes are a
+     * whole skippable frame, which is fewer than the smallest .lz4 header, so
+     * reading FLG out of those bytes would be reading a Frame_Size field. */
     if (twin.status == CUDEC_ERR_UNSUPPORTED) {
-        if (stream_size < cudec_detail::kLz4FrameMinHeaderBytes) {
-            Trap("a scope refusal about bytes too short to hold a descriptor",
-                 stream_size);
-        }
-        const unsigned flg = stream[4];
-        const bool block_independent = (flg >> 5) & 1;
-        const bool dict_id = flg & 1;
-        if (block_independent && !dict_id) {
-            Trap("a scope refusal about a frame declaring neither linked "
-                 "blocks nor a dictionary id",
-                 stream_size);
+        const bool skippable =
+            stream_size >= 4 &&
+            cudec_detail::Lz4FrameRead32LE(stream.get()) >=
+                cudec_detail::kLz4SkippableMagicMin &&
+            cudec_detail::Lz4FrameRead32LE(stream.get()) <=
+                cudec_detail::kLz4SkippableMagicMax;
+        if (!skippable) {
+            if (stream_size < cudec_detail::kLz4FrameMinHeaderBytes) {
+                Trap(
+                    "a scope refusal about bytes too short to hold a descriptor",
+                    stream_size);
+            }
+            const unsigned flg = stream[4];
+            const bool block_independent = (flg >> 5) & 1;
+            const bool dict_id = flg & 1;
+            if (block_independent && !dict_id) {
+                Trap("a scope refusal about a frame declaring neither a "
+                     "skippable magic, nor linked blocks, nor a dictionary id",
+                     stream_size);
+            }
         }
     }
 
@@ -284,26 +297,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         stream.get(), stream_size, oracle_out.get(), kMaxOracleOut,
         &oracle_size);
 
-    /* THE STRICTER DIRECTION, AND THE TWO PLACES IT IS NOT A DEFECT. Both
+    /* THE STRICTER DIRECTION, AND THE ONE PLACE IT IS NOT A DEFECT. Both
      * sides were asked about one .lz4 frame starting at byte zero, so a frame
      * the reference decodes end to end and the twin calls corrupt is the twin
-     * refusing a valid container. The two exemptions are identified from the
-     * bytes rather than inferred from the verdict. */
+     * refusing a valid container. The exemption is identified from the bytes
+     * rather than inferred from the verdict. */
     if (oracle == OracleVerdict::kAccepted &&
         twin.status == CUDEC_ERR_CORRUPT_INPUT) {
         bool declared_strictness = false;
-        if (stream_size >= 4) {
-            const uint32_t magic = cudec_detail::Lz4FrameRead32LE(stream.get());
-            declared_strictness |=
-                (magic & kLz4SkippableMagicMask) == kLz4SkippableMagicBase;
-        }
         /* The masks-to-zero block header, read at the exact offset the walk
          * stopped at rather than searched for. A scan of the whole stream
          * would excuse any divergence whose bytes happened to contain the
          * pattern somewhere, which over millions of random inputs is most of
          * them - an exemption that wide is a check that has stopped running. */
-        if (!declared_strictness && twin.walked &&
-            twin.stop_off + 4 <= stream_size) {
+        if (twin.walked && twin.stop_off + 4 <= stream_size) {
             const uint32_t bs =
                 cudec_detail::Lz4FrameRead32LE(stream.get() + twin.stop_off);
             declared_strictness = (bs != 0) && ((bs & 0x7FFFFFFFu) == 0);
