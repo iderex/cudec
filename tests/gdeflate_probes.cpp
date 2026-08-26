@@ -607,9 +607,17 @@ int main() {
                         "lane-order assertion above pins nothing on this page",
                         c.seed, c.level);
         }
+        /* All six drew a dynamic block when this was written, and the floor
+         * is set below that on purpose: which block type the reference picks
+         * is its decision, and an oracle pin that shifts one case to static
+         * should not red a probe about the precode. Four is still enough that
+         * the run cannot pass having read none, which is the failure this
+         * guards - every assertion above is inside the loop, so a run that
+         * skipped every case would be green and empty. */
         REQUIRE_CTX(dynamic_seen >= 4,
-                    "only %d of %zu inputs drew a dynamic block; the precode "
-                    "layout is unpinned on a run that never reads one",
+                    "only %d of %zu inputs drew a dynamic block (six did when "
+                    "this was written); the precode layout is unpinned on a "
+                    "run that reads too few",
                     dynamic_seen, sizeof(cases) / sizeof(cases[0]));
     }
 
