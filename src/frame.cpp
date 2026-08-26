@@ -7,7 +7,7 @@
  * (public): lz4_Frame_format.md. */
 #include "cudec.h"
 #include "cuda_raii.h"
-#include "xxhash32.h"
+#include "lz4_frame.h"
 
 #include <cuda_runtime.h>
 
@@ -16,27 +16,11 @@
 
 namespace {
 
-constexpr uint32_t kLz4FrameMagic = 0x184D2204u;
-
-uint32_t Read32LE(const unsigned char* p) {
-    uint32_t v;
-    std::memcpy(&v, p, 4);
-    return v; /* the frame format and the target hosts are little-endian */
-}
-
-uint64_t Read64LE(const unsigned char* p) {
-    uint64_t v;
-    std::memcpy(&v, p, 8);
-    return v;
-}
-
-/* A parsed data block: an offset/length into the frame, and whether it is
- * stored uncompressed (a straight copy) or LZ4-compressed (GPU-decoded). */
-struct FrameBlock {
-    size_t src_off;
-    size_t src_len;
-    bool uncompressed;
-};
+/* The envelope parse lives in src/lz4_frame.h so the fuzz target can drive
+ * arbitrary bytes into the same code this path runs (issue #141); what stays
+ * here is the device orchestration it feeds. */
+using cudec_detail::Lz4FrameBlock;
+using cudec_detail::Lz4FrameDescriptor;
 
 /* Decodes the compressed blocks in one device batch and assembles the whole
  * frame output (compressed decoded bytes + uncompressed blocks copied
@@ -51,7 +35,7 @@ struct FrameBlock {
  * streaming path (issue #24) needs. #24 still supersedes it (overlap,
  * pinned memory, per-block dst sizing). */
 cudec_status DecodeAndAssemble(const unsigned char* frame,
-                               const std::vector<FrameBlock>& blocks,
+                               const std::vector<Lz4FrameBlock>& blocks,
                                size_t block_max, unsigned char* out,
                                size_t dst_capacity, size_t* total_out) {
 #define FRAME_CUDA(call) CUDEC_CUDA_CHECK(call, return CUDEC_ERR_CUDA)
@@ -92,7 +76,7 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
             std::vector<unsigned char> stage(total_src);
             size_t so = 0;
             for (size_t k = 0; k < n; k++) {
-                const FrameBlock& b = blocks[cidx[k]];
+                const Lz4FrameBlock& b = blocks[cidx[k]];
                 std::memcpy(stage.data() + so, frame + b.src_off, b.src_len);
                 h_src[k] = static_cast<unsigned char*>(d_src.p) + so;
                 h_ssz[k] = b.src_len;
@@ -282,114 +266,32 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
 cudec_status DecodeFrame(const unsigned char* f, size_t frame_size,
                          unsigned char* out, size_t dst_capacity,
                          size_t* bytes_written) {
-    /* Magic (4) + FLG (1) + BD (1) + HC (1) is the minimum header. */
-    if (frame_size < 7 || Read32LE(f) != kLz4FrameMagic) {
-        return CUDEC_ERR_CORRUPT_INPUT;
-    }
-    const unsigned flg = f[4];
-    const unsigned bd = f[5];
-    if (((flg >> 6) & 3) != 1 || (flg & 2) != 0) {
-        return CUDEC_ERR_CORRUPT_INPUT; /* version / reserved bit */
-    }
-    const bool block_independent = (flg >> 5) & 1;
-    const bool block_checksum = (flg >> 4) & 1;
-    const bool content_size = (flg >> 3) & 1;
-    const bool content_checksum = (flg >> 2) & 1;
-    const bool dict_id = flg & 1;
-    if ((bd & 0x8F) != 0) {
-        return CUDEC_ERR_CORRUPT_INPUT; /* BD reserved bits */
-    }
-    const unsigned bmax = (bd >> 4) & 7;
-    if (bmax < 4 || bmax > 7) {
-        return CUDEC_ERR_CORRUPT_INPUT;
-    }
-    /* The frame format's smallest block-max, 64 KiB, doubled twice per BD
-     * step. Named for the reason issue #211 gives: digits in an expression
-     * cannot be told from a lane count by anything that reads this tree. */
-    constexpr size_t kBlockMaxKiB = 64;
-    const size_t block_max = (kBlockMaxKiB << 10) << ((bmax - 4) * 2);
-    if (!block_independent || dict_id) {
-        return CUDEC_ERR_UNSUPPORTED; /* linked blocks / dictionaries */
+    Lz4FrameDescriptor desc;
+    const cudec_status header_status =
+        cudec_detail::Lz4ParseFrameDescriptor(f, frame_size, &desc);
+    if (header_status != CUDEC_OK) {
+        return header_status;
     }
 
-    /* Header checksum covers FLG..end-of-descriptor. */
-    size_t pos = 6;
-    uint64_t declared_content_size = 0;
-    if (content_size) {
-        if (frame_size < pos + 8) {
-            return CUDEC_ERR_CORRUPT_INPUT;
-        }
-        declared_content_size = Read64LE(f + pos);
-        pos += 8;
-    }
-    if (frame_size < pos + 1) {
-        return CUDEC_ERR_CORRUPT_INPUT;
-    }
-    const unsigned hc = f[pos];
-    if (((cudec_detail::xxhash32(f + 4, pos - 4) >> 8) & 0xFF) != hc) {
-        return CUDEC_ERR_CORRUPT_INPUT;
-    }
-    pos += 1;
-
-    std::vector<FrameBlock> blocks;
-    /* Fuel: every step consumes at least the 4 block-size bytes, so a frame
-     * of frame_size bytes admits at most frame_size / 4 + 1 steps - a budget
-     * no frame the guards below admit can reach. It makes a future bounds
-     * bug a rejected frame instead of a spinning host thread. */
-    uint64_t fuel = frame_size / 4 + 1;
-    bool end_mark = false;
-    while (fuel-- != 0) {
-        if (frame_size < pos + 4) {
-            return CUDEC_ERR_CORRUPT_INPUT;
-        }
-        const uint32_t bs = Read32LE(f + pos);
-        pos += 4;
-        if (bs == 0) {
-            end_mark = true;
-            break;
-        }
-        const bool uncompressed = (bs >> 31) & 1;
-        const size_t blen = bs & 0x7FFFFFFFu;
-        if (blen == 0 || blen > block_max || frame_size < pos + blen) {
-            return CUDEC_ERR_CORRUPT_INPUT;
-        }
-        if (block_checksum) {
-            if (frame_size < pos + blen + 4) {
-                return CUDEC_ERR_CORRUPT_INPUT;
-            }
-            if (cudec_detail::xxhash32(f + pos, blen) !=
-                Read32LE(f + pos + blen)) {
-                return CUDEC_ERR_CORRUPT_INPUT;
-            }
-        }
-        blocks.push_back({pos, blen, uncompressed});
-        pos += blen + (block_checksum ? 4 : 0);
-    }
-    if (!end_mark) {
-        return CUDEC_ERR_CORRUPT_INPUT; /* fuel exhausted: no end mark */
+    std::vector<Lz4FrameBlock> blocks;
+    size_t tail_off = 0;
+    const cudec_status walk_status = cudec_detail::Lz4WalkFrameBlocks(
+        f, frame_size, desc, &blocks, &tail_off);
+    if (walk_status != CUDEC_OK) {
+        return walk_status;
     }
 
     size_t total = 0;
-    const cudec_status decode_status =
-        DecodeAndAssemble(f, blocks, block_max, out, dst_capacity, &total);
+    const cudec_status decode_status = DecodeAndAssemble(
+        f, blocks, desc.block_max, out, dst_capacity, &total);
     if (decode_status != CUDEC_OK) {
         return decode_status;
     }
 
-    /* A declared content size (FLG bit 3) must equal the produced size -
-     * liblz4 rejects a frame whose declared size does not match (too large
-     * or too small); cudec rejects it too (oracle parity). */
-    if (content_size && declared_content_size != total) {
-        return CUDEC_ERR_CORRUPT_INPUT;
-    }
-
-    if (content_checksum) {
-        if (frame_size < pos + 4) {
-            return CUDEC_ERR_CORRUPT_INPUT;
-        }
-        if (cudec_detail::xxhash32(out, total) != Read32LE(f + pos)) {
-            return CUDEC_ERR_CORRUPT_INPUT;
-        }
+    const cudec_status tail_status = cudec_detail::Lz4VerifyFrameTail(
+        f, frame_size, desc, tail_off, out, total);
+    if (tail_status != CUDEC_OK) {
+        return tail_status;
     }
 
     *bytes_written = total;
