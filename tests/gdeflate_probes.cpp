@@ -644,6 +644,17 @@ int main() {
      *     follows takes no further word - both asserted, for the reasons
      *     given where they are asserted.
      *
+     * AND ONE OF THE FOUR ANSWERS A QUESTION THE DOSSIER RECORDS AS OPEN.
+     * Section 11.5 lists three things not to read into the source, and the
+     * third is that "the draft states no bit width for a non-compressed
+     * block's length field. It says what was removed, in D3, and no more."
+     * Sixteen bits is the reference's answer rather than the draft's, and the
+     * LEN assertion below is where that stops being an assumption: a stored
+     * block whose declared length equals the input at six different sizes is
+     * a width measured, not one carried over from RFC 1951 because it happens
+     * to be the same number. The dossier item stays true as written - the
+     * draft still says nothing - so there is nothing to report back to #145.
+     *
      * Why the ladder needs it: a stored block is the one place a decoder is
      * handed a length it must bound itself. RFC 1951 gives a decoder a free
      * consistency check on that number and GDeflate does not, so the M4
