@@ -26,9 +26,17 @@
  * Absolute offsets, and 64-bit throughout. Snappy's declared length is a
  * varint32 so its positions provably fit in 32 bits, but the caller's
  * capacity is a size_t and mixing the two widths in a bound comparison is
- * where an overflow would hide. Whether the DEVICE side should carry
- * narrower copies is a measured kernel-shape question (issue #292), not a
- * width to change here on a guess. */
+ * where an overflow would hide.
+ *
+ * THE DEVICE CARRIES THEM AT THIS WIDTH TOO, MEASURED RATHER THAN INHERITED.
+ * Issue #292 asked whether the kernel should hold a narrowed copy of this
+ * struct. Both arms were built and run: narrowing the six fields to 32 bits
+ * takes the Snappy instantiation from 56 registers to 48 and from 9 resident
+ * blocks per SM to 10 on sm_86, and it costs 4-8% of decode throughput on
+ * every recorded corpus while the parse-only ceiling does not move. The copy
+ * loops index global memory, so a narrow field is widened again at the point
+ * of use, and the occupancy the narrowing buys is occupancy this kernel was
+ * not short of. docs/BENCHMARKS.md carries both arms and the mechanism. */
 #ifndef CUDEC_DECODE_SEQUENCE_H
 #define CUDEC_DECODE_SEQUENCE_H
 

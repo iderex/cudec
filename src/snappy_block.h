@@ -27,9 +27,19 @@
  * varint32, so every output position, every copy offset and every element
  * length provably fits in 32 bits. The shared element's fields are 64-bit
  * anyway, because the caller's capacity is a size_t and mixing the two
- * widths in the bound comparisons is where an overflow would hide. Whether
- * the DEVICE side should carry 32-bit copies of them is a measured
- * kernel-shape question (issue #292) and is not settled here.
+ * widths in the bound comparisons is where an overflow would hide.
+ *
+ * WHETHER THE DEVICE SHOULD CARRY 32-BIT COPIES OF THEM IS SETTLED, AND THE
+ * ANSWER IS NO. Issue #292 asked it and it is decided on a measurement
+ * rather than on the fields' declaration: a narrowed element buys eight
+ * registers and one more resident block per SM on sm_86, and LOSES 4-8% of
+ * decode throughput on all three recorded corpora. The parse-only ceiling
+ * does not move, which is what says where the loss is - the copy loops
+ * index global memory, so every narrow field is widened again at the point
+ * of use. Occupancy this kernel does not spend is occupancy it does not
+ * need. The numbers, both arms and the mechanism are in docs/BENCHMARKS.md
+ * under the #292 lever; the arithmetic WIDTH question is a different one and
+ * is answered per element inside src/chunk_decode.cuh.
  *
  * Edge semantics are settled empirically by oracle parity - whenever
  * snappy rejects, this parser must reject (tests/snappy_parser_twin.cpp).

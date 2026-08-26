@@ -1509,6 +1509,105 @@ standing instrument rather than a one-off: the next attempt on this stage, for
 any format on this seam, reads the trigger rate before writing a kernel
 instead of arguing about it.
 
+### M3 kernel shape (issue #292): the narrowed element buys occupancy and loses throughput
+
+The last width question the Snappy seam left open. The arithmetic width was
+settled with the gather (see the #58 pass above and the parser contract at the
+head of `src/chunk_decode.cuh`): the copy engine already picks a 32-bit modulo
+where the element admits one. What was not settled is the width the element is
+CARRIED in. `DecodeSequence` is six `uint64_t`, 48 bytes, and Snappy provably
+needs none of that range - its declared length is a varint32, so every position,
+offset and length fits in 32 bits. The struct's size is register pressure per
+lane, and the two instantiations of one kernel were already eight registers
+apart.
+
+Both arms were built and run rather than argued. The narrow arm is the same six
+fields declared `uint32_t`, which halves the element to 24 bytes. It is a
+measurement build and it is NOT in the tree: LZ4's `match_len` is bounded by the
+caller's `size_t` capacity rather than by any field width, and the tree carries
+a test that reaches past 2^32 through it, so a globally narrowed element is
+wrong for the other format on this seam. What the experiment answers is whether
+a SECOND, narrow element type for Snappy would be worth the panel decision it
+would cost - and it is not, so the question stops here rather than at that
+trade.
+
+Read out through `cudaFuncGetAttributes` and
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` on the shipped kernel:
+
+```
+device=NVIDIA GeForce RTX 3080 sm_86 maxWarpsPerSM=48 elementBytes=48
+lz4      regs=48   blocks/SM=10  warps/SM=40  (of 48)
+snappy   regs=56   blocks/SM=9   warps/SM=36  (of 48)
+
+device=NVIDIA GeForce RTX 3080 sm_86 maxWarpsPerSM=48 elementBytes=24
+lz4      regs=40   blocks/SM=12  warps/SM=48  (of 48)
+snappy   regs=48   blocks/SM=10  warps/SM=40  (of 48)
+```
+
+So the narrowing does exactly what it was expected to do to residency: eight
+registers back on both instantiations, one more resident block per SM for
+Snappy, and LZ4 reaching the architectural ceiling of 48 warps/SM. On the
+occupancy argument alone it wins.
+
+It loses on the clock, on every corpus:
+
+| corpus                 | 64-bit element | 32-bit element | delta     |
+| ---------------------- | -------------- | -------------- | --------- |
+| Silesia, 64 KiB chunks | 13.970 GB/s    | 12.899 GB/s    | **-7.7%** |
+| worst (copy chain)     | 8.064 GB/s     | 7.553 GB/s     | **-6.3%** |
+| worstlit (parse chain) | 3.612 GB/s     | 3.459 GB/s     | **-4.2%** |
+
+Repeated on Silesia because a single pair at that spread is a claim about one
+run. Three independent baseline samples against three narrow ones, alternating,
+same binaries, same corpus:
+
+```
+baseline  13.970 / 13.823 / 13.471 GB/s
+narrow    12.899 / 13.231 / 13.006 GB/s
+```
+
+Every baseline sample is above every narrow sample. GPU timing on this device
+jitters 1-2% run to run, which is the size of the spread WITHIN each arm and
+well under the gap between them.
+
+**The parse-only ceiling does not move, and that is what locates the cost.**
+Copies elided, the identical lockstep parse through the template seam:
+
+```
+baseline  19.911 / 19.693 / 18.734 GB/s
+narrow    19.648 / 19.683 / 20.044 GB/s
+```
+
+The two sets interleave completely. So the narrowing does not slow the parse -
+it slows the stage the parse feeds. The copy loops index global memory, where
+every field is an address operand and a 32-bit field is widened again at the
+point of use; the extra conversions are paid per lane per element, and they cost
+more than the resident block gains. On the adversarial corpora the direction is
+the same, which rules out an explanation that only holds for real data.
+
+**Rejected, and the accept rule that rejects it is the one already registered
+for this stage.** #161, #163 and #165 all turn on the parse-bound row as the
+DoS-resistance margin; this arm moves it 4.2% the wrong way and the general
+corpus 7.7% the wrong way. Occupancy is not the currency - the kernel was not
+short of resident warps, and buying more of them by making every element access
+more expensive is the trade this measurement refuses.
+
+So the element stays 64-bit on both sides of the seam, there is no narrowing to
+bounds-check, and the seam keeps ONE element contract - which is what the #85
+panel decided the copy engine's safety rests on, now costing nothing rather than
+costing an unmeasured amount. `src/decode_sequence.h` and `src/snappy_block.h`
+carry the answer where their next reader meets it.
+
+Recorded 2026-08-26 in the Ubuntu-24.04 WSL distribution, nvcc 13.3 (V13.3.73),
+driver 610.88, RTX 3080 (sm_86), 3 warmup + 30 measured runs, device-resident
+and CUDA-event timed, every chunk verified to its original size before timing.
+Both arms were built and run on this one toolchain in one sitting: the M3
+baselines above were taken under nvcc 12.6 in the pinned container, so the
+numbers here are compared against their own arm and never against those.
+Reproduce the baseline arm with `bench_snappy --gpu bench/corpora/silesia/*`,
+`bench_snappy --worst --gpu` and `bench_snappy --worstlit --gpu`; the narrow arm
+is those three over a build whose six `DecodeSequence` fields are `uint32_t`.
+
 ## M4: the GDeflate CPU denominator (issue #224)
 
 There is no GDeflate kernel yet. This entry is the denominator a later device
