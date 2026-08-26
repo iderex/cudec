@@ -131,6 +131,56 @@ add_test(NAME bench_snappy_worst_selfcheck COMMAND bench_snappy --worst
 add_test(NAME bench_snappy_worstlit_selfcheck COMMAND bench_snappy --worstlit
                                                       --selfcheck)
 
+# The GDeflate CPU denominator (issue #224). No CUDA in it at all: there is
+# no GDeflate kernel yet, so the reference decodes on the host and the binary
+# needs neither a device nor a cudec entry point. When the kernel lands, the
+# device rows join this binary the way they joined bench_snappy.
+#
+# It links gdeflate_oracle alone - the same target tests/ pins - because the
+# GDeflate streams in this project have ONE provenance, and a bench that
+# reached for a second compressor would be a second one nobody reconciles.
+add_executable(bench_gdeflate bench_gdeflate.cpp)
+target_link_libraries(bench_gdeflate PRIVATE gdeflate_oracle)
+# ../src for the corpus digest, which reads src/xxhash64.h - the hash already
+# in the tree rather than a new dependency for a bench.
+target_include_directories(bench_gdeflate PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The report names the oracle pin, and it is passed in from the one place that
+# holds it (cmake/CudecGDeflateOracle.cmake) rather than typed into the source:
+# a commit written twice is a commit that can disagree with itself, and the
+# half a reader would trust is the printed one.
+if(NOT CUDEC_GDEFLATE_COMMIT)
+  message(
+    FATAL_ERROR
+      "the gdeflate oracle pin did not reach this directory - bench_gdeflate "
+      "prints it in its methodology block, and a report attesting an unnamed "
+      "commit is the one failure that block may not have")
+endif()
+target_compile_definitions(
+  bench_gdeflate PRIVATE CUDEC_GDEFLATE_COMMIT="${CUDEC_GDEFLATE_COMMIT}")
+set_target_properties(bench_gdeflate PROPERTIES CXX_STANDARD 17
+                                                CXX_STANDARD_REQUIRED ON)
+# -O2 unconditionally for the reason bench_lz4 gives above: the documented
+# container command sets no CMAKE_BUILD_TYPE, and an -O0 reference decoder
+# would be timed instead of the reference decoder.
+target_compile_options(bench_gdeflate PRIVATE -Wall -Wextra -Werror -O2)
+
+# Same rot protection as the entries above. The selfcheck builds the whole
+# level set from a fixed source and asserts the digest of each, so a moved
+# oracle pin, a changed page split or a generator that lost its noise source
+# reds CI - none of which would stop the pages round-tripping, which is why
+# the round trip alone is not the check. CPU-only, so it runs on the GPU-less
+# runner.
+add_test(NAME bench_gdeflate_selfcheck COMMAND bench_gdeflate --selfcheck)
+
+# The asset-like corpus through the same grid (issue #139's block, issue
+# #224's path). Separate entry because it locks different bytes: the source
+# block comes from bench/assetlike_source.h, which bench_lz4 reads too, so a
+# generator that lost a region moves a digest here as well as there.
+# CPU-only, like the entry above.
+add_test(NAME bench_gdeflate_assetlike_selfcheck COMMAND bench_gdeflate
+                                                  --assetlike --selfcheck)
+
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
 # sequence-compression entry point and decoded by the reference, so the
@@ -195,5 +245,6 @@ set_tests_properties(
   bench_assetlike_selfcheck bench_zstd_worst_selfcheck bench_zstd_selfcheck
   bench_zstd_coverage_selfcheck bench_frame_selfcheck bench_snappy_selfcheck
   bench_snappy_worst_selfcheck bench_snappy_worstlit_selfcheck
+  bench_gdeflate_selfcheck bench_gdeflate_assetlike_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()
