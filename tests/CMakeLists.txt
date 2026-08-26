@@ -139,10 +139,14 @@ cudec_add_test(oracle_gdeflate SOURCES oracle_gdeflate.cpp LIBS
 # The dossier's format facts executed against that oracle (issue #170), the
 # GDeflate counterpart of snappy_probes below. It links gdeflate_oracle alone
 # for the reason oracle_gdeflate gives above, and it is GPU-less because the
-# facts are measured through the reference's public API rather than on a
-# device.
+# facts are measured either through the reference's public API or through the
+# schedule header, neither of which needs a device. It reaches src/ for that
+# header: the probes that pin where bits sit inside a page walk the substreams
+# with src/gdeflate_schedule.h rather than reimplementing the cursor beside it.
 cudec_add_test(gdeflate_probes SOURCES gdeflate_probes.cpp LIBS
                gdeflate_oracle)
+target_include_directories(gdeflate_probes
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The GDeflate round/refill schedule (issue #178), the first rung of the M4
 # substream machine. GPU-less because the schedule is pure arithmetic over a
 # byte range and the CPU twin is the only place it is testable before a kernel
