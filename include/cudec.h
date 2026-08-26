@@ -36,9 +36,10 @@ typedef enum cudec_status {
      * returns it; kept at this fixed value so a caller's switch stays
      * exhaustive once it is wired up. */
     CUDEC_ERR_NOT_IMPLEMENTED = 5,
-    /* A well-formed frame that uses a feature cudec does not decode
-     * (block-linked mode, a dictionary id). Distinct from CORRUPT_INPUT:
-     * the input is valid, just outside cudec's supported subset. */
+    /* A well-formed frame that uses a feature cudec does not decode, or a
+     * legal frame type it declines (block-linked mode, a dictionary id, a
+     * skippable frame). Distinct from CORRUPT_INPUT: the input is valid,
+     * just outside cudec's supported subset. */
     CUDEC_ERR_UNSUPPORTED = 6
 } cudec_status;
 
@@ -149,8 +150,10 @@ cudec_status cudec_snappy_decompress_batch(const void* const* d_src_ptrs,
  * LZ4F_blockIndependent). The header, block, and content checksums and the
  * optional declared content size, when present, are verified fail-closed.
  * Returns CUDEC_ERR_UNSUPPORTED for a valid frame cudec does not decode
- * (block-linked mode - the default of liblz4's frame compressor - or a
- * dictionary id), CUDEC_ERR_CORRUPT_INPUT for a malformed frame, a checksum
+ * (block-linked mode - the default of liblz4's frame compressor - a
+ * dictionary id, or a skippable frame, which is a legal member of the
+ * container this entry declines to step over),
+ * CUDEC_ERR_CORRUPT_INPUT for a malformed frame, a checksum
  * mismatch, or a declared content size that does not match the decoded
  * size, CUDEC_ERR_OUTPUT_TOO_SMALL when `dst_capacity` is too small, and
  * CUDEC_ERR_CUDA on a device or host resource failure. A NULL `frame` or

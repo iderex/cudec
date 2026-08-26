@@ -48,6 +48,14 @@ namespace cudec_detail {
 
 constexpr uint32_t kLz4FrameMagic = 0x184D2204u;
 
+/* The skippable-frame magic family, frame spec section "Skippable Frames":
+ * the low nibble is the frame's own index and all sixteen spellings name a
+ * legal member of the container. Held as its own range for the reason
+ * src/zstd_frame.h holds the identical one - the two container formats share
+ * these bytes and must not disagree about what they mean. */
+constexpr uint32_t kLz4SkippableMagicMin = 0x184D2A50u;
+constexpr uint32_t kLz4SkippableMagicMax = 0x184D2A5Fu;
+
 /* Magic (4) + FLG (1) + BD (1) + HC (1) is the smallest legal header. */
 constexpr size_t kLz4FrameMinHeaderBytes = 7;
 
@@ -91,14 +99,27 @@ inline uint64_t Lz4FrameRead64LE(const unsigned char* p) {
 
 /* Rung 1: the magic number and the frame descriptor, through the header
  * checksum. A malformed descriptor is CORRUPT_INPUT; a legal one this decoder
- * declines - linked blocks, a dictionary id - is UNSUPPORTED, so a caller can
- * tell "these bytes are not a frame" from "this is a frame I do not decode".
- * Only the second is worth a CPU fallback. */
+ * declines - a skippable frame, linked blocks, a dictionary id - is
+ * UNSUPPORTED, so a caller can tell "these bytes are not a frame" from "this
+ * is a frame I do not decode". Only the second is worth a CPU fallback. */
 inline cudec_status Lz4ParseFrameDescriptor(const unsigned char* f,
                                             size_t frame_size,
                                             Lz4FrameDescriptor* out) {
-    if (frame_size < kLz4FrameMinHeaderBytes ||
-        Lz4FrameRead32LE(f) != kLz4FrameMagic) {
+    if (frame_size < 4) {
+        return CUDEC_ERR_CORRUPT_INPUT; /* no magic to read */
+    }
+    const uint32_t magic = Lz4FrameRead32LE(f);
+    /* The skippable range is separated from every other wrong magic BEFORE
+     * the corrupt verdict, because those frames are legal: liblz4's frame API
+     * steps over one and reports a complete frame. A caller told "corrupt"
+     * about a valid skippable frame would have no reason to reach for a CPU
+     * decoder, which is the confusion the two classes exist to prevent.
+     * Stepping over one is refused as a scope line rather than as a
+     * difficulty; MASTERPLAN section 17 is where that line is argued. */
+    if (magic >= kLz4SkippableMagicMin && magic <= kLz4SkippableMagicMax) {
+        return CUDEC_ERR_UNSUPPORTED;
+    }
+    if (frame_size < kLz4FrameMinHeaderBytes || magic != kLz4FrameMagic) {
         return CUDEC_ERR_CORRUPT_INPUT;
     }
     const unsigned flg = f[4];
