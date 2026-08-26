@@ -43,7 +43,14 @@ include(FetchContent)
 #
 # The pinned commit is the branch head as of that read, so the pin does not
 # lag the fork; the fork lags upstream.
-set(CUDEC_GDEFLATE_COMMIT 8ba9502fb30d2bf728592d121f0d402e40c8cb05)
+# CACHE INTERNAL rather than a plain set: this file is included from tests/,
+# and the benchmark harness in bench/ prints the pin in its own methodology
+# block. A directory-scoped variable would reach that harness as the empty
+# string and it would attest an unnamed commit, which is the one failure a
+# methodology block may not have. bench/CMakeLists.txt refuses an empty value.
+set(CUDEC_GDEFLATE_COMMIT
+    8ba9502fb30d2bf728592d121f0d402e40c8cb05
+    CACHE INTERNAL "the pinned NVIDIA/libdeflate gdeflate commit")
 FetchContent_Declare(
   gdeflate
   URL https://github.com/NVIDIA/libdeflate/archive/${CUDEC_GDEFLATE_COMMIT}.tar.gz

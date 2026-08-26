@@ -1509,6 +1509,180 @@ standing instrument rather than a one-off: the next attempt on this stage, for
 any format on this seam, reads the trigger rate before writing a kernel
 instead of arguing about it.
 
+## M4: the GDeflate CPU denominator (issue #224)
+
+There is no GDeflate kernel yet. This entry is the denominator a later device
+number will be read against, and the harness says so in its own report rather
+than leaving a reader to infer it from the absence of a GPU row.
+
+Eight cells, two corpora crossed with the level set section 11.8 of the
+[MASTERPLAN](MASTERPLAN.md) records. Silesia is the general-purpose half;
+`asset-like` is the generated game-asset model (issue #139), which is the one
+regime Silesia does not reach - most of its block is incompressible, so the
+decode is dominated by literal transfer. Both harnesses read that block from
+one generator, `bench/assetlike_source.h`, so the bytes a number is attested
+against cannot drift between them.
+
+The levels are 0, 1, 6 and 12, and each is there to reach something: 0 emits
+uncompressed blocks by construction, which is the only block-type guarantee
+the reference's own header gives; 1 is the fast end of the search; 6 is the
+default; 12 is the densest table description. Section 11.8 also says plainly
+that a level list is the PLAN for coverage and not the coverage argument, and
+nothing here asserts which block types a family actually reached - that lock
+needs a walk over the emitted page and is issue #225's.
+
+The unit is the 64 KiB GDeflate page, and each page is compressed on its own,
+which is what makes it independently decodable and what the batch surface
+(#216) will take. The timed loop decodes one page per call. Before anything is
+timed every page is decoded back by the reference and compared against the
+source it was cut from, so a page set that dropped, reordered or truncated
+part of the corpus fails instead of reporting a plausible ratio over different
+bytes.
+
+Each report carries a digest of the corpus that was actually built, folded
+over the produced pages rather than over the inputs (the inputs are already
+pinned by the manifest `bench/get-corpora.sh` writes). It is order-sensitive,
+so the digests below belong to the file order listed in the corpus line.
+
+Recorded 2026-08-26 in the Ubuntu-24.04 WSL distribution on the host CPU named
+in the blocks, against the gdeflate fork pinned at
+`8ba9502fb30d2bf728592d121f0d402e40c8cb05`. Reproduce with
+`bench_gdeflate --warmup 3 --runs 30 bench/corpora/silesia/*` and
+`bench_gdeflate --warmup 3 --runs 30 --assetlike`.
+
+**Read the p50 and treat the tail with suspicion on this run.** The host was
+carrying other work while these were taken - the Silesia level-0 cell spreads
+from 0.692 GB/s at p50 to 0.227 GB/s at p99 - so the p90/p99 columns of the
+blocks below carry that contention rather than a property of the decoder. The
+p50 is the denominator this entry exists to record; the tail is reported
+because the block reports it, not because it is clean.
+
+| corpus     | level | compressed | ratio  | p50 decode | corpus digest      |
+| ---------- | ----- | ---------- | ------ | ---------- | ------------------ |
+| Silesia    | 0     | 212.38 MB  | 1.0021 | 0.692 GB/s | `88ed82d5ec9df3ad` |
+| Silesia    | 1     | 75.89 MB   | 0.3581 | 0.313 GB/s | `131124d155e6672b` |
+| Silesia    | 6     | 70.84 MB   | 0.3343 | 0.362 GB/s | `042b2473240db0b0` |
+| Silesia    | 12    | 67.77 MB   | 0.3198 | 0.373 GB/s | `4b88e13a215ed884` |
+| asset-like | 0     | 210.15 MB  | 1.0021 | 0.678 GB/s | `08ac6ec118b60189` |
+| asset-like | 1     | 149.00 MB  | 0.7105 | 0.292 GB/s | `45690d97a5d3b054` |
+| asset-like | 6     | 147.40 MB  | 0.7029 | 0.322 GB/s | `47dad3ea983dc577` |
+| asset-like | 12    | 146.70 MB  | 0.6995 | 0.335 GB/s | `cb272ab3765d8378` |
+
+The table is a reading aid. The eight blocks below are the record, and each one
+carries the methodology its own numbers were taken under.
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. cudec has no GDeflate kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, 212.38 MB compressed (ratio 1.0021), cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- granularity: 64 KiB pages, compression level 0
+- corpus digest: 88ed82d5ec9df3ad (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted here; reading it needs a walk over the emitted page and that lock is issue #225's
+- wall per run: p50 306.237 ms / p90 431.330 ms / p99 933.635 ms
+- decode throughput: p50 0.692 GB/s / p90 0.491 GB/s / p99 0.227 GB/s
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. cudec has no GDeflate kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, 75.89 MB compressed (ratio 0.3581), cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- granularity: 64 KiB pages, compression level 1
+- corpus digest: 131124d155e6672b (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted here; reading it needs a walk over the emitted page and that lock is issue #225's
+- wall per run: p50 676.159 ms / p90 1124.385 ms / p99 1393.539 ms
+- decode throughput: p50 0.313 GB/s / p90 0.188 GB/s / p99 0.152 GB/s
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. cudec has no GDeflate kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, 70.84 MB compressed (ratio 0.3343), cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- granularity: 64 KiB pages, compression level 6
+- corpus digest: 042b2473240db0b0 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted here; reading it needs a walk over the emitted page and that lock is issue #225's
+- wall per run: p50 585.838 ms / p90 629.493 ms / p99 713.022 ms
+- decode throughput: p50 0.362 GB/s / p90 0.337 GB/s / p99 0.297 GB/s
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. cudec has no GDeflate kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, 67.77 MB compressed (ratio 0.3198), cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- granularity: 64 KiB pages, compression level 12
+- corpus digest: 4b88e13a215ed884 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted here; reading it needs a walk over the emitted page and that lock is issue #225's
+- wall per run: p50 568.204 ms / p90 589.782 ms / p99 615.539 ms
+- decode throughput: p50 0.373 GB/s / p90 0.359 GB/s / p99 0.344 GB/s
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. cudec has no GDeflate kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: asset-like, 3200 pages, 209.72 MB original, 210.15 MB compressed (ratio 1.0021), generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- granularity: 64 KiB pages, compression level 0
+- corpus digest: 08ac6ec118b60189 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted here; reading it needs a walk over the emitted page and that lock is issue #225's
+- wall per run: p50 309.432 ms / p90 327.616 ms / p99 345.187 ms
+- decode throughput: p50 0.678 GB/s / p90 0.640 GB/s / p99 0.608 GB/s
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. cudec has no GDeflate kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: asset-like, 3200 pages, 209.72 MB original, 149.00 MB compressed (ratio 0.7105), generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- granularity: 64 KiB pages, compression level 1
+- corpus digest: 45690d97a5d3b054 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted here; reading it needs a walk over the emitted page and that lock is issue #225's
+- wall per run: p50 719.320 ms / p90 757.564 ms / p99 781.417 ms
+- decode throughput: p50 0.292 GB/s / p90 0.277 GB/s / p99 0.268 GB/s
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. cudec has no GDeflate kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: asset-like, 3200 pages, 209.72 MB original, 147.40 MB compressed (ratio 0.7029), generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- granularity: 64 KiB pages, compression level 6
+- corpus digest: 47dad3ea983dc577 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted here; reading it needs a walk over the emitted page and that lock is issue #225's
+- wall per run: p50 651.308 ms / p90 673.832 ms / p99 688.227 ms
+- decode throughput: p50 0.322 GB/s / p90 0.311 GB/s / p99 0.305 GB/s
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. cudec has no GDeflate kernel yet, so this report is the denominator and carries no cudec number
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: asset-like, 3200 pages, 209.72 MB original, 146.70 MB compressed (ratio 0.6995), generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- granularity: 64 KiB pages, compression level 12
+- corpus digest: cb272ab3765d8378 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted here; reading it needs a walk over the emitted page and that lock is issue #225's
+- wall per run: p50 626.935 ms / p90 666.084 ms / p99 682.146 ms
+- decode throughput: p50 0.335 GB/s / p90 0.315 GB/s / p99 0.307 GB/s
+```
+
 ## M5: the Zstd CPU denominator (issue #227)
 
 There is no Zstd kernel yet. This entry is the denominator a later device
