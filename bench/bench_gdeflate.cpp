@@ -21,12 +21,28 @@
  * therefore the shape most data arrives in; 12 is the densest table
  * description and the most aggressively chosen block boundaries.
  *
- * WHAT THIS PATH DOES NOT CLAIM. Section 11.8 says the level list is the plan
- * for coverage and not the coverage argument: a compressor chooses block
- * types for its own reasons. Asserting the block-type composition a family
- * actually reached needs a walk over the emitted page, which needs the
- * substream machine, and that lock is issue #225's rather than this one's.
- * Nothing here claims a block type was reached.
+ * WHAT THE LEVEL SWEEP DOES NOT CLAIM. Section 11.8 says the level list is
+ * the plan for coverage and not the coverage argument: a compressor chooses
+ * block types for its own reasons, and block type is not a pure function of
+ * level because incompressible input forces stored blocks at any level. So
+ * the four-level rows below claim no block type at all.
+ *
+ * WHAT --blocktypes ADDS (issue #225). A second corpus path whose families
+ * are level CROSSED WITH INPUT CHARACTER, each one asserting the block type
+ * it actually reached by walking the emitted page's first block header with
+ * the substream schedule in src/gdeflate_schedule.h. A family that did not
+ * reach its target type fails rather than quietly costing coverage, which is
+ * 11.8's rule executed rather than restated. Those rows are decode-path
+ * coverage and never headline numbers: they carry a ratio and they are not
+ * the milestone's throughput figures.
+ *
+ * WHAT THE COMPOSITION LOCK CANNOT SEE, said before anyone reads it as more.
+ * It reads the FIRST block of each page and stops. A GDeflate block boundary
+ * is not findable by scanning - dossier 11.3 D5, and the schedule header says
+ * the same - so reaching a page's second block means decoding to it, and
+ * there is no decoder in the tree yet (#176, #182). So a family asserting
+ * `static` proves every page OPENS with a static block, and says nothing
+ * about what follows in that page.
  *
  * Ratio is printed beside throughput on every row. For a DEFLATE-class format
  * the ratio is half the pitch, and a throughput-only table would misreport
@@ -41,6 +57,7 @@
 
 #include <libdeflate.h>
 
+#include "gdeflate_schedule.h"
 #include "xxhash64.h"
 
 #include <algorithm>
@@ -98,7 +115,97 @@ struct Corpus {
     /* Printed verbatim in the methodology block, so it must stay true for
      * whichever corpus ran. */
     std::string provenance;
+    /* What the block-type walk asserted about this corpus, or the sentence
+     * saying it asserted nothing. Printed rather than derived at the print
+     * site, so a corpus path that skips the walk cannot inherit a claim a
+     * different path earned. */
+    std::string composition;
 };
+
+/* The RFC 1951 block-type values the format keeps (dossier 11.3: D3 changes
+ * what a stored block CONTAINS, not the two bits that name it). Same three
+ * constants tests/gdeflate_probes.cpp reads; this binary links no test
+ * object, so they are stated rather than shared. */
+constexpr uint32_t kBlockStored = 0;
+constexpr uint32_t kBlockStatic = 1;
+constexpr uint32_t kBlockDynamic = 2;
+
+/* What a corpus path that did not walk the pages says about itself. A
+ * sentence rather than an empty string: an empty composition field printed
+ * as an empty line reads as a claim nobody made. */
+const char* const kCompositionNotAsserted =
+    "not asserted on this path; the four-level sweep claims no block type, "
+    "which is section 11.8's rule that a level list is a plan for coverage "
+    "and not the coverage argument";
+
+const char* BlockTypeName(uint32_t type) {
+    switch (type) {
+        case kBlockStored:
+            return "stored";
+        case kBlockStatic:
+            return "static";
+        case kBlockDynamic:
+            return "dynamic";
+        default:
+            return "reserved";
+    }
+}
+
+/* The first block header of a page: prime the 32 lanes, reset to lane 0
+ * (every block header rides lane 0, dossier 11.2), then BFINAL and BTYPE.
+ * This is the reading tests/gdeflate_probes.cpp pins, driven here over a
+ * corpus rather than over one crafted page.
+ *
+ * Returns false when the page is too short to prime or the schedule went
+ * sticky, which is a corpus this harness must not go on to time rather than
+ * a block type to report. */
+bool FirstBlockType(const std::vector<unsigned char>& page, uint32_t* out) {
+    cudec_detail::GDeflateSchedule s;
+    if (!cudec_detail::GDeflateInit(s, page.data(), page.size())) {
+        return false;
+    }
+    cudec_detail::GDeflateReset(s);
+    cudec_detail::GDeflatePop(s, 1); /* BFINAL, not read here */
+    const uint32_t type = cudec_detail::GDeflatePop(s, 2);
+    if (s.failed) {
+        return false;
+    }
+    *out = type;
+    return true;
+}
+
+/* 11.8's rule, executed: a family that did not reach its target block type
+ * fails rather than quietly costing coverage. Every page is walked and the
+ * first disagreement names the page and what was read there, because "some
+ * page in this corpus is wrong" is not a thing anyone can act on. */
+bool AssertComposition(Corpus* corpus, uint32_t want) {
+    for (size_t i = 0; i < corpus->compressed.size(); i++) {
+        uint32_t got = 0;
+        if (!FirstBlockType(corpus->compressed[i], &got)) {
+            std::fprintf(stderr,
+                         "page %zu of %s carries no readable block header - "
+                         "the schedule refused it before any type was read\n",
+                         i, corpus->name.c_str());
+            return false;
+        }
+        if (got != want) {
+            std::fprintf(stderr,
+                         "page %zu of %s opens with a %s block, not the %s "
+                         "block this family exists to reach - the corpus no "
+                         "longer covers the decode path it is named for\n",
+                         i, corpus->name.c_str(), BlockTypeName(got),
+                         BlockTypeName(want));
+            return false;
+        }
+    }
+    corpus->composition = std::string("every page opens with a ") +
+                          BlockTypeName(want) +
+                          " block, asserted by walking each page's first "
+                          "block header (the first block only - a later "
+                          "block in the same page is neither asserted nor "
+                          "denied, because reaching one means decoding to it)";
+    return true;
+}
 
 /* One page compressed on its own. The page count is read back from the
  * reference rather than assumed: the page split is the reference's to decide,
@@ -333,6 +440,40 @@ std::vector<unsigned char> MakeSelfcheckSource(size_t bytes) {
     return out;
 }
 
+/* THE TWO FORCED SOURCES, and why each one forces what it does.
+ *
+ * Neither is a plausible workload and neither is meant to be: these corpora
+ * exist to reach a decode path, and the report says so on their rows.
+ *
+ * Incompressible: a xorshift stream. LZ77 finds nothing and Huffman coding a
+ * uniform byte distribution costs more than it saves, so the reference emits
+ * a stored block at every level. This is the half of 11.8's sentence that
+ * says block type is not a pure function of level.
+ *
+ * Low-entropy: a short repeating alphabet with no noise at all. Everything
+ * after the first few bytes is one long match, the symbol set is tiny, and a
+ * dynamic table description costs more than the fixed one it would replace -
+ * so the reference takes the static block. */
+std::vector<unsigned char> MakeIncompressibleSource(size_t bytes) {
+    std::vector<unsigned char> out(bytes);
+    uint64_t x = 88172645463325252ull;
+    for (size_t i = 0; i < bytes; i++) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out[i] = static_cast<unsigned char>(x);
+    }
+    return out;
+}
+
+std::vector<unsigned char> MakeLowEntropySource(size_t bytes) {
+    std::vector<unsigned char> out(bytes);
+    for (size_t i = 0; i < bytes; i++) {
+        out[i] = static_cast<unsigned char>('a' + (i % 7));
+    }
+    return out;
+}
+
 /* The asset-like source, replicated to `pages` identical pages. The block is
  * generated in bench/assetlike_source.h, which bench_lz4 reads too: the
  * recorded numbers are attested against those bytes, and two harnesses
@@ -388,9 +529,8 @@ void PrintReport(const Corpus& corpus, int level,
                 "outside it); every page round-trip-verified against the "
                 "source once before timing; percentiles are nearest-rank\n",
                 warmup, runs);
-    std::printf("- block-type composition: not asserted here; reading it "
-                "needs a walk over the emitted page and that lock is issue "
-                "#225's\n");
+    std::printf("- block-type composition: %s\n",
+                corpus.composition.c_str());
     const double p50 = Percentile(sorted, 50);
     const double p90 = Percentile(sorted, 90);
     const double p99 = Percentile(sorted, 99);
@@ -407,15 +547,24 @@ void PrintReport(const Corpus& corpus, int level,
  * ones that moved. Stopping at the first would report one drifted level and
  * leave the rest unexamined, which reads as "only that one moved". */
 bool RunLevel(const std::vector<unsigned char>& source, const std::string& name,
-              const std::string& provenance, int level, size_t warmup,
-              size_t runs, uint64_t* digest_out) {
+              const std::string& provenance, int level, int want_block_type,
+              size_t warmup, size_t runs, uint64_t* digest_out) {
     Corpus corpus;
     corpus.name = name;
     corpus.provenance = provenance;
+    corpus.composition = kCompositionNotAsserted;
     if (!BuildCorpus(source, level, &corpus)) {
         return false;
     }
     if (!CorpusRoundTrips(source, corpus)) {
+        return false;
+    }
+    /* Before the digest and before anything is timed: a family that missed
+     * its block type is not a corpus to record a number about, and a digest
+     * pinned over it would pin the miss. */
+    if (want_block_type >= 0 &&
+        !AssertComposition(&corpus,
+                           static_cast<uint32_t>(want_block_type))) {
         return false;
     }
     *digest_out = CorpusDigest(corpus);
@@ -481,6 +630,68 @@ static_assert(sizeof(kAssetlikeSelfcheckDigests) /
                   kLevelCount,
               "one asset-like selfcheck digest per level");
 
+/* THE FORCED-BLOCK-TYPE FAMILIES (issue #225), one row each.
+ *
+ * Section 11.8 says the sweep is level CROSSED WITH INPUT CHARACTER, so each
+ * family names both and the two stored rows differ in which of the two did
+ * the forcing. Dropping either would leave the corpus proving less than it
+ * looks like it proves: `stored-by-level` alone would let a reader conclude
+ * that only level 0 reaches a stored block, which is the sentence 11.8
+ * exists to refuse.
+ *
+ * MEASURED RATHER THAN ASSUMED, and the measurement is what decided that
+ * nothing here is hand-constructed. The issue's scope allows hand-building a
+ * stream where a block type cannot be forced out of the compressor; the
+ * probe over levels 0, 1, 6 and 12 crossed with incompressible, low-entropy
+ * and mixed input found both target types reachable, so no hand-built page
+ * is in this tree and none is owed. `dynamic` is not a family here: it is
+ * what the four-level sweep already produces on ordinary input, and a corpus
+ * forcing the common case would carry cost for no coverage. */
+struct ForcedFamily {
+    const char* name;
+    int level;
+    uint32_t want_type;
+    std::vector<unsigned char> (*source)(size_t);
+    const char* provenance;
+    /* The digest of the four-page selfcheck corpus this family builds. */
+    uint64_t selfcheck_digest;
+};
+
+/* Bigger than the selfcheck's four pages so the row's timing is not noise,
+ * and far smaller than the level sweep's corpora because these rows are
+ * decode-path coverage rather than a throughput figure anyone quotes. */
+constexpr size_t kBlocktypePages = 64;
+
+const ForcedFamily kForcedFamilies[] = {
+    {"stored-by-level", 0, kBlockStored, MakeSelfcheckSource,
+     "generated in-harness from a fixed PRNG and compressed at level 0, "
+     "which the reference's own header says emits uncompressed blocks by "
+     "construction; DECODE-PATH COVERAGE, not a throughput figure",
+     0xd46934fd0e71f055ull},
+    {"stored-by-input", 6, kBlockStored, MakeIncompressibleSource,
+     "generated in-harness from a xorshift PRNG, incompressible by "
+     "construction, compressed at the DEFAULT level 6 - the stored block "
+     "here is forced by the input and not by the level; DECODE-PATH "
+     "COVERAGE, not a throughput figure",
+     0x28488bd60cba9ce9ull},
+    {"static-low-entropy", 1, kBlockStatic, MakeLowEntropySource,
+     "generated in-harness as a seven-byte repeating alphabet with no noise, "
+     "compressed at level 1, where a dynamic table description costs more "
+     "than the fixed code it would replace; DECODE-PATH COVERAGE, not a "
+     "throughput figure",
+     0x8dfa68cd98743adeull},
+};
+constexpr size_t kForcedFamilyCount =
+    sizeof(kForcedFamilies) / sizeof(kForcedFamilies[0]);
+
+/* Both stored families and at least one static family must be present, or
+ * this path has stopped being the thing its issue asked for. Refused at
+ * compile time because a family deleted from the table above would otherwise
+ * leave a green selfcheck that covers one block type. */
+static_assert(kForcedFamilyCount >= 3,
+              "the forced set must keep both stored forcings and the static "
+              "one; a smaller table covers less than #225 asks for");
+
 bool CheckDigest(uint64_t actual, const std::string& name, int level,
                  uint64_t expected) {
     if (actual == expected) {
@@ -509,8 +720,32 @@ bool ParseCount(const char* text, size_t lo, size_t hi, size_t* out) {
 void Usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s [--warmup N] [--runs N] [--assetlike] "
-                 "[--selfcheck] [corpus files...]\n",
+                 "[--blocktypes] [--selfcheck] [corpus files...]\n",
                  argv0);
+}
+
+/* The forced-block-type path. Each family is its own corpus at its own
+ * level, so this walks the family table instead of the level list the
+ * other paths sweep. */
+int RunBlocktypes(size_t warmup, size_t runs, bool selfcheck) {
+    const size_t pages = selfcheck ? kSelfcheckPages : kBlocktypePages;
+    bool ok = true;
+    for (size_t i = 0; i < kForcedFamilyCount; i++) {
+        const ForcedFamily& f = kForcedFamilies[i];
+        const std::vector<unsigned char> source = f.source(pages * kPageBytes);
+        uint64_t digest = 0;
+        if (!RunLevel(source, f.name, f.provenance, f.level,
+                      static_cast<int>(f.want_type), warmup, runs,
+                      &digest)) {
+            return 1;
+        }
+        if (selfcheck &&
+            !CheckDigest(digest, f.name, f.level, f.selfcheck_digest)) {
+            ok = false;
+        }
+        std::printf("\n");
+    }
+    return ok ? 0 : 1;
 }
 
 }  // namespace
@@ -520,12 +755,15 @@ int main(int argc, char** argv) {
     size_t runs = 30;
     bool selfcheck = false;
     bool assetlike = false;
+    bool blocktypes = false;
     std::vector<std::string> files;
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--assetlike") {
             assetlike = true;
+        } else if (arg == "--blocktypes") {
+            blocktypes = true;
         } else if (arg == "--selfcheck") {
             selfcheck = true;
         } else if (arg == "--runs" && i + 1 < argc) {
@@ -552,11 +790,23 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    if (blocktypes && (assetlike || !files.empty())) {
+        std::fprintf(stderr,
+                     "--blocktypes builds its own corpora, one per forced "
+                     "block type; do not pass corpus files or --assetlike "
+                     "with it\n");
+        return 2;
+    }
+
     if (selfcheck) {
         /* Short and fixed, so the rot check stays fast on the GPU-less runner
          * and its verdict is a digest rather than a timing. */
         warmup = 0;
         runs = 1;
+    }
+
+    if (blocktypes) {
+        return RunBlocktypes(warmup, runs, selfcheck);
     }
 
     std::vector<unsigned char> source;
@@ -605,8 +855,8 @@ int main(int argc, char** argv) {
     bool ok = true;
     for (size_t i = 0; i < kLevelCount; i++) {
         uint64_t digest = 0;
-        if (!RunLevel(source, name, provenance, kLevels[i], warmup, runs,
-                      &digest)) {
+        if (!RunLevel(source, name, provenance, kLevels[i],
+                      /*want_block_type=*/-1, warmup, runs, &digest)) {
             return 1;
         }
         if (selfcheck && !CheckDigest(digest, name, kLevels[i], expected[i])) {

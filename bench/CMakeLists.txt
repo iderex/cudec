@@ -181,6 +181,19 @@ add_test(NAME bench_gdeflate_selfcheck COMMAND bench_gdeflate --selfcheck)
 add_test(NAME bench_gdeflate_assetlike_selfcheck COMMAND bench_gdeflate
                                                   --assetlike --selfcheck)
 
+# The forced-block-type corpora (issue #225). Separate entry because it locks
+# a different property from the two above: those rot on corpus shape and are
+# proven by a digest, this one rots on BLOCK-TYPE COVERAGE and is proven by a
+# walk over each page's first block header. A corpus that quietly collapsed to
+# all-dynamic blocks would still round-trip and still carry a stable digest of
+# its own, so neither entry above would notice that the decode paths this
+# milestone claims to cover had stopped being reached.
+#
+# CPU-only, like the entries above: the walk uses the substream schedule in
+# src/gdeflate_schedule.h and the reference decoder, and touches no device.
+add_test(NAME bench_gdeflate_blocktypes_selfcheck COMMAND bench_gdeflate
+                                                  --blocktypes --selfcheck)
+
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
 # sequence-compression entry point and decoded by the reference, so the
@@ -246,5 +259,6 @@ set_tests_properties(
   bench_zstd_coverage_selfcheck bench_frame_selfcheck bench_snappy_selfcheck
   bench_snappy_worst_selfcheck bench_snappy_worstlit_selfcheck
   bench_gdeflate_selfcheck bench_gdeflate_assetlike_selfcheck
+  bench_gdeflate_blocktypes_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()
