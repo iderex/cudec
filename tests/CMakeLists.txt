@@ -796,9 +796,14 @@ function(cudec_check_abi_ceiling_derivation header_path out_violations)
     return()
   endif()
   file(READ ${header_path} _header_src)
-  # The initialiser, not the whole file: the ceiling's own definition is the
-  # subject, and the prose above it names both constants on purpose.
-  if(NOT _header_src MATCHES "kMaxBatchChunks[ \t\r\n]*=[^;]*;")
+  # The DECLARATION, not any mention of the name. The rules further down
+  # this file blank comments before they read a source; this one runs
+  # before that helper is defined, so it earns the same property from the
+  # pattern instead: the match has to start at a `constexpr` with no
+  # statement terminator between it and the identifier, and prose sitting
+  # under the previous definition is therefore out of reach. The probe
+  # named commented_mention.h is where that is watched rather than argued.
+  if(NOT _header_src MATCHES "constexpr[^;]*kMaxBatchChunks[ \t\r\n]*=[^;]*;")
     string(APPEND _violations
            "  no definition of kMaxBatchChunks was found to read - the rule "
            "is dead rather than satisfied (issue #242)\n")
@@ -822,10 +827,11 @@ function(cudec_check_abi_ceiling_derivation header_path out_violations)
   set(${out_violations} "${_violations}" PARENT_SCOPE)
 endfunction()
 
-# Three probes, planted first, for the reason the sweep above plants two: a
+# Four probes, planted first, for the reason the sweep above plants two: a
 # rule nobody has watched refuse anything is a rule nobody can show still
-# bites. The third is the dead-rule direction - a header the pattern stops
-# matching must report that it read nothing, never come back silent.
+# bites. The last two are the dead-rule direction - a header the pattern stops
+# matching, and one where the only occurrence of the name is in prose, must
+# both report that nothing was read rather than coming back silent.
 set(_abi_ceiling_probe_root ${CMAKE_CURRENT_BINARY_DIR}/abi-ceiling-probes)
 file(REMOVE_RECURSE ${_abi_ceiling_probe_root})
 file(WRITE ${_abi_ceiling_probe_root}/frozen.h
@@ -836,10 +842,14 @@ file(WRITE ${_abi_ceiling_probe_root}/width_derived.h
      "    static_cast<size_t>(INT32_MAX) * kWarpSize;\n")
 file(WRITE ${_abi_ceiling_probe_root}/no_definition.h
      "constexpr unsigned kWarpSize = 32;\n")
+file(WRITE ${_abi_ceiling_probe_root}/commented_mention.h
+     "constexpr unsigned kWarpSize = 32;\n"
+     "/* kMaxBatchChunks = INT32_MAX * kWarpSize was the old shape. */\n")
 set(_abi_ceiling_probes
     "frozen.h|"
     "width_derived.h|is derived from kWarpSize"
-    "no_definition.h|the rule is dead rather than satisfied")
+    "no_definition.h|the rule is dead rather than satisfied"
+    "commented_mention.h|the rule is dead rather than satisfied")
 foreach(_entry IN LISTS _abi_ceiling_probes)
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
   string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\2" _expected "${_entry}")
