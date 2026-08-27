@@ -248,6 +248,18 @@ add_test(NAME bench_zstd_selfcheck COMMAND bench_zstd --selfcheck)
 add_test(NAME bench_zstd_coverage_selfcheck COMMAND bench_zstd --coverage
                                                     --selfcheck)
 
+# The literals-shape census (issue #237). Separate entry because it locks a
+# property neither of the two above touches: those rot on corpus shape and are
+# proven by a digest, this one rots on whether the walk can still TELL THE TWO
+# HUFFMAN LITERALS SPELLINGS APART. A census that stopped recognising the
+# single-stream form would report the same near-zero incidence as a corpus that
+# genuinely carries none, and the recorded result is a near-zero incidence - so
+# the selfcheck runs the census over the forced-mode corpus, which contains a
+# fixture of each spelling, and fails unless both were seen in sections and in
+# bytes. CPU-only, so it runs on the GPU-less runner.
+add_test(NAME bench_zstd_literals_selfcheck COMMAND bench_zstd --literals
+                                                    --selfcheck)
+
 # Every ctest entry carries a finite TIMEOUT (issue #72): the self-checks run
 # the same corpus construction and CPU decode the decoder is held to, so a
 # non-terminating decode must red them rather than stall the run. The
@@ -256,7 +268,8 @@ add_test(NAME bench_zstd_coverage_selfcheck COMMAND bench_zstd --coverage
 set_tests_properties(
   bench_selfcheck bench_worst4b_selfcheck bench_longmatch_selfcheck
   bench_assetlike_selfcheck bench_zstd_worst_selfcheck bench_zstd_selfcheck
-  bench_zstd_coverage_selfcheck bench_frame_selfcheck bench_snappy_selfcheck
+  bench_zstd_coverage_selfcheck bench_zstd_literals_selfcheck
+  bench_frame_selfcheck bench_snappy_selfcheck
   bench_snappy_worst_selfcheck bench_snappy_worstlit_selfcheck
   bench_gdeflate_selfcheck bench_gdeflate_assetlike_selfcheck
   bench_gdeflate_blocktypes_selfcheck
