@@ -394,6 +394,15 @@ cudec_add_test(batch_limit_parity SOURCES batch_limit_parity.cpp)
 target_include_directories(batch_limit_parity
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
+# The same limit against the OTHER failure: a ceiling re-derived from the wave
+# width the kernel launches at, which would make the accepted set twice as
+# large on a wave64 device (issue #242, masterplan section 15.5). Host-side for
+# the same reason as the parity test above, and it reads src/ for the same
+# reason.
+cudec_add_test(batch_limit_width_lock SOURCES batch_limit_width_lock.cpp)
+target_include_directories(batch_limit_width_lock
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 cudec_add_test(frame_host_negative SOURCES frame_host_negative.cpp)
 target_include_directories(frame_host_negative
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -761,6 +770,115 @@ cudec_check_batch_limit_sweep(${CMAKE_CURRENT_SOURCE_DIR}/../src
 if(_batch_limit_violations)
   message(FATAL_ERROR "a source under src/ builds its own batch launch bound "
                       "(issue #39):\n${_batch_limit_violations}")
+endif()
+
+# The ABI ceiling is frozen at the wave32 value on every backend and must not
+# be re-derived from the width the kernel launches at (issue #242, masterplan
+# section 15.5). A width-derived ceiling admits twice as many chunks on a
+# wave64 device, so the same call succeeds on one GPU and returns
+# CUDEC_ERR_INVALID_ARGUMENT on another.
+#
+# THIS IS A TEXT RULE BECAUSE THE VALUE CANNOT CARRY IT. On this backend the
+# two constants are both 32, so writing the ceiling in terms of the device
+# width produces exactly the same number and every arithmetic check stays
+# green - tests/batch_limit_width_lock.cpp included, which is why that file
+# says so and this rule sits beside it. What separates the right definition
+# from the wrong one here is which name it reads, and only the source says
+# that. A drift detector, not tamper-proofing: a copy that reaches the width
+# by some third name is not caught.
+function(cudec_check_abi_ceiling_derivation header_path out_violations)
+  set(_violations "")
+  if(NOT EXISTS ${header_path})
+    string(APPEND _violations
+           "  ${header_path} does not exist - the rule has nothing to read "
+           "(issue #242)\n")
+    set(${out_violations} "${_violations}" PARENT_SCOPE)
+    return()
+  endif()
+  file(READ ${header_path} _header_src)
+  # The DECLARATION, not any mention of the name. The rules further down
+  # this file blank comments before they read a source; this one runs
+  # before that helper is defined, so it earns the same property from the
+  # pattern instead: the match has to start at a `constexpr` with no
+  # statement terminator between it and the identifier, and prose sitting
+  # under the previous definition is therefore out of reach. The probe
+  # named commented_mention.h is where that is watched rather than argued.
+  if(NOT _header_src MATCHES "constexpr[^;]*kMaxBatchChunks[ \t\r\n]*=[^;]*;")
+    string(APPEND _violations
+           "  no definition of kMaxBatchChunks was found to read - the rule "
+           "is dead rather than satisfied (issue #242)\n")
+    set(${out_violations} "${_violations}" PARENT_SCOPE)
+    return()
+  endif()
+  set(_definition "${CMAKE_MATCH_0}")
+  if(_definition MATCHES "(^|[^A-Za-z_0-9])kWarpSize([^A-Za-z_0-9]|$)")
+    string(APPEND _violations
+           "  kMaxBatchChunks is derived from kWarpSize, the device's wave "
+           "width - the ABI ceiling is frozen at kAbiChunkLimitWaveSize on "
+           "every backend (issue #242)\n")
+  endif()
+  if(NOT _definition MATCHES
+     "(^|[^A-Za-z_0-9])kAbiChunkLimitWaveSize([^A-Za-z_0-9]|$)")
+    string(APPEND _violations
+           "  kMaxBatchChunks no longer reads kAbiChunkLimitWaveSize - the "
+           "constant naming the width the ABI ceiling is frozen at is what "
+           "keeps it out of the device's (issue #242)\n")
+  endif()
+  set(${out_violations} "${_violations}" PARENT_SCOPE)
+endfunction()
+
+# Four probes, planted first, for the reason the sweep above plants two: a
+# rule nobody has watched refuse anything is a rule nobody can show still
+# bites. The last two are the dead-rule direction - a header the pattern stops
+# matching, and one where the only occurrence of the name is in prose, must
+# both report that nothing was read rather than coming back silent.
+set(_abi_ceiling_probe_root ${CMAKE_CURRENT_BINARY_DIR}/abi-ceiling-probes)
+file(REMOVE_RECURSE ${_abi_ceiling_probe_root})
+file(WRITE ${_abi_ceiling_probe_root}/frozen.h
+     "constexpr size_t kMaxBatchChunks =\n"
+     "    static_cast<size_t>(INT32_MAX) * kAbiChunkLimitWaveSize;\n")
+file(WRITE ${_abi_ceiling_probe_root}/width_derived.h
+     "constexpr size_t kMaxBatchChunks =\n"
+     "    static_cast<size_t>(INT32_MAX) * kWarpSize;\n")
+file(WRITE ${_abi_ceiling_probe_root}/no_definition.h
+     "constexpr unsigned kWarpSize = 32;\n")
+file(WRITE ${_abi_ceiling_probe_root}/commented_mention.h
+     "constexpr unsigned kWarpSize = 32;\n"
+     "/* kMaxBatchChunks = INT32_MAX * kWarpSize was the old shape. */\n")
+set(_abi_ceiling_probes
+    "frozen.h|"
+    "width_derived.h|is derived from kWarpSize"
+    "no_definition.h|the rule is dead rather than satisfied"
+    "commented_mention.h|the rule is dead rather than satisfied")
+foreach(_entry IN LISTS _abi_ceiling_probes)
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\2" _expected "${_entry}")
+  cudec_check_abi_ceiling_derivation(${_abi_ceiling_probe_root}/${_probe}
+                                     _probe_result)
+  if(_expected STREQUAL "")
+    # An empty needle is found at position 0 in every string, so the silent
+    # case is checked on emptiness rather than through string(FIND).
+    if(_probe_result)
+      message(FATAL_ERROR "the ABI-ceiling rule refuses a compliant probe: "
+                          "'${_probe}' must come back silent (issue #242). It "
+                          "reported:\n${_probe_result}")
+    endif()
+  else()
+    string(FIND "${_probe_result}" "${_expected}" _found_at)
+    if(_found_at EQUAL -1)
+      message(FATAL_ERROR "the ABI-ceiling rule is dead: probe '${_probe}' "
+                          "did not report \"${_expected}\" (issue #242). "
+                          "It reported:\n${_probe_result}")
+    endif()
+  endif()
+endforeach()
+
+# And now against the header the rule is for.
+cudec_check_abi_ceiling_derivation(${_limits_header} _abi_ceiling_violations)
+if(_abi_ceiling_violations)
+  message(FATAL_ERROR "the batch ABI's chunk-count ceiling has moved onto the "
+                      "device's wave width (issue "
+                      "#242):\n${_abi_ceiling_violations}")
 endif()
 
 # Reads a source and hands back its lines with C comments blanked in place,
