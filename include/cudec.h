@@ -96,7 +96,11 @@ typedef char cudec_chunk_result_layout_check
  * CUDEC_ERR_INVALID_ARGUMENT and launches nothing: any NULL array
  * argument, a misaligned d_results, an empty batch (chunk_count == 0), and
  * a batch beyond the implementation's launch limit (rejected, never
- * truncated). A rejected call makes no CUDA call and leaves the thread's
+ * truncated). That limit is a fixed property of this ABI: it is the same
+ * number on every backend and every device, and in particular it does not
+ * widen on a GPU whose wave is 64 lanes rather than 32. A chunk_count this
+ * call accepts is accepted everywhere, and one it refuses is refused
+ * everywhere. A rejected call makes no CUDA call and leaves the thread's
  * pending CUDA error state untouched; a call that passes validation
  * consumes that pending state (cudaGetLastError semantics), so the
  * returned status reflects this submission alone. */
