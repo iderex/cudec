@@ -130,6 +130,15 @@ constexpr uint32_t kBlockStored = 0;
 constexpr uint32_t kBlockStatic = 1;
 constexpr uint32_t kBlockDynamic = 2;
 
+/* The most bytes one stored block can carry, from the 16-bit length field
+ * tests/gdeflate_probes.cpp measures against the reference rather than
+ * carrying over from RFC 1951 (probe 7, dossier D3/D4). It is one byte short
+ * of a page, which is why a page of stored data is never one block. */
+constexpr size_t kStoredBlockMaxBytes = 0xFFFF;
+static_assert(kStoredBlockMaxBytes < kPageBytes,
+              "a full page of stored data would fit in one stored block, and "
+              "the composition claim below assumes it cannot");
+
 /* What a corpus path that did not walk the pages says about itself. A
  * sentence rather than an empty string: an empty composition field printed
  * as an empty line reads as a claim nobody made. */
@@ -159,18 +168,20 @@ const char* BlockTypeName(uint32_t type) {
  * Returns false when the page is too short to prime or the schedule went
  * sticky, which is a corpus this harness must not go on to time rather than
  * a block type to report. */
-bool FirstBlockType(const std::vector<unsigned char>& page, uint32_t* out) {
+bool FirstBlockHeader(const std::vector<unsigned char>& page, uint32_t* type,
+                      bool* is_final) {
     cudec_detail::GDeflateSchedule s;
     if (!cudec_detail::GDeflateInit(s, page.data(), page.size())) {
         return false;
     }
     cudec_detail::GDeflateReset(s);
-    cudec_detail::GDeflatePop(s, 1); /* BFINAL, not read here */
-    const uint32_t type = cudec_detail::GDeflatePop(s, 2);
+    const uint32_t bfinal = cudec_detail::GDeflatePop(s, 1);
+    const uint32_t block_type = cudec_detail::GDeflatePop(s, 2);
     if (s.failed) {
         return false;
     }
-    *out = type;
+    *type = block_type;
+    *is_final = bfinal != 0;
     return true;
 }
 
@@ -179,9 +190,12 @@ bool FirstBlockType(const std::vector<unsigned char>& page, uint32_t* out) {
  * first disagreement names the page and what was read there, because "some
  * page in this corpus is wrong" is not a thing anyone can act on. */
 bool AssertComposition(Corpus* corpus, uint32_t want) {
-    for (size_t i = 0; i < corpus->compressed.size(); i++) {
+    const size_t pages = corpus->compressed.size();
+    size_t whole_page_blocks = 0;
+    for (size_t i = 0; i < pages; i++) {
         uint32_t got = 0;
-        if (!FirstBlockType(corpus->compressed[i], &got)) {
+        bool is_final = false;
+        if (!FirstBlockHeader(corpus->compressed[i], &got, &is_final)) {
             std::fprintf(stderr,
                          "page %zu of %s carries no readable block header - "
                          "the schedule refused it before any type was read\n",
@@ -197,13 +211,71 @@ bool AssertComposition(Corpus* corpus, uint32_t want) {
                          BlockTypeName(want));
             return false;
         }
+        /* A stored block carries at most kStoredBlockMaxBytes, so a page
+         * holding more than that cannot be one stored block and its first
+         * block cannot be final. Reading BFINAL set there would mean the
+         * length field is wider than probe 7 measured or that the walk is
+         * reading the wrong bit, and both are ladder facts rather than corpus
+         * accidents - so it is a refusal rather than a smaller claim. */
+        if (want == kBlockStored && is_final &&
+            corpus->originals[i].size() > kStoredBlockMaxBytes) {
+            std::fprintf(stderr,
+                         "page %zu of %s holds %zu bytes and its first stored "
+                         "block is final, so one stored block would have to "
+                         "carry more than the %zu bytes its length field can "
+                         "hold\n",
+                         i, corpus->name.c_str(), corpus->originals[i].size(),
+                         kStoredBlockMaxBytes);
+            return false;
+        }
+        if (is_final) {
+            whole_page_blocks++;
+        }
+    }
+    /* What the walk covered, not merely what it looked at. BFINAL on the
+     * first block says the page has no second block, so for those pages the
+     * opening block IS the page and the claim is complete; for the rest it is
+     * a lower bound, because reaching a page's second block means decoding to
+     * it. Reporting the split is what keeps a lower bound from being read as
+     * a census (issues #206, #225).
+     *
+     * ONE SIDE OF THIS IS A REFUSAL AND THE OTHER IS A REPORT, and the
+     * asymmetry is deliberate rather than unfinished. A walk that read BFINAL
+     * as set where it is clear reds on the stored refusal above. A walk that
+     * read it as clear everywhere - a dead read, the usual failure - turns
+     * every whole-page claim below into a lower bound, which is the harness
+     * claiming LESS than it covered. There is no structural fact that decides
+     * how many blocks a table-using page holds, so nothing here can refuse
+     * that direction, and a check that goes dead towards a weaker claim is
+     * not a fail-open. */
+    /* The parenthetical belongs only where a later block can exist. Carrying
+     * it onto a page proved whole would deny a claim the walk has just
+     * earned. */
+    const char* const kUnreached =
+        " (a later block in the same page is neither asserted nor denied, "
+        "because reaching one means decoding to it)";
+    std::string covered;
+    if (whole_page_blocks == pages) {
+        covered = "and BFINAL is set on it in every page, so each page is that "
+                  "one block and this is the page's whole composition rather "
+                  "than its opening";
+    } else if (whole_page_blocks == 0) {
+        covered = std::string(
+                      "and BFINAL is clear on it in every page, so every page "
+                      "carries at least one more block that this walk does "
+                      "not reach - a lower bound on the count, never a "
+                      "census") +
+                  kUnreached;
+    } else {
+        covered = "and BFINAL is set on it in " +
+                  std::to_string(whole_page_blocks) + " of " +
+                  std::to_string(pages) +
+                  " pages, which are whole; the rest carry at least one more "
+                  "block that this walk does not reach" +
+                  kUnreached;
     }
     corpus->composition = std::string("every page opens with a ") +
-                          BlockTypeName(want) +
-                          " block, asserted by walking each page's first "
-                          "block header (the first block only - a later "
-                          "block in the same page is neither asserted nor "
-                          "denied, because reaching one means decoding to it)";
+                          BlockTypeName(want) + " block, " + covered;
     return true;
 }
 
