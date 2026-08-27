@@ -1945,6 +1945,187 @@ decode surface each, so a throughput figure over them would measure the fixture
 list; the harness prints that in place of a number rather than leaving it to be
 inferred.
 
+## M5 perf lever: the single-stream literals shape, retired on incidence (issue #237)
+
+**The lever, and why it is answered here instead of on a device.** The
+single-stream Huffman literals form (`Size_Format=00`, RFC 8878 section
+3.1.1.3.1.1) is the one spelling that carries a single backward stream; the
+other three carry four. A decode shape dedicated to it would put the whole lane
+team on that stream instead of running the four-stream machinery over one real
+stream and three empty ones, and section 14.6 of the masterplan names it as one
+of the two levers that would be tried first if the literals phase turned out to
+dominate a frame's time. What it costs is a branch every literals section pays,
+whatever spelling it wears. So its ceiling is set by how much literal work sits
+in that form, and that is a property of what the compressor emits, not of any
+kernel: it is measurable now, and it decides the lever before a kernel exists.
+
+**The pre-registered rule this run was taken under**, written on #237 before the
+measurement: a form appearing in a negligible fraction of the real corpora
+retires the lever on the numbers alone, and that outcome is written up like any
+other. cudec has retired a lever of exactly this shape once before -- perf pass
+1 (issue #16) killed the vectorized literal copy because the path rarely
+triggered and only added setup and branch overhead -- and issue #165 is where
+the discipline of reading a trigger rate before writing the code was adopted.
+
+**Two statistics, always both.** The share of literals SECTIONS wearing a
+spelling and the share of literal BYTES sitting inside those sections answer
+different questions, and here they cannot agree even in principle:
+`Size_Format=00` caps `Regenerated_Size` at 1023 bytes while the wider
+spellings reach 262143. The section share says how often the branch is paid;
+the byte share bounds what it could buy. That separation is bench/literal_hist.h's
+lesson from issue #165 carried across formats.
+
+The census reads frame headers only, through the walker `tests/zstd_corpus.h`
+already pins, over the same six cells and the same frames the M5 CPU
+denominator above was taken on -- the six corpus digests below reproduce the six
+recorded in that entry byte for byte, which is what makes this a census of that
+corpus rather than of one resembling it. Recorded 2026-08-27. Reproduce with
+`bench_zstd --literals bench/corpora/silesia/*`; nothing is timed and no entropy
+stream is decoded, so no figure here is a denominator.
+
+| granularity | level | huffman sections | 1-stream | of sections | huffman literal bytes | 1-stream bytes | of bytes |
+| ----------- | ----- | ---------------- | -------- | ----------- | --------------------- | -------------- | -------- |
+| 64 KiB      | 1     | 3149             | 0        | 0.0000%     | 63586548              | 0              | 0.0000%  |
+| 64 KiB      | 3     | 3149             | 0        | 0.0000%     | 48451864              | 0              | 0.0000%  |
+| 64 KiB      | 19    | 3096             | 0        | 0.0000%     | 26666688              | 0              | 0.0000%  |
+| 512 KiB     | 1     | 1889             | 0        | 0.0000%     | 61165017              | 0              | 0.0000%  |
+| 512 KiB     | 3     | 2173             | 6        | 0.2761%     | 34179495              | 1010           | 0.0030%  |
+| 512 KiB     | 19    | 3621             | 174      | 4.8053%     | 17000854              | 28296          | 0.1664%  |
+
+The table is a reading aid. The six blocks below are the record.
+
+```
+## bench_zstd literals-shape report
+- what this is: an incidence census over the literals sections the pinned libzstd 1.5.7 emits, read from the frame headers by ParseZstdFrameShape in tests/zstd_corpus.h. NOT A THROUGHPUT MEASUREMENT: nothing is timed and no entropy stream is decoded, so no number here is a denominator
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 frames, 211.94 MB original, 76.70 MB compressed (ratio 0.3619), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before the walk
+- granularity: 64 KiB frames, compression level 1
+- corpus digest: f95ac5fe65483030 (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- blocks walked: 3234 over 3234 frames (raw 21 / rle 0 / compressed 3213)
+- literals sections: 3213 (raw 64 / rle 0 / compressed 3149 / treeless 0)
+- huffman sections by stream count: 3149 total, 1-stream (Size_Format=00) 0 (0.0000%), 4-stream 3149 (100.0000%)
+- huffman literal bytes regenerated: 63586548 total, 1-stream 0 (0.0000%), 4-stream 63586548 (100.0000%)
+- largest 1-stream section seen: 0 bytes regenerated (the spelling's own ceiling is 1023)
+```
+
+```
+## bench_zstd literals-shape report
+- what this is: an incidence census over the literals sections the pinned libzstd 1.5.7 emits, read from the frame headers by ParseZstdFrameShape in tests/zstd_corpus.h. NOT A THROUGHPUT MEASUREMENT: nothing is timed and no entropy stream is decoded, so no number here is a denominator
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 frames, 211.94 MB original, 73.52 MB compressed (ratio 0.3469), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before the walk
+- granularity: 64 KiB frames, compression level 3
+- corpus digest: c7171e665a1888c6 (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- blocks walked: 3234 over 3234 frames (raw 15 / rle 0 / compressed 3219)
+- literals sections: 3219 (raw 70 / rle 0 / compressed 3149 / treeless 0)
+- huffman sections by stream count: 3149 total, 1-stream (Size_Format=00) 0 (0.0000%), 4-stream 3149 (100.0000%)
+- huffman literal bytes regenerated: 48451864 total, 1-stream 0 (0.0000%), 4-stream 48451864 (100.0000%)
+- largest 1-stream section seen: 0 bytes regenerated (the spelling's own ceiling is 1023)
+```
+
+```
+## bench_zstd literals-shape report
+- what this is: an incidence census over the literals sections the pinned libzstd 1.5.7 emits, read from the frame headers by ParseZstdFrameShape in tests/zstd_corpus.h. NOT A THROUGHPUT MEASUREMENT: nothing is timed and no entropy stream is decoded, so no number here is a denominator
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 frames, 211.94 MB original, 65.04 MB compressed (ratio 0.3069), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before the walk
+- granularity: 64 KiB frames, compression level 19
+- corpus digest: 748220fb33f7ee01 (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- blocks walked: 3234 over 3234 frames (raw 1 / rle 0 / compressed 3233)
+- literals sections: 3233 (raw 137 / rle 0 / compressed 3096 / treeless 0)
+- huffman sections by stream count: 3096 total, 1-stream (Size_Format=00) 0 (0.0000%), 4-stream 3096 (100.0000%)
+- huffman literal bytes regenerated: 26666688 total, 1-stream 0 (0.0000%), 4-stream 26666688 (100.0000%)
+- largest 1-stream section seen: 0 bytes regenerated (the spelling's own ceiling is 1023)
+```
+
+```
+## bench_zstd literals-shape report
+- what this is: an incidence census over the literals sections the pinned libzstd 1.5.7 emits, read from the frame headers by ParseZstdFrameShape in tests/zstd_corpus.h. NOT A THROUGHPUT MEASUREMENT: nothing is timed and no entropy stream is decoded, so no number here is a denominator
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 405 frames, 211.94 MB original, 73.95 MB compressed (ratio 0.3489), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before the walk
+- granularity: 512 KiB frames, compression level 1
+- corpus digest: ed6b1bc51f66d81f (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- blocks walked: 1940 over 405 frames (raw 6 / rle 0 / compressed 1934)
+- literals sections: 1934 (raw 45 / rle 0 / compressed 1681 / treeless 208)
+- huffman sections by stream count: 1889 total, 1-stream (Size_Format=00) 0 (0.0000%), 4-stream 1889 (100.0000%)
+- huffman literal bytes regenerated: 61165017 total, 1-stream 0 (0.0000%), 4-stream 61165017 (100.0000%)
+- largest 1-stream section seen: 0 bytes regenerated (the spelling's own ceiling is 1023)
+```
+
+```
+## bench_zstd literals-shape report
+- what this is: an incidence census over the literals sections the pinned libzstd 1.5.7 emits, read from the frame headers by ParseZstdFrameShape in tests/zstd_corpus.h. NOT A THROUGHPUT MEASUREMENT: nothing is timed and no entropy stream is decoded, so no number here is a denominator
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 405 frames, 211.94 MB original, 68.23 MB compressed (ratio 0.3219), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before the walk
+- granularity: 512 KiB frames, compression level 3
+- corpus digest: 4983cbc86cd8255b (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- blocks walked: 2506 over 405 frames (raw 88 / rle 0 / compressed 2418)
+- literals sections: 2418 (raw 245 / rle 0 / compressed 1956 / treeless 217)
+- huffman sections by stream count: 2173 total, 1-stream (Size_Format=00) 6 (0.2761%), 4-stream 2167 (99.7239%)
+- huffman literal bytes regenerated: 34179495 total, 1-stream 1010 (0.0030%), 4-stream 34178485 (99.9970%)
+- largest 1-stream section seen: 227 bytes regenerated (the spelling's own ceiling is 1023)
+```
+
+```
+## bench_zstd literals-shape report
+- what this is: an incidence census over the literals sections the pinned libzstd 1.5.7 emits, read from the frame headers by ParseZstdFrameShape in tests/zstd_corpus.h. NOT A THROUGHPUT MEASUREMENT: nothing is timed and no entropy stream is decoded, so no number here is a denominator
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 405 frames, 211.94 MB original, 58.65 MB compressed (ratio 0.2767), cut into independent frames and compressed by the pinned libzstd through the corpus generator in tests/zstd_corpus.h; every frame decoded back by the reference and the concatenation compared against the source before the walk
+- granularity: 512 KiB frames, compression level 19
+- corpus digest: 4242734974b3b0d5 (XXH64 over per-frame length and XXH64, little-endian, in corpus order)
+- blocks walked: 4378 over 405 frames (raw 1 / rle 0 / compressed 4377)
+- literals sections: 4377 (raw 735 / rle 21 / compressed 3213 / treeless 408)
+- huffman sections by stream count: 3621 total, 1-stream (Size_Format=00) 174 (4.8053%), 4-stream 3447 (95.1947%)
+- huffman literal bytes regenerated: 17000854 total, 1-stream 28296 (0.1664%), 4-stream 16972558 (99.8336%)
+- largest 1-stream section seen: 255 bytes regenerated (the spelling's own ceiling is 1023)
+```
+
+**The lever is retired: no kernel code ships.** Across the whole recorded grid
+the single-stream form carries at most **0.1664% of the Huffman literal bytes**,
+and four of the six cells carry none at all. The branch that would select the
+dedicated shape is taken by every literals section, so the trade is a cost paid
+on up to 100% of sections against a ceiling of one part in six hundred of the
+literal work -- and that ceiling is generous twice over, because it assumes the
+dedicated shape decodes those bytes in zero time and because literal decode is
+only one phase of a frame's cost. That is the pre-registered retirement
+condition met on the numbers.
+
+**The section share and the byte share diverge by a factor of thirty, and only
+one of them is the argument.** At 512 KiB and level 19 the form is 4.8053% of
+sections but 0.1664% of bytes, because the largest single-stream section in the
+entire grid regenerates 255 bytes against a 262143-byte ceiling on the wide
+spellings. A reader who took the section share for the size of the prize would
+be reading the wrong statistic; issue #165 is where that mistake was made
+visible on LZ4 and Snappy, and the census prints both figures on every run so it
+cannot be made silently here.
+
+**What drives the form is block splitting, not frame size,** and that is the
+opposite of what the lever's framing assumed. Incidence is zero at 64 KiB
+granularity across the whole level set and non-zero only at 512 KiB, where the
+compressor emits many blocks per frame instead of one: 4378 blocks over 405
+frames at level 19 against 3234 blocks over 3234 frames at 64 KiB. The form is
+the tail of a block split small, so shrinking the frame -- which produces fewer,
+larger blocks per frame here -- does not raise it. No cause is claimed beyond
+what those counts show.
+
+**What this does not cover, stated as a bound rather than left to be assumed.**
+One corpus (Silesia), one compressor (the pinned libzstd 1.5.7), the two frame
+granularities and three levels the M5 batch model names, and nothing below 64
+KiB. A different compressor, a dictionary, or a producer emitting deliberately
+tiny blocks could carry a materially higher share, and none of those was
+measured. The forced-mode corpus does emit the form on demand, so the fallback
+#237 named -- reach for the #185 fixtures if the natural corpora never exercise
+it -- was not needed: the natural corpora exercise it, and the answer is that
+they barely do.
+
+**The census cannot report a zero it cannot see, and that is checked by
+something that runs.** A near-zero incidence and a walk that stopped
+recognising the single-stream spelling produce the identical table, so
+`bench_zstd_literals_selfcheck` runs the census over the forced-mode corpus --
+which carries a fixture of each spelling -- and fails unless both were counted,
+in sections and in bytes. Removing the one-stream arm of the census turns that
+ctest entry red with the reason named; the Silesia grid reporting 0.0000% leaves
+it green. That is the separation the zeroes above need in order to be read as a
+result.
+
 ## Community AMD results
 
 **No community results yet.** Nothing in this section is a measurement; it

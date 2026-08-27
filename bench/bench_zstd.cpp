@@ -1076,6 +1076,239 @@ bool RunForcedModeCoverage() {
     return true;
 }
 
+/* ------------------------------------------------------------------------
+ * The literals-shape census (issue #237): which literals spelling the
+ * compressor actually emits, over the recorded grid.
+ *
+ * The question is a TRIGGER RATE and not a duration. A decode shape dedicated
+ * to the single-stream Huffman literals form (Size_Format=00) puts the whole
+ * lane team on one stream instead of running the four-stream machinery over
+ * one real stream and three empty ones; what it costs is a branch every
+ * literals section pays, and what it buys is bounded by how much literal work
+ * sits in that form. cudec has measured and rejected a lever of exactly this
+ * shape once already - docs/BENCHMARKS.md "Perf pass 1 (issue #16)" killed the
+ * vectorized literal copy because the path rarely triggered - so the incidence
+ * is produced first and on its own, before any kernel exists to A/B.
+ *
+ * TWO STATISTICS, ALWAYS BOTH, which is bench/literal_hist.h's lesson from
+ * issue #165 carried across formats. The share of SECTIONS wearing a spelling
+ * and the share of literal BYTES sitting inside those sections answer
+ * different questions, and here they cannot agree even in principle:
+ * Size_Format=00 caps Regenerated_Size at 1023 bytes while the wider
+ * spellings reach 262143, so a form that is common by section can be
+ * negligible by work. A lever that moves decode time is argued from the byte
+ * share; the section share is what says how often the branch is paid.
+ *
+ * It reads headers only, through the walker tests/ already pins. No entropy
+ * stream is decoded here and no second walker enters the tree.
+ * ---------------------------------------------------------------------- */
+
+struct LiteralsCensus {
+    size_t frames = 0;
+    size_t blocks = 0;
+    size_t blocks_by_type[3] = {0, 0, 0};
+    /* Indexed by Literals_Block_Type: raw, rle, compressed, treeless. */
+    size_t sections[4] = {0, 0, 0, 0};
+    size_t regenerated[4] = {0, 0, 0, 0};
+    /* The Huffman forms (Compressed and Treeless) split by stream count:
+     * [0] is the single-stream spelling, [1] the four-stream ones. */
+    size_t huffman_sections[2] = {0, 0};
+    size_t huffman_regenerated[2] = {0, 0};
+    size_t largest_one_stream = 0;
+};
+
+/* Folds one frame's headers into the census. Returns false when the walker
+ * could not account for the frame, because a census taken over frames only
+ * partly understood reports an incidence that is really a parse failure. */
+bool CensusOfFrame(const std::vector<unsigned char>& frame,
+                   LiteralsCensus* census, std::string* why) {
+    ZstdFrameShape shape;
+    if (!ParseZstdFrameShape(frame, &shape, why)) {
+        return false;
+    }
+    census->frames++;
+    for (const ZstdBlockShape& block : shape.blocks) {
+        census->blocks++;
+        if (block.block_type < 3) {
+            census->blocks_by_type[block.block_type]++;
+        }
+        if (block.block_type != kZstdBlockCompressed) {
+            continue;
+        }
+        const unsigned type = block.literals_type;
+        if (type > 3) {
+            *why = "literals type out of range";
+            return false;
+        }
+        census->sections[type]++;
+        census->regenerated[type] += block.literals_regenerated_size;
+        if (type != kZstdLiteralsCompressed && type != kZstdLiteralsTreeless) {
+            continue;
+        }
+        /* The walker reports 1 or 4 and nothing else for these two types, so
+         * anything else is the walker having changed under this census rather
+         * than a stream count worth counting. */
+        if (block.literals_streams != 1 && block.literals_streams != 4) {
+            *why = "huffman literals section with neither 1 nor 4 streams";
+            return false;
+        }
+        const unsigned slot = block.literals_streams == 1 ? 0u : 1u;
+        census->huffman_sections[slot]++;
+        census->huffman_regenerated[slot] += block.literals_regenerated_size;
+        if (slot == 0 &&
+            block.literals_regenerated_size > census->largest_one_stream) {
+            census->largest_one_stream = block.literals_regenerated_size;
+        }
+    }
+    return true;
+}
+
+double SharePercent(size_t part, size_t whole) {
+    if (whole == 0) {
+        return 0.0;
+    }
+    return 100.0 * static_cast<double>(part) / static_cast<double>(whole);
+}
+
+void PrintLiteralsReport(const ZstdCorpus& corpus,
+                         const LiteralsCensus& census, size_t frame_bytes,
+                         int level) {
+    const size_t huffman_sections =
+        census.huffman_sections[0] + census.huffman_sections[1];
+    const size_t huffman_bytes =
+        census.huffman_regenerated[0] + census.huffman_regenerated[1];
+    const size_t all_sections = census.sections[0] + census.sections[1] +
+                                census.sections[2] + census.sections[3];
+
+    std::printf("## bench_zstd literals-shape report\n");
+    std::printf("- what this is: an incidence census over the literals "
+                "sections the pinned libzstd %s emits, read from the frame "
+                "headers by ParseZstdFrameShape in tests/zstd_corpus.h. NOT A "
+                "THROUGHPUT MEASUREMENT: nothing is timed and no entropy "
+                "stream is decoded, so no number here is a denominator\n",
+                ZSTD_versionString());
+    std::printf("- host CPU: %s\n", cudec_bench::HostCpuName().c_str());
+    std::printf("- corpus: %s, %zu frames, %.2f MB original, %.2f MB "
+                "compressed (ratio %.4f), %s\n",
+                corpus.name.c_str(), corpus.originals.size(),
+                static_cast<double>(corpus.original_bytes) / 1e6,
+                static_cast<double>(corpus.compressed_bytes) / 1e6,
+                static_cast<double>(corpus.compressed_bytes) /
+                    static_cast<double>(corpus.original_bytes),
+                corpus.provenance.c_str());
+    std::printf("- granularity: %zu KiB frames, compression level %d\n",
+                frame_bytes / 1024, level);
+    std::printf("- corpus digest: %016llx (XXH64 over per-frame length and "
+                "XXH64, little-endian, in corpus order)\n",
+                static_cast<unsigned long long>(CorpusDigest(corpus)));
+    std::printf("- blocks walked: %zu over %zu frames (raw %zu / rle %zu / "
+                "compressed %zu)\n",
+                census.blocks, census.frames, census.blocks_by_type[0],
+                census.blocks_by_type[1], census.blocks_by_type[2]);
+    std::printf("- literals sections: %zu (raw %zu / rle %zu / compressed %zu "
+                "/ treeless %zu)\n",
+                all_sections, census.sections[0], census.sections[1],
+                census.sections[2], census.sections[3]);
+    std::printf("- huffman sections by stream count: %zu total, 1-stream "
+                "(Size_Format=00) %zu (%.4f%%), 4-stream %zu (%.4f%%)\n",
+                huffman_sections, census.huffman_sections[0],
+                SharePercent(census.huffman_sections[0], huffman_sections),
+                census.huffman_sections[1],
+                SharePercent(census.huffman_sections[1], huffman_sections));
+    std::printf("- huffman literal bytes regenerated: %zu total, 1-stream %zu "
+                "(%.4f%%), 4-stream %zu (%.4f%%)\n",
+                huffman_bytes, census.huffman_regenerated[0],
+                SharePercent(census.huffman_regenerated[0], huffman_bytes),
+                census.huffman_regenerated[1],
+                SharePercent(census.huffman_regenerated[1], huffman_bytes));
+    std::printf("- largest 1-stream section seen: %zu bytes regenerated (the "
+                "spelling's own ceiling is 1023)\n",
+                census.largest_one_stream);
+}
+
+/* The census over one cell of the grid. The corpus is built and verified by
+ * exactly the path the timed run uses, so the frames counted here are the
+ * frames the recorded denominator was taken over rather than a second corpus
+ * that merely resembles it. */
+bool RunLiteralsCensus(const std::vector<unsigned char>& source,
+                       const std::string& name, size_t frame_bytes, int level,
+                       uint64_t* digest_out) {
+    ZstdCorpus corpus;
+    corpus.name = name;
+    corpus.provenance =
+        "cut into independent frames and compressed by the pinned libzstd "
+        "through the corpus generator in tests/zstd_corpus.h; every frame "
+        "decoded back by the reference and the concatenation compared "
+        "against the source before the walk";
+    if (!BuildStandardCorpus(source, frame_bytes, level, &corpus)) {
+        return false;
+    }
+    if (!StandardCorpusReconstructs(source, corpus)) {
+        return false;
+    }
+    LiteralsCensus census;
+    for (size_t i = 0; i < corpus.compressed.size(); i++) {
+        std::string why;
+        if (!CensusOfFrame(corpus.compressed[i], &census, &why)) {
+            std::fprintf(
+                stderr,
+                "the walker could not account for frame %zu of %s: %s\n", i,
+                corpus.name.c_str(), why.c_str());
+            return false;
+        }
+    }
+    PrintLiteralsReport(corpus, census, frame_bytes, level);
+    std::printf("\n");
+    *digest_out = CorpusDigest(corpus);
+    return true;
+}
+
+/* THE GUARD THIS CENSUS CANNOT SHIP WITHOUT, and the reason is the shape of
+ * the answer it is expected to give. A near-zero 1-stream incidence is the
+ * result this measurement exists to produce, and a census whose walk never
+ * recognises the single-stream spelling at all reports the identical number.
+ * The two have to be told apart by something that runs.
+ *
+ * The forced-mode corpus carries a fixture for each spelling on purpose -
+ * literals-compressed-one-stream and literals-compressed-four-stream, pinned
+ * as cells by tests/zstd_corpus_selfproof.cpp and listed in
+ * docs/ZSTD-CORPUS.md - so the census is run over it and required to have seen
+ * both, in sections and in bytes. Break the 1-stream arm of CensusOfFrame and
+ * this fails; leave the Silesia grid reporting 0.0000% and it passes, which is
+ * the separation that number needs in order to be read as a result. */
+bool LiteralsCensusSeesBothSpellings() {
+    const std::vector<ZstdFixture> fixtures = MakeZstdFixtures();
+    if (fixtures.empty()) {
+        std::fprintf(stderr, "the forced-mode corpus generator produced "
+                             "nothing\n");
+        return false;
+    }
+    LiteralsCensus census;
+    for (const ZstdFixture& fixture : fixtures) {
+        std::string why;
+        if (!CensusOfFrame(fixture.compressed, &census, &why)) {
+            std::fprintf(stderr,
+                         "the walker could not account for forced-mode "
+                         "fixture %s: %s\n",
+                         fixture.name.c_str(), why.c_str());
+            return false;
+        }
+    }
+    bool ok = true;
+    for (unsigned slot = 0; slot < 2; slot++) {
+        if (census.huffman_sections[slot] == 0 ||
+            census.huffman_regenerated[slot] == 0) {
+            std::fprintf(stderr,
+                         "the census saw no %s huffman literals section with "
+                         "bytes in it over the forced-mode corpus, so a zero "
+                         "incidence reported elsewhere would be unreadable\n",
+                         slot == 0 ? "1-stream" : "4-stream");
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 bool ParseCount(const char* text, size_t low, size_t high, size_t* out) {
     char* end = nullptr;
     const unsigned long long value = std::strtoull(text, &end, 10);
@@ -1089,7 +1322,7 @@ bool ParseCount(const char* text, size_t low, size_t high, size_t* out) {
 void Usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s [--runs N] [--warmup N] [--worst] [--coverage] "
-                 "[--selfcheck] [corpus files...]\n"
+                 "[--literals] [--selfcheck] [corpus files...]\n"
                  "  no flag and files given: the standard corpus path over "
                  "the recorded granularity and level set\n",
                  argv0);
@@ -1100,9 +1333,11 @@ void Usage(const char* argv0) {
 int main(int argc, char** argv) {
     bool worst = false;
     bool coverage = false;
+    bool literals = false;
     bool selfcheck = false;
     size_t warmup = 3;
     size_t runs = 30;
+    bool timing_flag_given = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -1110,6 +1345,8 @@ int main(int argc, char** argv) {
             worst = true;
         } else if (arg == "--coverage") {
             coverage = true;
+        } else if (arg == "--literals") {
+            literals = true;
         } else if (arg == "--selfcheck") {
             selfcheck = true;
         } else if (arg == "--runs" && i + 1 < argc) {
@@ -1117,12 +1354,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--runs must be in [1, %zu]\n", kMaxRuns);
                 return 2;
             }
+            timing_flag_given = true;
         } else if (arg == "--warmup" && i + 1 < argc) {
             if (!ParseCount(argv[++i], 0, kMaxRuns, &warmup)) {
                 std::fprintf(stderr, "--warmup must be in [0, %zu]\n",
                              kMaxRuns);
                 return 2;
             }
+            timing_flag_given = true;
         } else if (arg == "--runs" || arg == "--warmup") {
             std::fprintf(stderr, "%s needs a value\n", arg.c_str());
             return 2;
@@ -1133,9 +1372,75 @@ int main(int argc, char** argv) {
             files.push_back(arg);
         }
     }
-    if (worst && coverage) {
-        std::fprintf(stderr, "--worst and --coverage are separate runs\n");
+    if (static_cast<int>(worst) + static_cast<int>(coverage) +
+            static_cast<int>(literals) >
+        1) {
+        std::fprintf(stderr,
+                     "--worst, --coverage and --literals are separate runs\n");
         return 2;
+    }
+
+    if (literals) {
+        /* The same grid the recorded denominator was taken over, walked
+         * rather than timed. --runs and --warmup are refused here instead of
+         * ignored: a census accepting a timing flag reads as a run that was
+         * repeated, and this one is not repeated because there is nothing in
+         * it to vary. */
+        if (timing_flag_given) {
+            std::fprintf(stderr, "--literals is a census, not a timed run: it "
+                                 "takes neither --runs nor --warmup\n");
+            return 2;
+        }
+        if (files.empty() && !selfcheck) {
+            std::fprintf(stderr,
+                         "bench_zstd --literals needs corpus files (the "
+                         "recorded run uses bench/corpora/silesia/*); "
+                         "--selfcheck runs it on a generated source "
+                         "instead\n");
+            return 2;
+        }
+        std::vector<unsigned char> source;
+        std::string name;
+        if (selfcheck) {
+            source = MakeSelfcheckSource(kSelfcheckBytes);
+            name = "generated (selfcheck)";
+        } else {
+            for (const std::string& path : files) {
+                if (!AppendFile(path, &source)) {
+                    return 1;
+                }
+                const size_t slash = path.find_last_of("/\\");
+                name += (name.empty() ? "" : "+") +
+                        path.substr(slash == std::string::npos ? 0
+                                                               : slash + 1);
+            }
+        }
+        bool digests_hold = true;
+        for (size_t f = 0; f < sizeof(kFrameSizes) / sizeof(kFrameSizes[0]);
+             f++) {
+            for (size_t l = 0; l < sizeof(kLevels) / sizeof(kLevels[0]); l++) {
+                uint64_t digest = 0;
+                if (!RunLiteralsCensus(source, name, kFrameSizes[f], kLevels[l],
+                                       &digest)) {
+                    return 1;
+                }
+                if (selfcheck && !CheckDigest(digest, kFrameSizes[f],
+                                              kLevels[l],
+                                              kSelfcheckDigests[f][l])) {
+                    digests_hold = false;
+                }
+            }
+        }
+        if (!digests_hold) {
+            return 1;
+        }
+        if (selfcheck && !LiteralsCensusSeesBothSpellings()) {
+            return 1;
+        }
+        if (selfcheck) {
+            std::printf("PASS: selfcheck complete\n");
+        }
+        return 0;
     }
 
     if (coverage) {

@@ -187,6 +187,7 @@ bool ReadLiteralsSection(Reader* r, ZstdBlockShape* shape) {
             regenerated = (*head >> 4) | (static_cast<size_t>(rest[0]) << 4) |
                           (static_cast<size_t>(rest[1]) << 12);
         }
+        shape->literals_regenerated_size = regenerated;
         /* An RLE literals section stores exactly one byte whatever it
          * regenerates; a Raw one stores every byte it regenerates. */
         return r->Skip(type == kZstdLiteralsRle ? 1u : regenerated);
@@ -195,6 +196,7 @@ bool ReadLiteralsSection(Reader* r, ZstdBlockShape* shape) {
     /* Compressed and Treeless carry a compressed size as well, and the
      * stream count is the Size_Format: 00 is the only single-stream form. */
     size_t compressed = 0;
+    size_t regenerated = 0;
     if (size_format == 0 || size_format == 1) {
         const unsigned char* rest = nullptr;
         if (!r->Take(2, &rest)) {
@@ -203,6 +205,7 @@ bool ReadLiteralsSection(Reader* r, ZstdBlockShape* shape) {
         const uint32_t packed = (static_cast<uint32_t>(*head) >> 4) |
                                 (static_cast<uint32_t>(rest[0]) << 4) |
                                 (static_cast<uint32_t>(rest[1]) << 12);
+        regenerated = packed & 0x3ffu;
         compressed = (packed >> 10) & 0x3ffu;
     } else if (size_format == 2) {
         const unsigned char* rest = nullptr;
@@ -213,6 +216,7 @@ bool ReadLiteralsSection(Reader* r, ZstdBlockShape* shape) {
                                 (static_cast<uint32_t>(rest[0]) << 4) |
                                 (static_cast<uint32_t>(rest[1]) << 12) |
                                 (static_cast<uint32_t>(rest[2]) << 20);
+        regenerated = packed & 0x3fffu;
         compressed = (packed >> 14) & 0x3fffu;
     } else {
         const unsigned char* rest = nullptr;
@@ -224,8 +228,10 @@ bool ReadLiteralsSection(Reader* r, ZstdBlockShape* shape) {
                                 (static_cast<uint64_t>(rest[1]) << 12) |
                                 (static_cast<uint64_t>(rest[2]) << 20) |
                                 (static_cast<uint64_t>(rest[3]) << 28);
+        regenerated = static_cast<size_t>(packed & 0x3ffffu);
         compressed = static_cast<size_t>((packed >> 18) & 0x3ffffu);
     }
+    shape->literals_regenerated_size = regenerated;
     shape->literals_streams = size_format == 0 ? 1u : 4u;
     shape->literals_payload_offset = r->pos;
     shape->literals_payload_size = compressed;

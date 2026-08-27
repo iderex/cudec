@@ -2042,6 +2042,22 @@ them by naming where the literals live.
   is idle, and warp per frame's ten resident frames stop being the worse
   trade. That is the one measurement that reopens 14.2, and #236 and #237
   are the levers that would be tried first.
+
+  **Measured outcome (issue #237, 2026-08-27): the `Size_Format` of zero half
+  of that bullet is retired before the kernel exists, and the other half is
+  untouched.** An incidence census over the recorded M5 corpus - the same six
+  cells and the same frames the CPU denominator was taken on, proved by the
+  six corpus digests reproducing - finds the single-stream form carrying at
+  most 0.1664% of the Huffman literal bytes, and none at all at 64 KiB
+  granularity across the whole level set. So the 124-of-128-idle case is real
+  but rare enough that a dedicated shape for it cannot pay for the branch
+  every literals section would take, and #237 is closed with no kernel code.
+  What that does NOT settle is whether the four-stream literals phase
+  dominates a frame's time: that is a device measurement, it stays open on
+  #236, and it is still the one that would reopen 14.2. `docs/BENCHMARKS.md`
+  carries the table, the bounds of the corpus it was taken over, and the guard
+  that separates a measured zero from a blind one.
+
 - **Achieved registers above 64 per thread.** The whole of 14.2 is derived
   from 32 resident warps at 64 registers. Above it the block count falls
   and the shared-memory headroom the four-warp block relies on stops being

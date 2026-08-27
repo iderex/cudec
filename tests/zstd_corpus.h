@@ -76,6 +76,16 @@ struct ZstdBlockShape {
      * only for those two literals types. */
     size_t literals_payload_offset = 0;
     size_t literals_payload_size = 0;
+    /* What the literals section regenerates, for every literals type. The
+     * walk reads it in order to step over a Raw section and carries it in the
+     * same packed word as the compressed size for the other two, so it is
+     * reported for the reason the three fields above are. It is the
+     * denominator any statement about how much literal WORK sits in a given
+     * section shape has to be taken over: the section count answers a
+     * different question and the two diverge sharply, because the
+     * single-stream spelling caps regenerated size at 1023 bytes while the
+     * four-stream ones reach 262143. */
+    size_t literals_regenerated_size = 0;
 };
 
 struct ZstdFrameShape {
