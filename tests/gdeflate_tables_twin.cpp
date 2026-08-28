@@ -371,6 +371,84 @@ int CheckRoot(const char* what, const Table& t, uint32_t root_bits) {
     return 0;
 }
 
+/* Canonical ORDER, asserted directly rather than inferred from the codewords
+ * that were decoded through it. A table can hand back the right symbol for
+ * every codeword the fixtures happen to emit and still order `sorted` by
+ * something else, because the first-index arithmetic and the fill walk the
+ * same array - so an ordering defect hides behind exactly the evidence the
+ * parity fixtures produce. The property is the reference's own: primarily by
+ * increasing codeword length, secondarily by increasing symbol value, with the
+ * uncoded symbols left out entirely. */
+template <typename Table>
+int CheckCanonicalOrder(const char* what, const Table& t,
+                        const std::vector<unsigned char>& lens,
+                        uint32_t max_len) {
+    uint32_t n = 0;
+    for (size_t sym = 0; sym < lens.size(); sym++) {
+        n += (lens[sym] != 0) ? 1u : 0u;
+    }
+    uint32_t placed = 0;
+    for (uint32_t len = 1; len <= max_len; len++) {
+        REQUIRE_CTX(t.first_index[len] == placed, "%s: length %u starts at %u, "
+                    "%u symbols placed before it", what, len,
+                    static_cast<uint32_t>(t.first_index[len]), placed);
+        uint32_t previous = 0;
+        for (uint32_t i = 0; i < t.count[len]; i++) {
+            const uint32_t sym = t.sorted[placed + i];
+            REQUIRE_CTX(sym < lens.size(), "%s: symbol %u is outside the "
+                        "alphabet", what, sym);
+            REQUIRE_CTX(lens[sym] == len, "%s: symbol %u sits at length %u and "
+                        "its length is %u", what, sym, len,
+                        static_cast<uint32_t>(lens[sym]));
+            REQUIRE_CTX(i == 0 || sym > previous, "%s: symbol %u follows %u at "
+                        "length %u", what, sym, previous, len);
+            previous = sym;
+        }
+        placed += t.count[len];
+    }
+    REQUIRE_CTX(placed == n, "%s: %u symbols placed, %u coded", what, placed, n);
+    return 0;
+}
+
+int RunCanonicalOrder() {
+    const std::vector<unsigned char> flat_lens = AllLiteralsLens();
+    GDeflateLitLenTable flat;
+    REQUIRE(GDeflateBuildTable(flat_lens.data(), 257u, flat));
+    if (CheckCanonicalOrder("all-literals", flat, flat_lens,
+                            cudec_detail::kGDeflateMaxCodeLen) != 0) {
+        return 1;
+    }
+
+    const std::vector<unsigned char> deep_lens = DeepCodeLens();
+    GDeflateLitLenTable deep;
+    REQUIRE(GDeflateBuildTable(deep_lens.data(), 257u, deep));
+    if (CheckCanonicalOrder("deep-code", deep, deep_lens,
+                            cudec_detail::kGDeflateMaxCodeLen) != 0) {
+        return 1;
+    }
+
+    /* A vector whose coded symbols are scattered rather than leading, so that
+     * an implementation ordering by symbol index alone, or filling in input
+     * order, produces a different array. Symbols 200, 5, 91 and 3 all carry
+     * length 2, which spends the codespace exactly. */
+    std::vector<unsigned char> scattered(257, 0);
+    scattered[200] = 2;
+    scattered[5] = 2;
+    scattered[91] = 2;
+    scattered[3] = 2;
+    GDeflateLitLenTable mixed;
+    REQUIRE(GDeflateBuildTable(scattered.data(), 257u, mixed));
+    REQUIRE(mixed.sorted[0] == 3);
+    REQUIRE(mixed.sorted[1] == 5);
+    REQUIRE(mixed.sorted[2] == 91);
+    REQUIRE(mixed.sorted[3] == 200);
+    if (CheckCanonicalOrder("scattered", mixed, scattered,
+                            cudec_detail::kGDeflateMaxCodeLen) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
 int RunRootAccelerator() {
     GDeflateLitLenTable flat;
     const std::vector<unsigned char> flat_lens = AllLiteralsLens();
@@ -592,6 +670,9 @@ int RunUnreachableByFormat() {
 }  // namespace
 
 int main() {
+    if (RunCanonicalOrder() != 0) {
+        return 1;
+    }
     if (RunAlphabetParity() != 0) {
         return 1;
     }
