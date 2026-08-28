@@ -411,14 +411,18 @@ wrong. "Exactly once" holds for a supported launch geometry, which the
 kernel enforces rather than assumes: the copy loops stride by the warp
 size, so a block that is not a whole number of warps would leave a fixed
 slice of every destination written by nobody, and that geometry returns
-without decoding ([DETERMINISM.md](DETERMINISM.md)). The shipped inner loop computes that `i mod off` directly - one
-64-bit modulo per output byte, so every lane pays a division per
-iteration (`dst[seq.match_dst + i] = dst[seq.match_src + (i % offset)]`
-in `src/lz4_decode.cuh`). Cutting that cost is deferred, measurement-gated
-perf work, not a present property: eliding the modulo when the match
-cannot wrap (`off >= len`, #36) and narrowing it to 32-bit (#58), neither
-merged. The fully incremental `r += step; if (r >= off) r -= off` scheme
-was itself tried and rejected by measurement - see perf pass 1 below.
+without decoding ([DETERMINISM.md](DETERMINISM.md)). The shipped inner loop
+computes that `i mod off` directly, at two arithmetic widths behind one
+warp-uniform test in `src/chunk_decode.cuh`: a 32-bit modulo where the match
+length fits in `uint32_t`, and the 64-bit one above it, so a match longer
+than 2^32 still decodes through the other arm. That narrowing is #58 and it
+is merged - perf pass 4 in [BENCHMARKS.md](BENCHMARKS.md) is the measurement
+it was accepted on, and the offset stays 64-bit in the stored sequence, so no
+field is narrowed. Eliding the modulo altogether when the match cannot wrap
+(`off >= len`) was measured and rejected rather than deferred: perf pass 3
+there records the worst-case regression that decided it (#36). The fully
+incremental `r += step; if (r >= off) r -= off` scheme was itself tried and
+rejected by measurement - see perf pass 1 below.
 
 **The validation ladder** (fail-closed; every stream-decoded value checked
 before first use as address, length, or offset): token existence before
@@ -536,15 +540,15 @@ percentage points"; batches under ~2,000 chunks underfill the machine and
 land near CPU speed (documented, not hidden); warp-synchronous discipline
 is load-bearing - every `__syncwarp` is reviewed as such.
 
-**M3/M4 seam:** the chunk decoder is to become
-`template<class Parser, bool ParseOnly>` - Snappy (M3) swaps the parser and
-keeps everything else; GDeflate (M4) keeps the copy engine, validation
-posture, and result contract while bringing its format-native 32-substream
-parse model. Written as a commitment rather than as a present property,
-because it is one: `src/lz4_decode.cuh` is `template <bool ParseOnly>` with
-`Lz4Parser` named directly in the kernel body, and no `Parser` template
-parameter exists under `src/` today. Section 10 fixes the contract the seam
-must carry; the M3 kernel rung materializes it.
+**M3/M4 seam:** the chunk decoder is
+`template <class Parser, bool ParseOnly, int WaveSize>` - Snappy (M3) swaps
+the parser and keeps everything else; GDeflate (M4) keeps the copy engine,
+validation posture, and result contract while bringing its format-native
+32-substream parse model. This was written as a commitment rather than as a
+present property, and it is a present property now: `src/chunk_decode.cuh`
+carries the `Parser` parameter and the M3 kernel rung materialized it (#150),
+and the wave-width parameter beside it is #241. Section 10 fixes the contract
+the seam carries; GDeflate is the instantiation still owed.
 
 **The M1 PR ladder** (each independently gated): (1) this design section -
 closes the design issue; (2) the sequence parser + validation ladder as a
