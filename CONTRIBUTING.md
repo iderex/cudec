@@ -83,7 +83,7 @@ container command for the maintained path (build directory `build-cuda`,
 ### The tests that allocate over 4 GiB
 
 Some arms of the decoder are selected by a capacity test and nothing smaller
-reaches them: `src/lz4_decode.cuh` picks a 64-bit overlap gather for a match
+reaches them: `src/chunk_decode.cuh` picks a 64-bit overlap gather for a match
 longer than 2^32, and no ordinary fixture is that large. `huge_match_gpu`
 reaches that one with a single 4 GiB decode. It is built by every CUDA
 configure, so it cannot rot, and it is registered as a ctest entry only under
