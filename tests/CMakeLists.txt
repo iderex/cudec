@@ -156,6 +156,16 @@ cudec_add_test(gdeflate_schedule_twin SOURCES gdeflate_schedule_twin.cpp LIBS
                gdeflate_oracle)
 target_include_directories(gdeflate_schedule_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The GDeflate canonical table construction (issue #175), the rung above the
+# schedule. GPU-less for the same reason and linking gdeflate_oracle alone for
+# the reason oracle_gdeflate gives above. It emits whole GDeflate pages to ask
+# the reference its verdict, because the fork compiles its decompressor with
+# HIDE_INTERFACE and its table builder is reachable through nothing else -
+# tests/gdeflate_page_writer.h is that emitter and carries the argument.
+cudec_add_test(gdeflate_tables_twin SOURCES gdeflate_tables_twin.cpp LIBS
+               gdeflate_oracle)
+target_include_directories(gdeflate_tables_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.
