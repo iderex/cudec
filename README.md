@@ -24,8 +24,8 @@ properties a closed binary cannot offer:
 
 - **Auditability.** Decompressors are classic attack surface. Every bounds
   check in cudec is readable, tested, and fuzz-diffed against the reference
-  implementation - liblz4 today, with zlib and libzstd joining as the DEFLATE
-  and Zstd formats land.
+  implementations - liblz4 and snappy today, with zlib and libzstd joining as
+  the DEFLATE and Zstd formats land.
 - **Portability.** CUDA first; a HIP port is a planned milestone. What that
   milestone claims is one kernel family, single-source across both vendors
   behind the same C ABI, auditable and fail-closed on either - not a first on
@@ -42,14 +42,16 @@ one, and this README will never claim otherwise.
 
 ## Status
 
-**M0 through M2 are complete; M3 is next.** cudec decodes real LZ4 on an
-NVIDIA GPU today - batch block decode, the `.lz4` frame format
-(block-independent subset), and a pinned-host streaming path - all fail-closed
-and fuzz-diffed against liblz4. The design record is
-[docs/MASTERPLAN.md](docs/MASTERPLAN.md); the measured LZ4 block and streaming
+**M0 through M3 are complete; M4 is next.** cudec decodes real LZ4 and real
+Snappy on an NVIDIA GPU today - LZ4 batch block decode, the `.lz4` frame
+format (block-independent subset), a pinned-host LZ4 streaming path, and
+Snappy batch decode of raw streams - all fail-closed and fuzz-diffed against
+liblz4 and snappy. Snappy is batch-only by decision, not by omission: there is
+no Snappy streaming entry and no milestone carries one. The design record is
+[docs/MASTERPLAN.md](docs/MASTERPLAN.md); the measured LZ4 and Snappy
 baselines, each carrying its full methodology, are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md). Snappy, GDeflate, Zstd, and the HIP
-port are planned, not yet implemented. Progress is tracked in the issues and
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). GDeflate, Zstd and the HIP port are
+planned, not yet implemented. Progress is tracked in the issues and
 milestones:
 
 | Milestone        | Deliverable                                         | Status  |
@@ -57,7 +59,7 @@ milestones:
 | M0 - Foundation  | Toolchain, CMake+CUDA skeleton, CI, test harness    | done    |
 | M1 - LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      | done    |
 | M2 - LZ4 batch   | Frame format, batch API, streaming path, benchmarks | done    |
-| M3 - Snappy      | Snappy decode on the same kernel family             | planned |
+| M3 - Snappy      | Snappy decode on the same kernel family             | done    |
 | M4 - GDeflate    | GDeflate decode as an auditable CUDA library        | planned |
 | M5 - Zstd        | Zstd decode (FSE/Huffman sequences)                 | planned |
 | M6 - Portability | HIP port                                            | planned |

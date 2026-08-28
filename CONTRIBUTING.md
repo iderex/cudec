@@ -17,8 +17,8 @@ Issue-driven, gate-driven:
   defined error code, never an out-of-bounds access, never a partial guess.
   Every reject path carries an explicit negative test.
 - **The oracles decide.** Decode output is diff-tested on real and fuzzed
-  corpora against the reference implementations - liblz4 today, with zlib and
-  libzstd joining as the DEFLATE and Zstd formats land.
+  corpora against the reference implementations - liblz4 and snappy today,
+  with zlib and libzstd joining as the DEFLATE and Zstd formats land.
 - **Format provenance.** Every format is implemented from its public
   specification only - the LZ4 block/frame spec, Snappy, DEFLATE (RFC 1951),
   the GDeflate spec, Zstd (RFC 8878). The reference decoders (liblz4, zlib,
