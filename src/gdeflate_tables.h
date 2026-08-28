@@ -196,15 +196,20 @@ CUDEC_HOST_DEVICE inline bool GDeflateBuildTable(
         t.first_index[len] = static_cast<uint16_t>(next);
         next += t.count[len];
     }
-    uint32_t fill[kMaxLen + 1];
-    for (uint32_t len = 0; len <= kMaxLen; len++) {
-        fill[len] = t.first_index[len];
-    }
+    /* first_index doubles as the fill cursor and is wound back by each
+     * length's own count afterwards. A separate scratch array would be
+     * per-thread local memory in the kernel, in the one place where occupancy
+     * is the binding resource (section 13.1), for a value the table already
+     * holds. */
     for (uint32_t sym = 0; sym < num_syms; sym++) {
         const uint32_t len = lens[sym];
         if (len != 0) {
-            t.sorted[fill[len]++] = static_cast<uint16_t>(sym);
+            t.sorted[t.first_index[len]++] = static_cast<uint16_t>(sym);
         }
+    }
+    for (uint32_t len = 1; len <= kMaxLen; len++) {
+        t.first_index[len] =
+            static_cast<uint16_t>(t.first_index[len] - t.count[len]);
     }
 
     /* Cleared before the completeness question rather than after it, so no

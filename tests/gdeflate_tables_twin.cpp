@@ -570,10 +570,18 @@ int RunAllZeroLitLen() {
  * surface. They are refused rather than clamped because a clamped length
  * describes a different code, silently. */
 int RunUnreachableByFormat() {
+    /* The fixture is a vector that is a COMPLETE code over the first 257
+     * symbols with one extra symbol at length 16, and it is that shape for a
+     * reason worth keeping. A vector whose over-long length replaced a coded
+     * one is refused either way - the code it leaves behind is incomplete - so
+     * it cannot tell the length check from the completeness check. This one
+     * can: without the length check the over-long symbol is counted in a slot
+     * one past the end of the per-length array, the fifteen lengths that
+     * remain still spend the whole codespace, and the vector is accepted. */
     std::vector<unsigned char> too_long = CompleteLengths(257);
-    too_long[0] = 16;
+    too_long.push_back(16);
     GDeflateLitLenTable lt;
-    REQUIRE(!GDeflateBuildTable(too_long.data(), 257u, lt));
+    REQUIRE(!GDeflateBuildTable(too_long.data(), 258u, lt));
 
     const std::vector<unsigned char> lens = CompleteLengths(257);
     GDeflateDistTable dt;
