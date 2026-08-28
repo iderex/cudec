@@ -584,12 +584,14 @@ crafted negative in the twin asserts the reference's verdict on the same
 bytes as well as cudec's, so a reject branch is demonstrably in parity
 rather than merely present.
 
-**Where this section is a commitment and where it is a description.** The
-parser core, the seam, the batch entry and the device gate set have all
-landed; what has not is the bench rung and the measured pass. Each
-subsection below says which it is, so the document cannot be read as a
-report of shipped code. The tree is the authority for the second kind and
-the commands that read it are given inline.
+**Where this section is a commitment and where it is a description.** Every
+rung of the ladder below has landed - the parser core, the seam, the batch
+entry, the device gate set, the bench rung and the measured perf pass, whose
+numbers are in [BENCHMARKS.md](BENCHMARKS.md). Each subsection below still
+says which it is, because a subsection marked landed keeps the wording it was
+committed to rather than being rewritten into a report of the result, so the
+document cannot be read as a report of shipped code. The tree is the
+authority for the second kind and the commands that read it are given inline.
 
 ### The seam: what a parser owes the chunk decoder
 
