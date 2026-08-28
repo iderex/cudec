@@ -173,9 +173,15 @@ CUDEC_HOST_DEVICE inline bool GDeflateBuildTable(
     }
 
     /* Codespace out of 2^kMaxLen, accumulated the way the reference
-     * accumulates it: shift the running total left once per length instead of
-     * summing `count[len] << (kMaxLen - len)`, so the widest intermediate is
-     * bounded by the alphabet size rather than by the shift. */
+     * accumulates it: the running total shifted left once per length. An
+     * over-subscribed vector overshoots deliberately - that overshoot is the
+     * refusal below - so the accumulator has to hold more than a full
+     * codespace without wrapping, and the worst case is every symbol at length
+     * 1, which reaches `num_syms << (kMaxLen - 1)`. The reference carries the
+     * same bound as a static assertion and so does this. */
+    static_assert(kCapSyms <= (0xFFFFFFFFu >> (kMaxLen - 1)),
+                  "the codespace accumulator must not wrap on the most "
+                  "over-subscribed vector the alphabet admits");
     uint32_t codespace = 0;
     for (uint32_t len = 1; len <= kMaxLen; len++) {
         codespace = (codespace << 1) + t.count[len];
