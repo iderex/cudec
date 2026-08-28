@@ -482,6 +482,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Read-only, and needed by one step: a document may declare a path the
+      # tree owes as `path` (planned: #NNN), and that declaration is judged
+      # against the issue's state. No declaration exists today, so nothing
+      # here calls the tracker yet; the grant is what keeps the first one
+      # from erroring instead of being judged.
+      issues: read
     steps:
       - name: Check out the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -504,6 +510,23 @@ jobs:
       # the script's own header, next to the constants they are about.
       - name: Dependabot config validates against the published schema
         run: scripts/check-dependabot-config.sh
+
+      # A tense-present document naming a repository path the tree does not
+      # hold is refused here (issue #397). Three such corrections landed by
+      # hand in one night - #391, #393, #395 - and nothing in this repository
+      # would have found any of them.
+      #
+      # IT REACHES ONE THIRD OF THAT CLASS, AND A GREEN RUN IS NOT "NO
+      # DOCUMENT CONTRADICTS THE TREE". #393 and #395 are claims about state
+      # rather than references to files, and no reading of a path reaches
+      # either. The two properties it does hold, the three carve-outs, and the
+      # population each one meets are argued in the script's own header beside
+      # the code that decides them, and the self-tests that keep it from
+      # passing vacuously run on every invocation.
+      - name: Every path a tense-present document names resolves
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-doc-paths.sh
 
       # Every Action pinned to a full commit SHA, enforced rather than swept
       # (issue #131). A tag or branch pin resolves to whatever the upstream

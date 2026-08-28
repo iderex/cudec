@@ -197,5 +197,43 @@ are no HIP device sources yet, so the option fails the configure rather than
 handing back a host-only library that looks like a working port. The two
 options are mutually exclusive in one build tree.
 
+### Documents and the paths they name
+
+A repository path written in a tense-present document must resolve.
+`scripts/check-doc-paths.sh` refuses one that does not, in the `format` job, and
+it runs its own self-tests first so a regex that stopped matching cannot pass
+the tree silently.
+
+Where a document must name a file the tree only **owes** - an M4 design
+paragraph naming the GDeflate table headers, say - declare it and name the issue
+that owes it:
+
+```
+The canonical table will live in `path/to/file.h` (planned: #NNN).
+```
+
+The placeholder in that example is deliberate and is worth one sentence, because
+the trap costs a red gate on this file. A real path written here would be a live
+declaration like any other, judged against the issue it names, so illustrating
+the spelling with one of the M4 table headers and its issue number would make
+this section red the day that issue closes - the check refusing its own
+documentation. Worse, it reds immediately, because the illustration is a
+reference to a file the tree does not hold. A placeholder outside the tree's
+directories is invisible to the scan and is the safe way to show the shape.
+
+That is not a grace period. The declaration is judged against the issue: the
+moment it closes without the path existing, the reference reds exactly as a
+broken present-tense path would, so a promise cannot outlive the work it pointed
+at. A path that neither resolves nor carries a declaration is refused outright.
+
+Two things the gate deliberately does not reach, so a green run is not read as
+"no document contradicts the tree". A path under a directory this tree does not
+have is another project's file and passes - which is how `docs/MASTERPLAN.md`
+may keep naming nvCOMP's `src/lowlevel/gdeflateKernels.cu` - and with it any
+path whose whole directory is still owed. And `CHANGELOG.md` and
+`docs/BENCHMARKS.md` are out of scope entirely: they are append-only records of
+what was true when each entry was written, so a since-renamed path is honest
+text there rather than a defect.
+
 All repo artifacts - code, comments, commits, PRs, issues - are written in
 English.
