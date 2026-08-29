@@ -11,6 +11,7 @@
 
 include(${PROJECT_SOURCE_DIR}/cmake/CudecLz4Oracle.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/CudecSnappyOracle.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/CudecGDeflateOracle.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/CudecZstdOracle.cmake)
 
 function(cudec_add_fuzz_target name)
@@ -116,6 +117,20 @@ cudec_add_fuzz_target(fuzz_gdeflate_tables SHARE 2 SOURCES
 cudec_add_fuzz_target(fuzz_gdeflate_tables_selftest SOURCES
                       fuzz_gdeflate_tables.cpp)
 target_compile_definitions(fuzz_gdeflate_tables_selftest
+                           PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
+
+# The whole GDeflate page decode against the vendored oracle (issue #192): the
+# schedule, the code-length rounds, the table construction, the block loop and
+# the in-tile LZ77 in one entry point, diffed against
+# libdeflate_gdeflate_decompress. It links gdeflate_oracle for that reason,
+# which neither GDeflate target above does. SHARE 3 for the reason
+# fuzz_zstd_decode carries the same number: this is the composition rather than
+# a unit, and it is where the budget keeps buying reach.
+cudec_add_fuzz_target(fuzz_gdeflate_page SHARE 3 SOURCES fuzz_gdeflate_page.cpp
+                      LIBS gdeflate_oracle)
+cudec_add_fuzz_target(fuzz_gdeflate_page_selftest SOURCES
+                      fuzz_gdeflate_page.cpp LIBS gdeflate_oracle)
+target_compile_definitions(fuzz_gdeflate_page_selftest
                            PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
 
 # The Zstd frame and block header walk (issue #180), the one Zstd surface raw
