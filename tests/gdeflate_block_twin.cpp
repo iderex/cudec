@@ -24,6 +24,14 @@
  * value, reds this file. A test that merely asserted the tables differ from
  * RFC 1951's would pass against a decoder that never reached them.
  *
+ * THE PER-BLOCK PARITY BELONGS TO #175 AND LIVES HERE FOR THE CORPUS. That
+ * issue's first Done-when bullet asks for the decoded output of every dynamic
+ * block to match the reference at the block boundary, and the corpus the
+ * bullet is defined over is the one this file generates. A second file would
+ * have had to carry a second copy of the generator and the compress/decompress
+ * wrappers, so CheckBlockBoundaries sits beside them instead. What it does and
+ * where it stops is at that function.
+ *
  * WHAT IS NOT COVERED. The reject ladder is filed separately from this issue,
  * so the negatives here are the three this decoder owes on its own terms - a
  * reserved block type, an output that does not fit its tile, and a page cut
@@ -201,12 +209,119 @@ int FirstBlockType(const std::vector<unsigned char>& page) {
 struct Coverage {
     bool type_seen[4];
     bool multi_block;
-    Coverage() : multi_block(false) {
+    /* The two shapes the per-block parity below can attribute, tracked so the
+     * claim that both were exercised is measured rather than assumed. */
+    bool block_parity_whole_page;
+    bool block_parity_split;
+    Coverage()
+        : multi_block(false),
+          block_parity_whole_page(false),
+          block_parity_split(false) {
         for (uint32_t i = 0; i < 4; i++) {
             type_seen[i] = false;
         }
     }
 };
+
+/* Per-BLOCK parity at the block boundary, which is issue #175's first
+ * Done-when bullet and the last thing that issue was waiting on.
+ *
+ * WHY IT IS NOT ALREADY DONE BY THE PAGE COMPARISON ABOVE. That comparison is
+ * over a page's whole output, so a block loop that put the boundary between
+ * two blocks in the wrong place and recovered - a length taken from the next
+ * block's first symbol, a drain that ran one round short and one round long -
+ * still produces the page's bytes and passes. The boundary is the thing this
+ * separates.
+ *
+ * HOW A BLOCK BOUNDARY IS READ AT THE CONTRACT EDGE. The reference exposes no
+ * decode table and no per-block callback: what it answers about a page is the
+ * bytes it produced and whether it accepted (#175's note of 2026-08-26). So
+ * the boundary is not read out of either decoder, it is IMPOSED on the page
+ * and then confirmed by both. Setting BFINAL on the first block - bit 0 of the
+ * page's first word, the bit beside the BTYPE that
+ * RunReservedBlockType below rewrites - makes that block the whole page, and
+ * the reference then reports the block's own output length as its own answer.
+ * Ours must produce the same length and the same bytes, and those bytes must
+ * be the prefix the full page already produced.
+ *
+ * WHAT IT REACHES. Every block of every corpus page, not only the dynamic
+ * ones: the type of a block after the first is not readable at this edge
+ * either, so the property is asserted over all of them, which is the stronger
+ * statement rather than a weaker one. That the corpus reaches dynamic blocks
+ * at all stays the measured claim in RunCorpus below.
+ *
+ * WHERE IT STOPS. BFINAL can be imposed on the FIRST block only, because the
+ * bit position of any later block's header is not known without decoding to
+ * it. A page of two blocks is therefore fully attributed and a page of three
+ * would not be, so the third is refused loudly here rather than passing with
+ * the last blocks lumped together. Measured over this corpus, no page holds
+ * more than two. */
+int CheckBlockBoundaries(const char* name, int level, size_t page_index,
+                         const std::vector<unsigned char>& page,
+                         const unsigned char* want, uint64_t page_len,
+                         uint32_t blocks, Coverage* cov) {
+    REQUIRE_CTX(blocks >= 1, "%s page %zu reported %u blocks", name,
+                page_index, blocks);
+    if (blocks == 1) {
+        /* The block boundary and the page boundary coincide, so the byte
+         * comparison the caller already made IS this block's comparison. */
+        cov->block_parity_whole_page = true;
+        return 0;
+    }
+    REQUIRE_CTX(blocks == 2,
+                "%s level %d page %zu holds %u blocks: only the first can be "
+                "isolated, so a page past two is outside what this attributes",
+                name, level, page_index, blocks);
+
+    std::vector<unsigned char> cut = page;
+    cut[0] = static_cast<unsigned char>(cut[0] | 0x01u);
+
+    std::vector<unsigned char> first(kTileBytes, 0);
+    GDeflatePageState st;
+    uint64_t first_len = 0;
+    REQUIRE_CTX(GDeflateDecodePage(st, cut.data(), cut.size(), first.data(),
+                                   kTileBytes, &first_len),
+                "%s level %d page %zu: the isolated first block was refused",
+                name, level, page_index);
+    REQUIRE_CTX(st.blocks == 1, "%s page %zu isolated %u blocks", name,
+                page_index, st.blocks);
+    REQUIRE_CTX(first_len > 0 && first_len < page_len,
+                "%s page %zu: first block produced %llu of %llu", name,
+                page_index, static_cast<unsigned long long>(first_len),
+                static_cast<unsigned long long>(page_len));
+
+    /* The reference's own answer for the same imposed boundary. It is asked
+     * for the whole tile rather than for a length this side computed, so the
+     * length below is the reference's and the comparison is not circular. */
+    std::vector<std::vector<unsigned char> > one;
+    one.push_back(cut);
+    std::vector<unsigned char> oracle_first;
+    REQUIRE_CTX(OracleDecompress(one, kTileBytes, &oracle_first),
+                "%s level %d page %zu: the reference refused the isolated "
+                "first block",
+                name, level, page_index);
+    REQUIRE_CTX(oracle_first.size() == first_len,
+                "%s page %zu: reference ended the first block at %zu, this "
+                "decoder at %llu",
+                name, page_index, oracle_first.size(),
+                static_cast<unsigned long long>(first_len));
+    REQUIRE_CTX(equal_bytes(first.data(), oracle_first.data(),
+                            static_cast<size_t>(first_len)),
+                "%s level %d page %zu first block", name, level, page_index);
+    /* And the same bytes in place, which is what makes this a statement about
+     * the full page's first block rather than about a page of its own. */
+    REQUIRE_CTX(equal_bytes(first.data(), want, static_cast<size_t>(first_len)),
+                "%s level %d page %zu first block in place", name, level,
+                page_index);
+    /* NOTHING IS ASSERTED HERE FOR THE SECOND BLOCK, ON PURPOSE. Its bytes are
+     * the caller's whole-page comparison restricted to the range past the
+     * boundary, so a check written here could not fail while that one passed,
+     * and a guard that cannot bite proves nothing. What this function adds for
+     * the second block is the BOUNDARY: where its output begins is now a
+     * number both decoders produced rather than one this side chose. */
+    cov->block_parity_split = true;
+    return 0;
+}
 
 /* One corpus fixture: compress, decompress every page with the decoder under
  * test, and require the concatenation to be the input byte for byte and the
@@ -251,6 +366,10 @@ int CheckRoundTrip(const char* name, int level,
         cov->type_seen[type] = true;
         if (st.blocks > 1) {
             cov->multi_block = true;
+        }
+        if (CheckBlockBoundaries(name, level, i, pages[i], in.data() + consumed,
+                                 produced, st.blocks, cov) != 0) {
+            return 1;
         }
         got.insert(got.end(), tile.begin(), tile.begin() + want);
     }
@@ -319,6 +438,11 @@ int RunCorpus() {
     REQUIRE(cov.type_seen[cudec_detail::kGDeflateBlockDynamic]);
     REQUIRE(!cov.type_seen[kGDeflateBlockReserved]);
     REQUIRE(cov.multi_block);
+    /* Both attribution shapes of CheckBlockBoundaries have to have been
+     * reached, or the per-block claim rests on whichever one the corpus
+     * happened to produce (issue #175). */
+    REQUIRE(cov.block_parity_whole_page);
+    REQUIRE(cov.block_parity_split);
     return 0;
 }
 
