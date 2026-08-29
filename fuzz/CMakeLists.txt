@@ -102,6 +102,22 @@ cudec_add_fuzz_target(fuzz_gdeflate_tilestream_selftest SOURCES
 target_compile_definitions(fuzz_gdeflate_tilestream_selftest
                            PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
 
+# The GDeflate table pipeline (issue #186): the canonical construction and the
+# dynamic block's code-length rounds that feed it. It links no oracle library
+# and for a sharper reason than the walker above: the reference HAS a decode
+# table builder, and it is static inside a translation unit compiled with
+# HIDE_INTERFACE, so no comparison against it is possible at any boundary this
+# tree links. The property is a codespace count computed beside the builder
+# instead. SHARE 2 for the reason fuzz_zstd_fse carries the same number: this
+# is a structure-aware target whose reachable state keeps growing with the time
+# it is given, not an envelope that saturates in seconds.
+cudec_add_fuzz_target(fuzz_gdeflate_tables SHARE 2 SOURCES
+                      fuzz_gdeflate_tables.cpp)
+cudec_add_fuzz_target(fuzz_gdeflate_tables_selftest SOURCES
+                      fuzz_gdeflate_tables.cpp)
+target_compile_definitions(fuzz_gdeflate_tables_selftest
+                           PRIVATE CUDEC_FUZZ_SELFTEST_BREAK)
+
 # The Zstd frame and block header walk (issue #180), the one Zstd surface raw
 # fuzzer bytes reach without a structure-aware layer. It links zstd_oracle -
 # the decode-only translation units - because nothing here produces a frame;

@@ -639,6 +639,11 @@ int RunPrecodeIsNotACode() {
         GDeflateCodeLengths lens;
         REQUIRE_CTX(!GDeflateReadCodeLengths(s, page.data(), lens), "shape %u",
                     shape);
+        /* The flag as well as the return value. This case refused with the
+         * schedule left clean until fuzz/fuzz_gdeflate_tables.cpp caught it,
+         * and the test that was here asserted only the return - so the two
+         * ways a caller can read a verdict disagreed and nothing said so. */
+        REQUIRE_CTX(s.failed, "shape %u refused with a clean schedule", shape);
     }
     return 0;
 }
