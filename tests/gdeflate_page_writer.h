@@ -189,6 +189,35 @@ inline std::vector<unsigned char> CompleteLengths(uint32_t n) {
     return lens;
 }
 
+/* The codeword a built table assigns to `sym`, recovered from the same three
+ * arrays the decoder walks. Returns false for a symbol the vector left out.
+ * It lives beside the writer because every fixture that emits a body needs it
+ * and, like CompleteLengths above, none of them should invent it twice. */
+template <typename Table>
+inline bool CodewordOf(const Table& t, const unsigned char* lens, uint32_t sym,
+                       uint32_t* code, uint32_t* len) {
+    const uint32_t l = lens[sym];
+    if (l == 0) {
+        return false;
+    }
+    if (t.kind == cudec_detail::kGDeflateTableSingle) {
+        /* The reference gives the one symbol both codewords, 0 and 1, so
+         * either bit resolves it; 0 is the one zlib's decompressor assumes and
+         * the one the reference's comment names. */
+        *code = 0;
+        *len = 1;
+        return true;
+    }
+    for (uint32_t i = 0; i < t.count[l]; i++) {
+        if (t.sorted[t.first_index[l] + i] == sym) {
+            *code = t.first_code[l] + i;
+            *len = l;
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace cudec_test
 
 #endif /* CUDEC_TESTS_GDEFLATE_PAGE_WRITER_H */

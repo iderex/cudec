@@ -3,8 +3,9 @@
  * reference refuses. Single-sourced for host and device, the sibling of
  * src/gdeflate_schedule.h, src/lz4_block.h and src/snappy_block.h. It reads no
  * bits of its own beyond the decode helper at the bottom and knows nothing
- * about block headers: where a length vector comes from is #176's, what a
- * decoded symbol means is #182's.
+ * about block headers beyond the dynamic block's own code-length rounds
+ * (#176): what a decoded literal/length or distance symbol MEANS is #182's,
+ * and so is every other block type.
  *
  * WHY THIS IS THE PIECE THAT GETS ITS OWN REVIEW. A decode table is the one
  * place in a DEFLATE-family decoder where attacker-chosen numbers become an
@@ -335,6 +336,214 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflateDecodeSymbol(
     }
     s.failed = true;
     return kGDeflateNoSymbol;
+}
+
+
+/* THE DYNAMIC BLOCK'S CODE-LENGTH ROUNDS (issue #176). Everything above turns
+ * a length vector into a table; this turns a page into the length vectors. It
+ * is in this file rather than beside the block loop because the vector is read
+ * THROUGH a canonical Huffman code built by the routine above - the precode is
+ * a table like any other - and a second copy of that construction is the one
+ * thing #175 forbids by name.
+ *
+ * THE ROUND STRUCTURE IS THE FORMAT AND IT IS NOT RFC 1951'S. In DEFLATE these
+ * fields are one serial bit stream. Here HLIT, HDIST and HCLEN ride lane 0
+ * with no round between them, each precode length is its own round, and each
+ * expanded length - a repeat code and its extra bits together - is its own
+ * round as well. An extra-bit field read in the round AFTER its code would
+ * decode a different page and raise no error, which is why the extra bits are
+ * popped before the Advance rather than after it.
+ *
+ * WHERE THIS IS STRICTER THAN THE REFERENCE, STATED RATHER THAN LEFT TO BE
+ * FOUND. A repeat run reaching past HLIT + HDIST is refused here. The
+ * reference does not refuse it: it keeps 137 slack entries after the alphabet
+ * precisely so the worst overrun - 138 zeroes with one length left to fill -
+ * writes into memory it owns, and the entries past the alphabet are then never
+ * read. That is a decoder ABSORBING a malformed vector rather than accepting a
+ * legal one: no compressor emits it, and RFC 1951 section 3.2.7 gives the run
+ * no meaning past the end of the alphabet. Carrying the slack would spend 137
+ * bytes of the per-warp budget section 13.1 measures on bytes nothing may
+ * read. The divergence is executed, with the reference's own answer beside it,
+ * in tests/gdeflate_header_twin.cpp. */
+
+constexpr uint32_t kGDeflateNumPrecodeSyms = 19;
+constexpr uint32_t kGDeflateMaxPrecodeLen = 7;
+
+/* The precode's root width is its maximum codeword length, so every codeword
+ * it can carry resolves in one lookup and the length-by-length walk is
+ * unreachable on it. The reference rests on the same equality - its
+ * PRECODE_TABLEBITS static assertion - and this is that statement in the place
+ * that has to agree with it. */
+using GDeflatePrecodeTable =
+    GDeflateHuffTable<kGDeflateNumPrecodeSyms, kGDeflateMaxPrecodeLen,
+                      kGDeflateMaxPrecodeLen>;
+
+/* The order the precode's own lengths are stored in - data rather than a
+ * derivation, and the reference's `deflate_precode_lens_permutation`. A
+ * permutation reorders the same multiset, so every completeness test answers
+ * identically under the permuted and the unpermuted reading (measured as a
+ * surviving mutant on #170). Only lengths ASSIGNED TO SYMBOLS separate the
+ * two, which is what this file produces and what that one could not. */
+CUDEC_HOST_DEVICE inline uint32_t GDeflatePrecodeOrder(uint32_t i) {
+    const unsigned char kOrder[kGDeflateNumPrecodeSyms] = {
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+    return kOrder[i];
+}
+
+/* The three repeat codes, named so the decode below reads as the format
+ * rather than as arithmetic over magic numbers. */
+constexpr uint32_t kGDeflateRepeatPrev = 16;
+constexpr uint32_t kGDeflateRepeatZeroShort = 17;
+constexpr uint32_t kGDeflateRepeatZeroLong = 18;
+
+/* The concatenated literal/length and distance length vector, and where the
+ * cut between them falls. A caller-provided struct rather than a local array
+ * because in the warp kernel these are 320 bytes that have to land in shared
+ * memory: a local array would be per-thread local memory in the one place
+ * where occupancy is the binding resource (docs/MASTERPLAN.md section 13.1). */
+struct GDeflateCodeLengths {
+    unsigned char lens[kGDeflateNumLitLenSyms + kGDeflateNumDistSyms];
+    uint32_t num_litlen;
+    uint32_t num_dist;
+};
+
+/* Read a dynamic block's code-length vectors, entered immediately after BTYPE
+ * has been popped off lane 0. Returns false with the schedule failed for every
+ * shape this decoder refuses, and `out` is not to be read in that case.
+ *
+ * NOTHING HERE IS SIZED FROM THE STREAM. HLIT and HDIST are five-bit fields
+ * and HCLEN is four, so the three counts are bounded by the field widths
+ * rather than by a check: the static assertions below say that the capacities
+ * this file declares are exactly the values those fields reach, which is the
+ * form that fails at compile time if a capacity is ever changed alone. */
+CUDEC_HOST_DEVICE inline bool GDeflateReadCodeLengths(
+    GDeflateSchedule& s, const unsigned char* page, GDeflateCodeLengths& out) {
+    static_assert(kGDeflateNumLitLenSyms == 257 + ((1u << 5) - 1u),
+                  "HLIT is five bits above 257, so the literal/length "
+                  "capacity must be the highest value that field reaches");
+    static_assert(kGDeflateNumDistSyms == 1 + ((1u << 5) - 1u),
+                  "HDIST is five bits above 1, so the distance capacity must "
+                  "be the highest value that field reaches");
+    static_assert(kGDeflateNumPrecodeSyms == 4 + ((1u << 4) - 1u),
+                  "HCLEN is four bits above 4, so the precode alphabet must "
+                  "be the highest value that field reaches");
+
+    /* The reference's ENSURE_BITS after BTYPE. Idempotent - a lane at or above
+     * the watermark is left alone - so a caller that ensured already is not
+     * charged a second word for calling this. */
+    GDeflateEnsure(s, page);
+
+    const uint32_t num_litlen = GDeflatePop(s, 5) + 257u;
+    const uint32_t num_dist = GDeflatePop(s, 5) + 1u;
+    const uint32_t num_explicit = GDeflatePop(s, 4) + 4u;
+    if (s.failed) {
+        return false;
+    }
+    GDeflateEnsure(s, page);
+
+    /* Every precode length the header does not state is zero: HCLEN says how
+     * many of the nineteen are present, and an absent one is absent from the
+     * code rather than undefined. */
+    unsigned char precode_lens[kGDeflateNumPrecodeSyms];
+    for (uint32_t i = 0; i < kGDeflateNumPrecodeSyms; i++) {
+        precode_lens[i] = 0;
+    }
+    for (uint32_t i = 0; i < num_explicit; i++) {
+        precode_lens[GDeflatePrecodeOrder(i)] =
+            static_cast<unsigned char>(GDeflatePop(s, 3));
+        GDeflateAdvance(s, page);
+    }
+    if (s.failed) {
+        return false;
+    }
+
+    GDeflatePrecodeTable precode;
+    if (!GDeflateBuildTable(precode_lens, kGDeflateNumPrecodeSyms, precode)) {
+        return false;
+    }
+
+    /* The expansion starts at a reset exactly as the header did, so the first
+     * length rides lane 0. */
+    GDeflateReset(s);
+    const uint32_t total = num_litlen + num_dist;
+    /* The increment lives in the body because a round writes one length or a
+     * run of them, and which it was is not known until the symbol is decoded.
+     * It terminates on every input all the same: each pass either writes at
+     * least one length or returns, and the run bound below is what keeps the
+     * write inside the alphabet. */
+    for (uint32_t i = 0; i < total;) {
+        const uint32_t presym = GDeflateDecodeSymbol(s, precode);
+        if (presym == kGDeflateNoSymbol) {
+            return false;
+        }
+        if (presym < kGDeflateRepeatPrev) {
+            out.lens[i++] = static_cast<unsigned char>(presym);
+            GDeflateAdvance(s, page);
+            continue;
+        }
+
+        unsigned char rep_val = 0;
+        uint32_t rep_count = 0;
+        if (presym == kGDeflateRepeatPrev) {
+            if (i == 0) {
+                /* Nothing to repeat. The reference refuses this as well, and
+                 * it is the one repeat-code refusal the two decoders share. */
+                s.failed = true;
+                return false;
+            }
+            rep_val = out.lens[i - 1];
+            rep_count = 3u + GDeflatePop(s, 2);
+        } else if (presym == kGDeflateRepeatZeroShort) {
+            rep_count = 3u + GDeflatePop(s, 3);
+        } else {
+            rep_count = 11u + GDeflatePop(s, 7);
+        }
+        if (s.failed) {
+            return false;
+        }
+        if (rep_count > total - i) {
+            /* See the block comment above: refused rather than absorbed into
+             * slack this alphabet does not carry. Written as a subtraction on
+             * the side that cannot overflow - `i` is below `total` here, so
+             * `total - i` is what is left rather than a sum that could wrap. */
+            s.failed = true;
+            return false;
+        }
+        for (uint32_t n = 0; n < rep_count; n++) {
+            out.lens[i++] = rep_val;
+        }
+        GDeflateAdvance(s, page);
+    }
+    if (s.failed) {
+        return false;
+    }
+    out.num_litlen = num_litlen;
+    out.num_dist = num_dist;
+    return true;
+}
+
+/* The rung above: the two vectors read, then the two tables built from them.
+ * Split from the read so the code-length round is provable on its own - a
+ * vector recovered wrongly and a vector that merely fails to build a table are
+ * different failures, and one entry point would report them as one. */
+CUDEC_HOST_DEVICE inline bool GDeflateReadDynamicTables(
+    GDeflateSchedule& s, const unsigned char* page, GDeflateCodeLengths& lens,
+    GDeflateLitLenTable& litlen, GDeflateDistTable& dist) {
+    if (!GDeflateReadCodeLengths(s, page, lens)) {
+        return false;
+    }
+    if (!GDeflateBuildTable(lens.lens, lens.num_litlen, litlen)) {
+        /* A vector that is not a code is bad input, so the schedule carries
+         * the same verdict a bad round would leave: a caller that checks only
+         * the flag must not read this as a page still worth decoding. */
+        s.failed = true;
+        return false;
+    }
+    if (!GDeflateBuildTable(lens.lens + lens.num_litlen, lens.num_dist, dist)) {
+        s.failed = true;
+        return false;
+    }
+    return true;
 }
 
 }  // namespace cudec_detail
