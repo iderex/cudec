@@ -54,6 +54,7 @@ using cudec_detail::GDeflateSchedule;
 using cudec_detail::kGDeflateNoSymbol;
 using cudec_detail::kGDeflateTableEmpty;
 using cudec_detail::kGDeflateTableSingle;
+using cudec_test::CodewordOf;
 using cudec_test::CompleteLengths;
 using cudec_test::GDeflatePageWriter;
 
@@ -70,32 +71,6 @@ using PrecodeTable =
     cudec_detail::GDeflateHuffTable<kNumPrecodeSyms, kMaxPrecodeLen,
                                     kMaxPrecodeLen>;
 
-/* The codeword a built table assigns to `sym`, recovered from the same three
- * arrays the decoder walks. Returns false for a symbol the vector left out. */
-template <typename Table>
-bool CodewordOf(const Table& t, const unsigned char* lens, uint32_t sym,
-                uint32_t* code, uint32_t* len) {
-    const uint32_t l = lens[sym];
-    if (l == 0) {
-        return false;
-    }
-    if (t.kind == kGDeflateTableSingle) {
-        /* The reference gives the one symbol both codewords, 0 and 1, so
-         * either bit resolves it; 0 is the one zlib's decompressor assumes and
-         * the one the reference's comment names. */
-        *code = 0;
-        *len = 1;
-        return true;
-    }
-    for (uint32_t i = 0; i < t.count[l]; i++) {
-        if (t.sorted[t.first_index[l] + i] == sym) {
-            *code = t.first_code[l] + i;
-            *len = l;
-            return true;
-        }
-    }
-    return false;
-}
 
 /* One dynamic block, emitted whole. `litlen_lens` and `dist_lens` are the
  * vectors under test; `symbols` is what the block's body encodes, which the

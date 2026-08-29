@@ -166,6 +166,18 @@ cudec_add_test(gdeflate_tables_twin SOURCES gdeflate_tables_twin.cpp LIBS
                gdeflate_oracle)
 target_include_directories(gdeflate_tables_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The GDeflate dynamic block header and its code-length rounds (issue #176),
+# the rung above the table construction: this is what turns a page into the
+# vectors that construction is fed. GPU-less and linking gdeflate_oracle alone
+# for the reasons oracle_gdeflate gives above, and reaching src/ for the header
+# under test. It emits whole pages through tests/gdeflate_page_writer.h for the
+# same reason gdeflate_tables_twin does - the reference's own code-length
+# vectors sit in a translation unit compiled with HIDE_INTERFACE, so the only
+# comparison available is the one a whole page buys.
+cudec_add_test(gdeflate_header_twin SOURCES gdeflate_header_twin.cpp LIBS
+               gdeflate_oracle)
+target_include_directories(gdeflate_header_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.
