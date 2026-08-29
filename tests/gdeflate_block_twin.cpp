@@ -695,6 +695,100 @@ int RunMatchBeforeOutput() {
     return 0;
 }
 
+/* A block whose symbols simply STOP, which is where issue #183's enumerated
+ * "missing EOB" negative was expected to go and where it turns out there is no
+ * negative to write.
+ *
+ * ON THE STATIC CODE THE END-OF-BLOCK SYMBOL IS SEVEN ZERO BITS, and a page's
+ * tail is zeros. So a block that stops emitting is handed an end-of-block by
+ * its own padding: it decodes, it does not fail closed, and both this decoder
+ * and the reference produce exactly the literals that were written. That is
+ * asserted below rather than described, together with the codeword that causes
+ * it, so the two cannot drift apart.
+ *
+ * WHAT THAT MEANS FOR THE LADDER. A missing end-of-block is not a reject branch
+ * of this decoder. Where the symbols outlast the output instead, the literal
+ * and length paths each refuse against the capacity before writing, which is
+ * the branch RunCapacityBoundary above already sweeps; and the round-fuel arm
+ * in the block loop is a termination property rather than a reachable refusal.
+ * A fixture asserting a refusal here would therefore have been asserting
+ * something no page produces.
+ *
+ * THE PAIR IS THE PROOF, AND IT DIFFERS BY ONE SYMBOL. The same literals with
+ * the end-of-block written out explicitly must produce the same bytes as the
+ * page that leaves it to the tail. If they ever diverge, one of the two is
+ * being decoded through a different path than this file claims. The block is a
+ * static one so the fixture owes no dynamic header; what is under test is one
+ * symbol's absence. */
+int RunEndOfBlockFromTheTail() {
+    const std::vector<unsigned char> litlen_lens = StaticLitLenLengths();
+    cudec_detail::GDeflateLitLenTable litlen;
+    REQUIRE(cudec_detail::GDeflateBuildTable(litlen_lens.data(), 288, litlen));
+
+    uint32_t lit_code = 0;
+    uint32_t lit_bits = 0;
+    REQUIRE(cudec_test::CodewordOf(litlen, litlen_lens.data(),
+                                   static_cast<uint32_t>('a'), &lit_code,
+                                   &lit_bits));
+    uint32_t eob_code = 0;
+    uint32_t eob_bits = 0;
+    REQUIRE(cudec_test::CodewordOf(litlen, litlen_lens.data(),
+                                   cudec_detail::kGDeflateEndOfBlock,
+                                   &eob_code, &eob_bits));
+    /* The reason the page below needs no end-of-block, asserted rather than
+     * assumed: RFC 1951's static code gives symbol 256 the seven-bit codeword
+     * 0000000, and a page's tail is zeros. */
+    REQUIRE(eob_code == 0u && eob_bits == 7u);
+
+    /* One whole round of the 32 lanes, so the block is past the priming round
+     * rather than ending inside it, and the capacity is exactly what those
+     * literals produce - the two pages then differ by the end-of-block symbol
+     * and by nothing else. */
+    const size_t kCapacity = cudec_detail::kGDeflateNumStreams;
+
+    for (uint32_t with_eob = 0; with_eob < 2; with_eob++) {
+        GDeflatePageWriter w;
+        w.Reset();
+        w.Push(1, 1); /* BFINAL */
+        w.Push(2, cudec_detail::kGDeflateBlockStatic);
+        w.Ensure();
+        w.Reset();
+        for (size_t i = 0; i < kCapacity; i++) {
+            w.PushCode(lit_code, lit_bits);
+            w.Advance();
+        }
+        if (with_eob) {
+            /* The reference leaves the loop here without advancing, so the
+             * drain that follows starts on this lane. */
+            w.PushCode(eob_code, eob_bits);
+        }
+        for (uint32_t i = 0; i < cudec_detail::kGDeflateNumStreams; i++) {
+            w.Advance();
+        }
+        REQUIRE(w.ok());
+        const std::vector<unsigned char> page = w.Finish();
+
+        libdeflate_result status = LIBDEFLATE_BAD_DATA;
+        size_t produced = 0;
+        REQUIRE(OracleVerdictPadded(page, kCapacity, &status, &produced));
+
+        std::vector<unsigned char> out(kCapacity, 0);
+        GDeflatePageState st;
+        uint64_t got = 0;
+        const bool ok = GDeflateDecodePage(st, page.data(), page.size(),
+                                           out.data(), out.size(), &got);
+        REQUIRE_CTX(ok, "with_eob=%u was refused", with_eob);
+        REQUIRE_CTX(got == kCapacity, "with_eob=%u produced %llu", with_eob,
+                    static_cast<unsigned long long>(got));
+        REQUIRE_CTX(status == LIBDEFLATE_SUCCESS, "with_eob=%u status %d",
+                    with_eob, static_cast<int>(status));
+        REQUIRE(produced == kCapacity);
+        const std::vector<unsigned char> want(kCapacity, 'a');
+        REQUIRE(equal_bytes(out.data(), want.data(), kCapacity));
+    }
+    return 0;
+}
+
 /* A stored block whose declared length is more than the page can supply. It is
  * the one length in this format with nothing to cross-check it against - there
  * is no complement field (dossier 11.3, D3) - so the bytes still reachable are
@@ -882,6 +976,9 @@ int main() {
         return 1;
     }
     if (RunTruncatedPage() != 0) {
+        return 1;
+    }
+    if (RunEndOfBlockFromTheTail() != 0) {
         return 1;
     }
     std::printf("gdeflate_block_twin: ok\n");
