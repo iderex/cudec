@@ -187,6 +187,47 @@ bool OracleDecompress(const std::vector<std::vector<unsigned char> >& pages,
     return true;
 }
 
+/* The reference's verdict on a page it is entitled to read past the end of.
+ *
+ * ENSURE_BITS in the pinned fork reads a 32-bit word with no bound check
+ * against the end of the page: the format's own watermark discipline makes
+ * that safe on a well-formed page, and a page this file cut short is not one.
+ * Handed such a page in a tight allocation the reference reads into whatever
+ * the allocator left behind, so its verdict would be a coin and the sanitizer
+ * gate would report a defect in the oracle rather than a verdict on this
+ * decoder. fuzz/fuzz_gdeflate_page.cpp settles that for the differential
+ * target and this is the same settlement: the reference gets its own copy with
+ * a zero tail behind it while being told the same `nbytes`, which makes the
+ * read deterministic without changing one byte of what it is asked about.
+ *
+ * The tail is sized from the CAPACITY and not from the page, for the reason
+ * that file states: on a compressed block the reference has no bound of its
+ * own, so it takes a word per round until the output fills, and rounds are
+ * bounded by the capacity rather than by the bytes the page had left.
+ *
+ * The return says only whether the reference could be ASKED; its answer is the
+ * out parameter, so an allocation that failed can never be read as a reject. */
+bool OracleVerdictPadded(const std::vector<unsigned char>& page,
+                         size_t capacity, libdeflate_result* status,
+                         size_t* produced) {
+    libdeflate_gdeflate_decompressor* d =
+        libdeflate_alloc_gdeflate_decompressor();
+    if (d == nullptr) {
+        return false;
+    }
+    std::vector<unsigned char> padded(page.size() + 6u * capacity + 4096u, 0);
+    std::memcpy(padded.data(), page.data(), page.size());
+    libdeflate_gdeflate_in_page in;
+    in.data = padded.data();
+    in.nbytes = page.size();
+    std::vector<unsigned char> out(capacity, 0);
+    *produced = 0;
+    *status = libdeflate_gdeflate_decompress(d, &in, 1, out.data(), capacity,
+                                             produced);
+    libdeflate_free_gdeflate_decompressor(d);
+    return true;
+}
+
 /* The block type of a page's first block, read with the schedule alone. Used
  * to prove the corpus reaches all three types rather than assuming it does -
  * which type a given input draws is the reference compressor's decision. */
@@ -751,12 +792,24 @@ int RunCapacityBoundary() {
  * page is accepted, which is the same boundary shape the header twin pins one
  * rung down.
  *
- * THE ORACLE IS NOT ASKED, AND NOT ASKING IT IS THE FINDING. ENSURE_BITS in
- * the pinned fork reads a 32-bit word with no bound check against the end of
- * the page, so handing the reference a truncated page is a heap out-of-bounds
- * read: it would red the sanitizer gate with a defect in the oracle rather
- * than a verdict on this decoder. src/gdeflate_schedule.h refuses the same
- * read by an explicit bound, which is what this asserts. */
+ * THE REFERENCE IS ASKED NOW, AND WHAT IT ANSWERS IS THE POINT (issue #183).
+ * This block used to record that it could not be asked at all: handing it a
+ * truncated page is a read past the end of the buffer, so its verdict would
+ * have been a coin and the sanitizer gate would have reported a defect in the
+ * oracle. What removed that obstacle is fuzz/fuzz_gdeflate_page.cpp's zero
+ * tail, which OracleVerdictPadded above reuses, and asking turns out to matter
+ * because the answer is NOT the one a reject-parity bullet would assume.
+ *
+ * The reference refuses most truncations and ACCEPTS the longest ones, because
+ * the tail hands it the words the page no longer has and its decode completes
+ * out of them. That is the recommended 128-byte zero padding doing the work,
+ * and it is exactly what #183 asks this rung to prove independence from: this
+ * decoder refuses every one of them by the explicit bound in
+ * src/gdeflate_schedule.h, including the ones the reference accepts. So the
+ * assertion below is a declared strictness departure and not reject parity,
+ * and both halves of the reference's split are required to have been reached -
+ * a fixture that only produced refusals would prove the departure by
+ * accident. */
 int RunTruncatedPage() {
     const std::vector<unsigned char> in = ShortRepeats(22, 20000);
     std::vector<std::vector<unsigned char> > pages;
@@ -766,6 +819,8 @@ int RunTruncatedPage() {
     std::vector<unsigned char> tile(kTileBytes, 0);
     const size_t words = pages[0].size() / 4u;
     uint32_t refusals = 0;
+    uint32_t oracle_refused = 0;
+    uint32_t oracle_accepted = 0;
     for (size_t cut = cudec_detail::kGDeflateNumStreams; cut < words; cut++) {
         std::vector<unsigned char> shorter(pages[0].begin(),
                                            pages[0].begin() + cut * 4u);
@@ -776,8 +831,21 @@ int RunTruncatedPage() {
                     "%zu words accepted", cut);
         REQUIRE_CTX(st.s.failed, "%zu words", cut);
         refusals++;
+
+        libdeflate_result status = LIBDEFLATE_BAD_DATA;
+        size_t produced = 0;
+        REQUIRE_CTX(
+            OracleVerdictPadded(shorter, in.size(), &status, &produced),
+            "%zu words: the reference could not be asked", cut);
+        if (status == LIBDEFLATE_SUCCESS) {
+            oracle_accepted++;
+        } else {
+            oracle_refused++;
+        }
     }
-    REQUIRE(refusals != 0);
+    REQUIRE(refusals == words - cudec_detail::kGDeflateNumStreams);
+    REQUIRE(oracle_refused != 0);
+    REQUIRE(oracle_accepted != 0);
     GDeflatePageState st;
     uint64_t got = 0;
     REQUIRE(GDeflateDecodePage(st, pages[0].data(), pages[0].size(),
