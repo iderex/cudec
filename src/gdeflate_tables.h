@@ -459,6 +459,13 @@ CUDEC_HOST_DEVICE inline bool GDeflateReadCodeLengths(
 
     GDeflatePrecodeTable precode;
     if (!GDeflateBuildTable(precode_lens, kGDeflateNumPrecodeSyms, precode)) {
+        /* The flag, not just the return. A precode that is not a code is bad
+         * input like any other refusal here, and this header's own contract
+         * says a caller that checks the sticky flag once at the end reads the
+         * same verdict as one that checks after every call - so a refusal that
+         * left the flag clear would break that contract silently. Found by
+         * fuzz/fuzz_gdeflate_tables.cpp on its first seed replay. */
+        s.failed = true;
         return false;
     }
 
