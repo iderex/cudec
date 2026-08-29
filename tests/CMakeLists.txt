@@ -178,6 +178,18 @@ cudec_add_test(gdeflate_header_twin SOURCES gdeflate_header_twin.cpp LIBS
                gdeflate_oracle)
 target_include_directories(gdeflate_header_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The GDeflate page decode (issue #182), the top of the M4 CPU ladder: block
+# dispatch, the DEFLATE64 length and distance tables, and the deferred in-tile
+# LZ77. Unlike the three rungs below it this one asks the oracle directly - the
+# reference's compressor produces the corpus and its decompressor says what the
+# pages mean, both across the library's own boundary - so it is the test that
+# makes the schedule, the table construction and the code-length read checkable
+# end to end. GPU-less and linking gdeflate_oracle alone for the reasons
+# oracle_gdeflate gives above, reaching src/ for the header under test.
+cudec_add_test(gdeflate_block_twin SOURCES gdeflate_block_twin.cpp LIBS
+               gdeflate_oracle)
+target_include_directories(gdeflate_block_twin
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.
