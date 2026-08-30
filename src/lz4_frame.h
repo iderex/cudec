@@ -10,7 +10,8 @@
  * LZ4 surface arbitrary bytes reach before anything else, and it is the gate
  * that decides which blocks the device decoder is asked about at all - so a
  * fail-open here admits a stream to the kernel rather than only to this rung.
- * src/frame.cpp includes <cuda_runtime.h> and joins the CUDA library, which
+ * src/frame.cpp reaches the device runtime through src/vendor_rt.h and joins
+ * the vendor runtime library, which
  * puts it out of reach of the one runner that could drive arbitrary bytes
  * into it: fuzz/ links no cudec archive and builds with Clang on a machine
  * with no CUDA at all. Header-only and CUDA-free is what lets the parser and

@@ -619,39 +619,226 @@ foreach(_probe host_warning device_warning)
   endif()
 endforeach()
 
-# Single-source lock (issue #40): the host-side CUDA RAII owners live once, in
-# src/cuda_raii.h, and every CUDA host translation unit reuses them instead of
-# carrying its own copy. This detector reds the build if the header stops
+# Single-source lock (issue #40): the host-side device-runtime RAII owners live
+# once, in src/vendor_raii.h, and every host translation unit reuses them
+# instead of carrying its own copy. This detector reds the build if the header stops
 # defining an owner, or if a host TU drops the include or re-introduces a local
 # owner definition. Honest limit (as with the checks above): it catches a
 # re-copy under the SAME struct names, not one smuggled in under a fresh name -
 # a drift detector, not tamper-proofing.
-set(_raii_header ${CMAKE_CURRENT_SOURCE_DIR}/../src/cuda_raii.h)
+set(_raii_header ${CMAKE_CURRENT_SOURCE_DIR}/../src/vendor_raii.h)
 if(NOT EXISTS ${_raii_header})
-  message(FATAL_ERROR "src/cuda_raii.h is missing: the shared CUDA RAII owners "
+  message(FATAL_ERROR "src/vendor_raii.h is missing: the shared RAII owners "
                       "must be single-sourced there (issue #40)")
 endif()
 file(READ ${_raii_header} _raii_src)
 foreach(_owner DevBuf PinnedBuf StreamOwner EventOwner)
   if(NOT _raii_src MATCHES "struct ${_owner}")
-    message(FATAL_ERROR "src/cuda_raii.h no longer defines the shared owner "
+    message(FATAL_ERROR "src/vendor_raii.h no longer defines the shared owner "
                         "'${_owner}' (issue #40)")
   endif()
 endforeach()
 foreach(_tu frame.cpp stream.cpp)
   file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_tu} _tu_src)
-  if(NOT _tu_src MATCHES "#include \"cuda_raii.h\"")
-    message(FATAL_ERROR "src/${_tu} no longer includes cuda_raii.h: it must "
-                        "reuse the shared CUDA RAII owners (issue #40)")
+  if(NOT _tu_src MATCHES "#include \"vendor_raii.h\"")
+    message(FATAL_ERROR "src/${_tu} no longer includes vendor_raii.h: it must "
+                        "reuse the shared RAII owners (issue #40)")
   endif()
   foreach(_owner DevBuf PinnedBuf StreamOwner EventOwner DevPtr)
     if(_tu_src MATCHES "struct ${_owner}")
       message(FATAL_ERROR "src/${_tu} defines a local 'struct ${_owner}': the "
-                          "CUDA RAII owners are single-sourced in cuda_raii.h "
+                          "RAII owners are single-sourced in vendor_raii.h "
                           "(issue #40)")
     endif()
   endforeach()
 endforeach()
+
+# ---- The vendor seam (issue #240). Two rules, and they fail for different
+# reasons, which is why neither is folded into the other.
+#
+# Both are functions over a STRING rather than passes over the tree, so each
+# one is watched refusing a planted violation and watched staying silent on a
+# planted near-miss before it is pointed at a real file. A rule that has only
+# ever run against a clean tree has not been shown to bite.
+
+# RULE ONE: src/vendor_rt.h is the only file under src/ that may name a
+# backend runtime. The port's whole claim is that frame.cpp, stream.cpp and
+# the RAII owners are ONE set of sources for both backends; a single
+# cudaMemcpy left anywhere else is a translation unit that compiles on exactly
+# one of them - and it compiles clean on the backend this machine can build,
+# which is the direction nothing else here would catch.
+#
+# The pattern matches a vendor prefix followed by an upper-case letter or an
+# underscore - cudaMalloc, hipMemcpy, cuda_runtime.h, hip_runtime.h - and is
+# deliberately narrower than the word "cuda". It must not fire on the public
+# status CUDEC_ERR_CUDA (a caller compiled against that name and this seam may
+# not move it), on the cudec_rt:: spellings the seam introduces, on prose that
+# says CUDA, or on an English word that merely contains "hip".
+function(cudec_scan_vendor_spelling _text _label _out)
+  set(_hits "")
+  # A leading space so a match at offset zero still has a left context to
+  # test; the class before the prefix is what keeps "chip" and "cudec" out.
+  if(" ${_text}" MATCHES "[^A-Za-z0-9_]((cuda|hip)[A-Z_][A-Za-z0-9_]*)")
+    string(APPEND _hits "${_label}: names a backend runtime directly "
+           "('${CMAKE_MATCH_1}'); every file under src/ except src/vendor_rt.h "
+           "reaches the runtime through cudec_rt:: (issue #240)\n")
+  endif()
+  set(${_out} "${_hits}" PARENT_SCOPE)
+endfunction()
+
+# The violating probes and the three near-misses. The near-misses are the ones
+# worth reading: each is a spelling that legitimately survives in this tree
+# today, and a rule that reddened on any of them would be switched off within
+# a week rather than repaired.
+foreach(_violating "    return cudaMalloc(&p, bytes);"
+                   "    return hipMemcpyAsync(d, s, n, k, st);"
+                   "#include <cuda_runtime.h>")
+  cudec_scan_vendor_spelling("${_violating}" "probe" _probe_hit)
+  if(NOT _probe_hit)
+    message(FATAL_ERROR "the vendor-seam rule is dead: the planted violation "
+                        "'${_violating}' was not reported (issue #240)")
+  endif()
+endforeach()
+foreach(_near "return CUDEC_ERR_CUDA;" "return cudec_rt::device_malloc(&p, n);"
+              "/* Every CUDA API error is checked, on chip and off. */")
+  cudec_scan_vendor_spelling("${_near}" "probe" _near_hit)
+  if(_near_hit)
+    message(FATAL_ERROR "the vendor-seam rule is over-wide: it reported the "
+                        "legitimate spelling '${_near}' (issue #240)")
+  endif()
+endforeach()
+
+set(_vendor_rt ${CMAKE_CURRENT_SOURCE_DIR}/../src/vendor_rt.h)
+if(NOT EXISTS ${_vendor_rt})
+  message(FATAL_ERROR "src/vendor_rt.h is missing: it is the one place a "
+                      "backend runtime is named (issue #240)")
+endif()
+# Opt-out by one path rather than opt-in by a list, for the reason the
+# termination rule states about its own glob: a new file under src/ must be
+# covered on the day it lands, not on the day somebody remembers to add it.
+file(GLOB_RECURSE _vendor_scan_sources RELATIVE
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.c
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cc
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cu
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cuh
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.hpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.inl)
+if(NOT _vendor_scan_sources)
+  message(FATAL_ERROR "the vendor-seam scan found no sources under src/ - the "
+                      "glob has stopped matching (issue #240)")
+endif()
+if(NOT vendor_rt.h IN_LIST _vendor_scan_sources)
+  message(FATAL_ERROR "src/vendor_rt.h is outside the vendor-seam glob, so the "
+                      "one file the rule exempts is a file it never saw "
+                      "(issue #240)")
+endif()
+list(REMOVE_ITEM _vendor_scan_sources vendor_rt.h)
+set(_vendor_violations "")
+foreach(_source IN LISTS _vendor_scan_sources)
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source} _vsrc)
+  cudec_scan_vendor_spelling("${_vsrc}" "src/${_source}" _found)
+  string(APPEND _vendor_violations "${_found}")
+endforeach()
+if(_vendor_violations)
+  message(FATAL_ERROR "the vendor seam has leaked:\n${_vendor_violations}")
+endif()
+
+# RULE TWO: the two arms of the mapping table carry the same operations.
+#
+# This is the part of the mapping that can be judged here at all. No ROCm
+# toolchain exists on the machine this landed from, so nothing local compiles
+# the HIP arm and no reading of this tree can say whether hipHostMalloc is the
+# right partner for cudaHostAlloc - that is the compile job in #210, and until
+# it runs the mapping is proven CONSISTENT and is not proven CORRECT. What IS
+# decidable is the failure that costs most and looks like nothing: an entry
+# added to the CUDA arm and forgotten in the HIP arm, which builds and passes
+# every gate here and reds only under a compiler nobody has.
+function(cudec_vendor_arms_agree _text _out)
+  set(_why "")
+  string(FIND "${_text}" "#if defined(__HIP_PLATFORM_AMD__)" _p_if)
+  string(FIND "${_text}" "\n#else" _p_else)
+  string(FIND "${_text}" "\n#endif" _p_endif)
+  if(_p_if LESS 0
+     OR _p_else LESS 0
+     OR _p_endif LESS 0
+     OR NOT _p_if LESS _p_else
+     OR NOT _p_else LESS _p_endif)
+    set(${_out} "the mapping table's #if/#else/#endif shape was not found; "
+        PARENT_SCOPE)
+    return()
+  endif()
+  math(EXPR _hip_len "${_p_else} - ${_p_if}")
+  math(EXPR _cuda_len "${_p_endif} - ${_p_else}")
+  string(SUBSTRING "${_text}" ${_p_if} ${_hip_len} _hip_arm)
+  string(SUBSTRING "${_text}" ${_p_else} ${_cuda_len} _cuda_arm)
+  string(REGEX MATCHALL "#define CUDEC_RT_[A-Z0-9_]+" _hip_names "${_hip_arm}")
+  string(REGEX MATCHALL "#define CUDEC_RT_[A-Z0-9_]+" _cuda_names "${_cuda_arm}")
+  list(TRANSFORM _hip_names REPLACE "#define " "")
+  list(TRANSFORM _cuda_names REPLACE "#define " "")
+  if(NOT _hip_names OR NOT _cuda_names)
+    set(${_out} "one arm defines no mapping at all; " PARENT_SCOPE)
+    return()
+  endif()
+  foreach(_n IN LISTS _cuda_names)
+    if(NOT _n IN_LIST _hip_names)
+      string(APPEND _why "${_n} is mapped for CUDA and not for HIP; ")
+    endif()
+  endforeach()
+  foreach(_n IN LISTS _hip_names)
+    if(NOT _n IN_LIST _cuda_names)
+      string(APPEND _why "${_n} is mapped for HIP and not for CUDA; ")
+    endif()
+  endforeach()
+  set(${_out} "${_why}" PARENT_SCOPE)
+endfunction()
+
+# Watched refusing in both directions and watched silent on a balanced table.
+# The two one-sided probes are one entry away from the balanced one: the
+# mistake somebody actually makes is adding a line to the arm they can
+# compile.
+set(_probe_balanced
+    "#if defined(__HIP_PLATFORM_AMD__)\n#define CUDEC_RT_MALLOC hipMalloc\n#define CUDEC_RT_FREE hipFree\n#else\n#define CUDEC_RT_MALLOC cudaMalloc\n#define CUDEC_RT_FREE cudaFree\n#endif\n"
+)
+set(_probe_cuda_only
+    "#if defined(__HIP_PLATFORM_AMD__)\n#define CUDEC_RT_MALLOC hipMalloc\n#else\n#define CUDEC_RT_MALLOC cudaMalloc\n#define CUDEC_RT_FREE cudaFree\n#endif\n"
+)
+set(_probe_hip_only
+    "#if defined(__HIP_PLATFORM_AMD__)\n#define CUDEC_RT_MALLOC hipMalloc\n#define CUDEC_RT_FREE hipFree\n#else\n#define CUDEC_RT_MALLOC cudaMalloc\n#endif\n"
+)
+set(_probe_shapeless "#define CUDEC_RT_MALLOC cudaMalloc\n")
+cudec_vendor_arms_agree("${_probe_balanced}" _arms_why)
+if(_arms_why)
+  message(FATAL_ERROR "the mapping-table rule is over-wide: it reported a "
+                      "balanced table (${_arms_why}) (issue #240)")
+endif()
+cudec_vendor_arms_agree("${_probe_cuda_only}" _arms_why)
+if(NOT _arms_why MATCHES "CUDEC_RT_FREE is mapped for CUDA and not for HIP")
+  message(FATAL_ERROR "the mapping-table rule is dead: a CUDA-only entry was "
+                      "not reported (issue #240)")
+endif()
+cudec_vendor_arms_agree("${_probe_hip_only}" _arms_why)
+if(NOT _arms_why MATCHES "CUDEC_RT_FREE is mapped for HIP and not for CUDA")
+  message(FATAL_ERROR "the mapping-table rule is dead: a HIP-only entry was "
+                      "not reported (issue #240)")
+endif()
+# A table whose two arms cannot be located must report that it read nothing,
+# never come back silent: a shape change is the one edit that would otherwise
+# turn this rule off while leaving it green.
+cudec_vendor_arms_agree("${_probe_shapeless}" _arms_why)
+if(NOT _arms_why MATCHES "shape was not found")
+  message(FATAL_ERROR "the mapping-table rule passes vacuously on a header it "
+                      "could not parse (issue #240)")
+endif()
+
+file(READ ${_vendor_rt} _vendor_rt_src)
+cudec_vendor_arms_agree("${_vendor_rt_src}" _arms_why)
+if(_arms_why)
+  message(FATAL_ERROR "src/vendor_rt.h maps the two backends unevenly: "
+                      "${_arms_why}(issue #240)")
+endif()
 
 # Single-source lock for the shared decode element (issue #150): the one
 # struct every format parser hands the chunk decoder lives once, in
@@ -1018,7 +1205,7 @@ endfunction()
 # Rule 1, single source. src/snappy_block.h exists and defines the parser
 # types; no other source under src/ defines them, and a source that names
 # SnappyParser includes the header rather than restating the ladder. This is
-# the cuda_raii.h lock (issue #40) applied to the format core: the M3 kernel
+# the vendor_raii.h lock (issue #40) applied to the format core: the M3 kernel
 # instantiates this parser, and a kernel-local copy of a validation ladder is
 # a fail-open the moment the two stop agreeing.
 #
@@ -2047,7 +2234,7 @@ file(WRITE ${_probe_dir}/scan_wrapped_after_mask.cu
 # element carries the loop and its condition. The idiom must come back silent
 # and a real loop wearing the same wrapper must not, or the clause that
 # forgives the wrapper has turned the rule off for every macro in the tree -
-# which is what the file exemption on src/cuda_raii.h was doing.
+# which is what the file exemption on src/vendor_raii.h was doing.
 #
 # Both put the #define on line 1, and the violating one asserts that line
 # number: the report lands on the macro's own line only while the join still

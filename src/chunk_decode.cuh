@@ -56,7 +56,7 @@
 #include "cudec.h"
 #include "decode_sequence.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt.h"
 
 namespace cudec_detail {
 

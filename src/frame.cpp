@@ -6,10 +6,10 @@
  * optional declared content size are verified fail-closed. Frame spec
  * (public): lz4_Frame_format.md. */
 #include "cudec.h"
-#include "cuda_raii.h"
+#include "vendor_raii.h"
 #include "lz4_frame.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt.h"
 
 #include <cstring>
 #include <vector>
@@ -28,9 +28,9 @@ using cudec_detail::Lz4FrameDescriptor;
  * to *total_out. Every CUDA failure maps to a defined status; a block the
  * decoder rejects makes the whole frame CORRUPT_INPUT.
  *
- * Staging is a single source buffer and a single destination buffer (not a
- * cudaMalloc per block): device memory stays bounded, an oversized hostile
- * frame fails fast and cleanly on one allocation instead of a per-block
+ * Staging is a single source buffer and a single destination buffer (not one
+ * device allocation per block): device memory stays bounded, an oversized
+ * hostile frame fails fast and cleanly on one allocation instead of a per-block
  * allocation storm, and the shape is closer to what the pinned-host
  * streaming path (issue #24) needs. #24 still supersedes it (overlap,
  * pinned memory, per-block dst sizing). */
@@ -38,7 +38,7 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
                                const std::vector<Lz4FrameBlock>& blocks,
                                size_t block_max, unsigned char* out,
                                size_t dst_capacity, size_t* total_out) {
-#define FRAME_CUDA(call) CUDEC_CUDA_CHECK(call, return CUDEC_ERR_CUDA)
+#define FRAME_RT(call) CUDEC_RT_CHECK(call, return CUDEC_ERR_CUDA)
 
     std::vector<size_t> cidx;
     size_t total_src = 0;
@@ -56,16 +56,17 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
     /* One-shot owners: each buffer is allocated once here and freed on every
      * scope exit. The shared grow-only DevBuf serves this by a single ensure()
      * from cap 0 - every size below is non-zero (guarded by n != 0), so the
-     * first ensure allocates exactly once, identical to a bare cudaMalloc. */
-    cudec_cuda::DevBuf d_src, d_dst, dd_meta, dd_res;
+     * first ensure allocates exactly once, identical to a bare device
+     * allocation. */
+    cudec_rt::DevBuf d_src, d_dst, dd_meta, dd_res;
     if (n != 0) {
         /* One destination slot of block_max per compressed block. Guard the
          * product against size_t overflow before asking the driver. */
         if (block_max != 0 && n > SIZE_MAX / block_max) {
             return CUDEC_ERR_CORRUPT_INPUT;
         }
-        FRAME_CUDA(d_src.ensure(total_src));
-        FRAME_CUDA(d_dst.ensure(n * block_max));
+        FRAME_RT(d_src.ensure(total_src));
+        FRAME_RT(d_dst.ensure(n * block_max));
 
         std::vector<const void*> h_src(n);
         std::vector<void*> h_dst(n);
@@ -84,8 +85,8 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
                 h_dcp[k] = block_max;
                 so += b.src_len;
             }
-            FRAME_CUDA(cudaMemcpy(d_src.p, stage.data(), total_src,
-                                  cudaMemcpyHostToDevice));
+            FRAME_RT(cudec_rt::memcpy(d_src.p, stage.data(), total_src,
+                                  cudec_rt::memcpy_h2d));
         }
 
         /* The four metadata arrays go up in ONE transfer out of one packed
@@ -107,8 +108,8 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
             return CUDEC_ERR_CORRUPT_INPUT;
         }
         const size_t meta_stride = n * sizeof(void*);
-        FRAME_CUDA(dd_meta.ensure(4 * meta_stride));
-        FRAME_CUDA(dd_res.ensure(n * sizeof(cudec_chunk_result)));
+        FRAME_RT(dd_meta.ensure(4 * meta_stride));
+        FRAME_RT(dd_res.ensure(n * sizeof(cudec_chunk_result)));
 
         /* One host staging buffer in the same layout, filled section by
          * section, so the upload is a straight copy of it. */
@@ -119,8 +120,8 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
                     meta_stride);
         std::memcpy(h_meta.data() + 3 * meta_stride, h_dcp.data(),
                     meta_stride);
-        FRAME_CUDA(cudaMemcpy(dd_meta.p, h_meta.data(), 4 * meta_stride,
-                              cudaMemcpyHostToDevice));
+        FRAME_RT(cudec_rt::memcpy(dd_meta.p, h_meta.data(), 4 * meta_stride,
+                              cudec_rt::memcpy_h2d));
 
         unsigned char* const d_meta = static_cast<unsigned char*>(dd_meta.p);
         const cudec_status launched = cudec_lz4_decompress_batch(
@@ -132,12 +133,12 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
         if (launched != CUDEC_OK) {
             return launched;
         }
-        FRAME_CUDA(cudaDeviceSynchronize());
+        FRAME_RT(cudec_rt::device_synchronize());
 
         std::vector<cudec_chunk_result> res(n);
-        FRAME_CUDA(cudaMemcpy(res.data(), dd_res.p,
+        FRAME_RT(cudec_rt::memcpy(res.data(), dd_res.p,
                               n * sizeof(cudec_chunk_result),
-                              cudaMemcpyDeviceToHost));
+                              cudec_rt::memcpy_d2h));
         for (size_t k = 0; k < n; k++) {
             /* Any per-block failure means the frame's block data is corrupt.
              * The per-block dst capacity is our internal block_max, never the
@@ -168,7 +169,7 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
     /* Place each block at its prefix offset: uncompressed blocks copied from
      * the frame, compressed blocks copied from the device.
      *
-     * Each compressed block used to cost its own blocking cudaMemcpy, which is
+     * Each compressed block used to cost its own blocking copy, which is
      * one host stall per block; the block-count sweep in docs/BENCHMARKS.md is
      * what made that visible, at roughly 34 microseconds a block. The copies
      * are now issued on one stream and drained once, and consecutive blocks
@@ -195,15 +196,15 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
      * freed device memory is a use-after-free that does not fail loudly - so
      * the guard below runs it on EVERY exit path from here on, including the
      * error returns, and the ordinary path checks its status as well. */
-    cudec_cuda::StreamOwner asm_stream;
+    cudec_rt::StreamOwner asm_stream;
     if (n != 0) {
-        FRAME_CUDA(asm_stream.create());
+        FRAME_RT(asm_stream.create());
     }
     struct AsmDrain {
-        cudaStream_t s;
+        cudec_rt::stream_t s;
         ~AsmDrain() {
             if (s != nullptr) {
-                (void)cudaStreamSynchronize(s);
+                (void)cudec_rt::stream_synchronize(s);
             }
         }
     } asm_drain{asm_stream.s};
@@ -234,10 +235,10 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
                 run_len += len;
             } else {
                 if (run_len != 0) {
-                    FRAME_CUDA(cudaMemcpyAsync(
+                    FRAME_RT(cudec_rt::memcpy_async(
                         out + run_out,
                         static_cast<unsigned char*>(d_dst.p) + run_dev, run_len,
-                        cudaMemcpyDeviceToHost, asm_stream.s));
+                        cudec_rt::memcpy_d2h, asm_stream.s));
                 }
                 run_dev = dev;
                 run_out = off;
@@ -248,17 +249,17 @@ cudec_status DecodeAndAssemble(const unsigned char* frame,
         }
     }
     if (run_len != 0) {
-        FRAME_CUDA(cudaMemcpyAsync(
+        FRAME_RT(cudec_rt::memcpy_async(
             out + run_out, static_cast<unsigned char*>(d_dst.p) + run_dev,
-            run_len, cudaMemcpyDeviceToHost, asm_stream.s));
+            run_len, cudec_rt::memcpy_d2h, asm_stream.s));
     }
     if (n != 0) {
-        FRAME_CUDA(cudaStreamSynchronize(asm_stream.s));
+        FRAME_RT(cudec_rt::stream_synchronize(asm_stream.s));
     }
 
     *total_out = total;
     return CUDEC_OK;
-#undef FRAME_CUDA
+#undef FRAME_RT
 }
 
 /* The frame decode proper; wrapped by the extern "C" entry point in a
