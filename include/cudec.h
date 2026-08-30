@@ -106,7 +106,18 @@ typedef char cudec_chunk_result_layout_check
  * everywhere. A rejected call makes no CUDA call and leaves the thread's
  * pending CUDA error state untouched; a call that passes validation
  * consumes that pending state (cudaGetLastError semantics), so the
- * returned status reflects this submission alone. */
+ * returned status reflects this submission alone.
+ *
+ * A call that passes validation then asks the runtime for the current
+ * device's wave width and launches the kernel built for it. Two synchronous
+ * failures come from that step and neither one launches: the query itself
+ * failing returns CUDEC_ERR_CUDA, and a device reporting a wave width this
+ * build has no kernel for returns CUDEC_ERR_UNSUPPORTED. The second one is
+ * refused rather than approximated on purpose - launching a kernel built for
+ * a different width would map chunks onto lanes that are not there, so the
+ * refusal is the fail-closed answer and not a missing feature that will be
+ * papered over later. Neither status is reachable on any CUDA device, all of
+ * which report 32. */
 cudec_status cudec_lz4_decompress_batch(const void* const* d_src_ptrs,
                                         const size_t* d_src_sizes,
                                         void* const* d_dst_ptrs,

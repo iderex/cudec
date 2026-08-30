@@ -2431,6 +2431,25 @@ that is normally the most invasive part of a HIP port does not arise here
 at all. What is left is arithmetic that assumes a width, and the parameter
 is what removes the assumption.
 
+**Landed** in two halves: the kernel family in #241, the host dispatch in
+#242. The dispatch asks `src/vendor_rt.h` for the width a launch is built
+for and selects the instantiation from the answer; a width this build emits
+no kernel for is refused with `CUDEC_ERR_UNSUPPORTED` rather than
+approximated by the 32-lane kernel, because a block that is not a whole
+number of waves leaves output bytes written by nobody.
+
+Where the width comes from is a backend difference and is written in the
+seam rather than at the dispatch. On CUDA it is a constant - every CUDA
+device reports 32 - so a submission there gains no call that can fail. On
+HIP it is read from the device, and a query that fails is
+`CUDEC_ERR_CUDA` rather than a default.
+
+**The wave64 branch has never executed.** No machine in this project has a
+wave64 device and no hosted runner carries an AMD GPU, so what is proven is
+that both instantiations are emitted into the shipped translation unit and
+that the selection returns the wave64 arm for a width of 64. The first run
+on wave64 silicon is #415.
+
 ### 15.3 ROCm 7.0 is the floor, because `__syncwarp` is load-bearing
 
 Section 9's discipline is warp-synchronous and every `__syncwarp` in the
