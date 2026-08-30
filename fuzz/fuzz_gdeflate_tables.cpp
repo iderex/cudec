@@ -38,11 +38,14 @@
  * as tables and never through a decoded match. */
 #include "gdeflate_tables.h"
 
+#include "gdeflate_structure.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -166,6 +169,43 @@ void ProbeSymbols(const Table& table, const unsigned char* lens,
 }
 
 }  // namespace
+
+/* The structure-aware mutator (issue #193). The envelope this target owns is
+ * one selector byte; everything behind it is read both as a length vector and
+ * as a page, so a structurally valid page behind a random selector exercises
+ * arm B without taking arm A away - arm A reads the same bytes as lengths and
+ * a page's words are as good a vector as any other bytes are.
+ *
+ * A branch that cannot produce an input falls through to libFuzzer's own
+ * mutator rather than returning the buffer unchanged: returning `size` with
+ * nothing altered feeds the engine a duplicate and costs an exec. */
+extern "C" size_t LLVMFuzzerCustomMutator(uint8_t* data, size_t size,
+                                          size_t max_size, unsigned int seed) {
+    if (!cudec_fuzz::StructuredEnabled()) {
+        return LLVMFuzzerMutate(data, size, max_size);
+    }
+    cudec_fuzz::Rng rng(seed);
+    const uint32_t choice = rng.Below(4);
+    if (choice < 2 && max_size > kMinPageBytes + 1u) {
+        /* A short tail rather than the writer's: refill past the last word is
+         * a branch this decoder refuses explicitly, and it is reachable only
+         * when the page ends. */
+        std::vector<unsigned char> page = cudec_fuzz::SynthPage(rng, 8u);
+        size_t room = (max_size - 1u) & ~static_cast<size_t>(3);
+        if (page.size() > room) {
+            page.resize(room);
+        }
+        if (page.size() >= kMinPageBytes) {
+            data[0] = static_cast<uint8_t>(rng.Below(256u));
+            std::memcpy(data + 1, page.data(), page.size());
+            return page.size() + 1u;
+        }
+    } else if (choice == 2 && size > 1u) {
+        cudec_fuzz::PerturbTail(rng, data, size, 1u);
+        return size;
+    }
+    return LLVMFuzzerMutate(data, size, max_size);
+}
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     /* One selector byte, then the payload. The selector decides how wide the

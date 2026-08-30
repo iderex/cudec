@@ -41,6 +41,7 @@
 #include "gdeflate_tables.h"
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace cudec_test {
@@ -49,6 +50,22 @@ namespace cudec_test {
  * symbols, so the shape that is easiest to reason about wins over the shape
  * that is compact. */
 using LaneBits = std::vector<unsigned char>;
+
+/* Slack for the reference's unchecked refill, not a property of the format.
+ * Sized for the fixture that deliberately drives the reference past the
+ * emitted words - an all-zero literal/length vector is an empty code, which
+ * the reference resolves to a synthetic literal that consumes one bit and
+ * produces one byte until the output buffer is full, so the words it asks for
+ * are bounded by the output cap and not by anything the page said. 16 KiB of
+ * zeros covers that cap with room, and a page here is still a quarter of the
+ * 64 KiB the format allows.
+ *
+ * DECLARED HERE RATHER THAN INSIDE THE WRITER because a caller that wants the
+ * emitted words WITHOUT this tail has to subtract it, and the alternative is
+ * scanning back over trailing zeros - which silently eats an emitted word that
+ * happened to be zero. fuzz/gdeflate_structure.h is that caller (issue #193).
+ */
+constexpr uint32_t kGDeflateWriterTailWords = 4096;
 
 class GDeflatePageWriter {
    public:
@@ -145,15 +162,7 @@ class GDeflatePageWriter {
     static constexpr uint32_t kStreams = 32;
     static constexpr uint32_t kPacket = 32;
     static constexpr uint32_t kWatermark = 32;
-    /* See the file comment: slack for the reference's unchecked refill, not a
-     * property of the format. Sized for the fixture that deliberately drives
-     * the reference past the emitted words - an all-zero literal/length vector
-     * is an empty code, which the reference resolves to a synthetic literal
-     * that consumes one bit and produces one byte until the output buffer is
-     * full, so the words it asks for are bounded by the output cap and not by
-     * anything the page said. 16 KiB of zeros covers that cap with room, and a
-     * page here is still a quarter of the 64 KiB the format allows. */
-    static constexpr uint32_t kTailWords = 4096;
+    static constexpr uint32_t kTailWords = kGDeflateWriterTailWords;
 
     LaneBits lane_[kStreams];
     uint32_t bitsleft_[kStreams];
@@ -216,6 +225,201 @@ inline bool CodewordOf(const Table& t, const unsigned char* lens, uint32_t sym,
         }
     }
     return false;
+}
+
+/* THE DYNAMIC-BLOCK EMITTER BELOW WAS LIFTED OUT OF ONE FIXTURE FILE (issue
+ * #193). It emitted the pages tests/gdeflate_header_twin.cpp needed and lived
+ * in that file's anonymous namespace, so the fuzz layer that now needs the
+ * same pages could only have had a second copy of the decoder's round order -
+ * the one thing this header exists to hold exactly once. What moved is the
+ * whole emitter and not a slice of it: a token stream, the precode plan the
+ * permutation forces, and the page those two produce. Nothing about it
+ * changed in the move, which is why the fixtures that drive it are unchanged
+ * too.
+ */
+
+/* DEFLATE_BLOCKTYPE_DYNAMIC_HUFFMAN in the reference's deflate_constants.h. */
+constexpr uint32_t kBlockTypeDynamic = 2;
+/* The end-of-block symbol, the one literal/length symbol every fixture here
+ * has to code for the reference to finish a block. */
+constexpr uint32_t kEndOfBlock = 256;
+
+/* One element of the code-length stream: a precode symbol and, for the three
+ * repeat codes, the extra-bit field that follows it in the SAME round. */
+struct LenToken {
+    uint32_t presym;
+    uint32_t extra_bits;
+    uint32_t extra_value;
+};
+
+/* Run-length encode a concatenated length vector the way a compressor does,
+ * using all three repeat codes wherever they apply. This is what puts codes
+ * 16, 17 and 18 into the fixtures at all: an explicit-only encoding is a legal
+ * header that never reaches the branches this issue is about. */
+inline std::vector<LenToken> BuildTokens(const std::vector<unsigned char>& all) {
+    std::vector<LenToken> out;
+    size_t i = 0;
+    for (uint32_t guard = 0; guard < 1024u && i < all.size(); guard++) {
+        const unsigned char v = all[i];
+        size_t run = 1;
+        for (size_t j = i + 1; j < all.size() && all[j] == v; j++) {
+            run++;
+        }
+        if (v == 0) {
+            for (uint32_t g = 0; g < 1024u && run >= 11; g++) {
+                const size_t take = run < 138 ? run : 138;
+                out.push_back({18, 7, static_cast<uint32_t>(take - 11)});
+                i += take;
+                run -= take;
+            }
+            for (uint32_t g = 0; g < 1024u && run >= 3; g++) {
+                const size_t take = run < 10 ? run : 10;
+                out.push_back({17, 3, static_cast<uint32_t>(take - 3)});
+                i += take;
+                run -= take;
+            }
+        } else {
+            out.push_back({v, 0, 0});
+            i++;
+            run--;
+            for (uint32_t g = 0; g < 1024u && run >= 3; g++) {
+                const size_t take = run < 6 ? run : 6;
+                out.push_back({16, 2, static_cast<uint32_t>(take - 3)});
+                i += take;
+                run -= take;
+            }
+        }
+        for (size_t k = 0; k < run; k++) {
+            out.push_back({v, 0, 0});
+            i++;
+        }
+    }
+    return out;
+}
+
+/* Precode lengths covering exactly the symbols the token stream uses, in the
+ * shape CompleteLengths gives, plus the smallest HCLEN that reaches them all.
+ * `forced_explicit` overrides that count where a fixture is about the field
+ * rather than about the vector; 0 means derive it. */
+inline bool PlanPrecode(const std::vector<LenToken>& toks, uint32_t forced_explicit,
+                 unsigned char precode_lens[cudec_detail::kGDeflateNumPrecodeSyms],
+                 uint32_t* num_explicit) {
+    unsigned char used[cudec_detail::kGDeflateNumPrecodeSyms];
+    std::memset(used, 0, sizeof(used));
+    for (size_t i = 0; i < toks.size(); i++) {
+        if (toks[i].presym >= cudec_detail::kGDeflateNumPrecodeSyms) {
+            return false;
+        }
+        used[toks[i].presym] = 1;
+    }
+    uint32_t n_used = 0;
+    for (uint32_t v = 0; v < cudec_detail::kGDeflateNumPrecodeSyms; v++) {
+        n_used += used[v];
+    }
+    const std::vector<unsigned char> shape = CompleteLengths(n_used);
+    std::memset(precode_lens, 0, cudec_detail::kGDeflateNumPrecodeSyms);
+    uint32_t k = 0;
+    for (uint32_t v = 0; v < cudec_detail::kGDeflateNumPrecodeSyms; v++) {
+        if (used[v]) {
+            precode_lens[v] = shape[k++];
+        }
+    }
+    /* The permutation is what decides how many lengths the header must state:
+     * a symbol at position p is only reachable when HCLEN + 4 exceeds p. */
+    uint32_t needed = 4;
+    for (uint32_t i = 0; i < cudec_detail::kGDeflateNumPrecodeSyms; i++) {
+        if (used[cudec_detail::GDeflatePrecodeOrder(i)] && i + 1u > needed) {
+            needed = i + 1u;
+        }
+    }
+    if (forced_explicit != 0) {
+        if (forced_explicit < needed) {
+            return false;
+        }
+        needed = forced_explicit;
+    }
+    *num_explicit = needed;
+    return true;
+}
+
+/* Emit one whole page: a single final dynamic block whose header carries
+ * `toks` and whose body encodes `symbols`. Every round here mirrors
+ * gdeflate_decompress_template.h in the pinned fork - the header fields ride
+ * lane 0 with no round between them, each precode length is its own round,
+ * and a repeat code's extra bits are pushed before the round ends. */
+inline bool EmitPage(const std::vector<unsigned char>& litlen_lens,
+              const std::vector<unsigned char>& dist_lens,
+              const std::vector<LenToken>& toks,
+              const unsigned char precode_lens[cudec_detail::kGDeflateNumPrecodeSyms],
+              uint32_t num_explicit, const std::vector<uint32_t>& symbols,
+              std::vector<unsigned char>* page) {
+    cudec_detail::GDeflatePrecodeTable precode;
+    if (!cudec_detail::GDeflateBuildTable(precode_lens, cudec_detail::kGDeflateNumPrecodeSyms, precode)) {
+        return false;
+    }
+    cudec_detail::GDeflateLitLenTable litlen;
+    const bool litlen_ok =
+        cudec_detail::GDeflateBuildTable(litlen_lens.data(),
+                           static_cast<uint32_t>(litlen_lens.size()), litlen);
+
+    GDeflatePageWriter w;
+    w.Reset();
+    w.Push(1, 1);                 /* BFINAL: one block per page here. */
+    w.Push(2, kBlockTypeDynamic); /* BTYPE */
+    w.Ensure();
+    w.Push(5, static_cast<uint32_t>(litlen_lens.size()) - 257u); /* HLIT */
+    w.Push(5, static_cast<uint32_t>(dist_lens.size()) - 1u);     /* HDIST */
+    w.Push(4, num_explicit - 4u);                                /* HCLEN */
+    w.Ensure();
+    for (uint32_t i = 0; i < num_explicit; i++) {
+        w.Push(3, precode_lens[cudec_detail::GDeflatePrecodeOrder(i)]);
+        w.Advance();
+    }
+    w.Reset();
+    for (size_t i = 0; i < toks.size(); i++) {
+        uint32_t code = 0;
+        uint32_t len = 0;
+        if (!CodewordOf(precode, precode_lens, toks[i].presym, &code, &len)) {
+            return false;
+        }
+        w.PushCode(code, len);
+        if (toks[i].extra_bits != 0) {
+            w.Push(toks[i].extra_bits, toks[i].extra_value);
+        }
+        w.Advance();
+    }
+
+    if (!symbols.empty()) {
+        if (!litlen_ok) {
+            return false;
+        }
+        w.Reset();
+        for (size_t i = 0; i < symbols.size(); i++) {
+            uint32_t code = 0;
+            uint32_t len = 0;
+            if (!CodewordOf(litlen, litlen_lens.data(), symbols[i], &code,
+                            &len)) {
+                return false;
+            }
+            w.PushCode(code, len);
+            if (symbols[i] == kEndOfBlock) {
+                /* The reference leaves the decode loop on end-of-block without
+                 * advancing, then runs 32 rounds to drain deferred copies.
+                 * Those rounds refill, so the writer owes their words. */
+                break;
+            }
+            w.Advance();
+        }
+        for (uint32_t i = 0; i < cudec_detail::kGDeflateNumStreams; i++) {
+            w.Advance();
+        }
+    }
+
+    if (!w.ok()) {
+        return false;
+    }
+    *page = w.Finish();
+    return true;
 }
 
 }  // namespace cudec_test

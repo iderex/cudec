@@ -98,6 +98,40 @@ without waiting for a real divergence to turn up, and it is never the binary
 whose findings are read. A `_selftest` binary that runs to its time limit
 instead of trapping means the harness has stopped comparing.
 
+## The structure-aware layer over the two GDeflate targets
+
+A GDeflate page is 32 least-significant-bit-first streams interleaved word by
+word in the order a decoder's refills happen, so a block header is spread
+across 32 lanes and every field in it sits at a bit offset that depends on
+every field before it. Random bytes die in the code-length rounds, and the
+table construction, the block loop and the in-tile LZ77 behind them are never
+entered. `gdeflate_structure.h` is the answer: a generator of pages whose
+envelope is correct by construction - BFINAL, BTYPE, HLIT, HDIST, HCLEN, a
+precode that is a code, and literal/length and distance vectors that are codes
+
+- and whose interior is whatever the engine's bytes say. It emits through
+  `cudec_test::EmitPage`, the same mirror of `src/gdeflate_schedule.h` the header
+  fixtures drive, so the round order exists once.
+
+It is switchable off at run time, and the switch is what the numbers below were
+taken with:
+
+```
+CUDEC_FUZZ_STRUCTURED=0 scripts/fuzz-coverage.sh build-fuzz fuzz_gdeflate_page 60 1
+CUDEC_FUZZ_STRUCTURED=1 scripts/fuzz-coverage.sh build-fuzz fuzz_gdeflate_page 60 1
+```
+
+An environment switch rather than a build one, so both arms of the comparison
+are the same binary. Unstructured mutation keeps running inside the layer as
+well: only half of its mutations synthesise a page, a quarter perturb the words
+behind an envelope, and a quarter are handed to libFuzzer's own mutator.
+
+`scripts/fuzz-coverage.sh` is the route from a run to a figure. It reports the
+`cov:` count off libFuzzer's `DONE` line - the instrumented edges the run
+executed - and refuses a run that produced no such line, which is what a crash
+or a kill leaves behind. What it cannot do is attribute an edge to a source
+line, and it does not claim to.
+
 ## Regression seeds
 
 An input that ever crashed a target, tripped a sanitizer, or diverged from a
