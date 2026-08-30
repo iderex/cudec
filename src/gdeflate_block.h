@@ -58,6 +58,12 @@ constexpr uint32_t kGDeflateBlockStatic = 1;
 constexpr uint32_t kGDeflateBlockDynamic = 2;
 constexpr uint32_t kGDeflateBlockReserved = 3;
 
+/* The block types a decoded page can be made OF, which is one fewer than the
+ * BTYPE field can spell. The reserved type is refused before anything is
+ * accounted for it, so it never indexes the census below and the census array
+ * is deliberately too short to hold it. */
+constexpr uint32_t kGDeflateBlockTypeCount = 3;
+
 /* The literal/length alphabet's first length symbol, and the end-of-block
  * symbol below it. */
 constexpr uint32_t kGDeflateEndOfBlock = 256;
@@ -158,6 +164,16 @@ struct GDeflatePageState {
      * nothing outside says which, so without this the multi-block case cannot
      * be told from the single-block one by anything that reads a decode. */
     uint32_t blocks;
+    /* What the page turned out to be MADE OF, in the same sense `blocks` is
+     * what it turned out to hold: how many blocks of each type it carried and
+     * how many output bytes each type produced, indexed by the BTYPE
+     * constants above. A block boundary inside a page is not findable by
+     * scanning (docs/MASTERPLAN.md section 11.3), so a decode that walked to
+     * a block is the only thing that can attribute a byte to its type, and
+     * without this the attribution is unreadable from outside (issue #206).
+     * Written only on a successful decode, like `blocks`. */
+    uint32_t type_blocks[kGDeflateBlockTypeCount];
+    uint64_t type_bytes[kGDeflateBlockTypeCount];
 };
 
 /* Perform the copy the current lane reserved: decode the distance symbol off
@@ -231,8 +247,11 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
         (s.word_count + 1u) * (kGDeflateMaxLaneBits / kGDeflateMinMatchLen);
     bool final_block = false;
     uint32_t blocks_read = 0;
+    uint32_t type_blocks[kGDeflateBlockTypeCount] = {0, 0, 0};
+    uint64_t type_bytes[kGDeflateBlockTypeCount] = {0, 0, 0};
     for (uint64_t block = 0; block < block_fuel && !final_block; block++) {
         blocks_read++;
+        const uint64_t block_out_start = out_pos;
         GDeflateReset(s);
         final_block = GDeflatePop(s, 1) != 0;
         const uint32_t block_type = GDeflatePop(s, 2);
@@ -377,12 +396,25 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
                 }
             }
         }
+
+        /* BTYPE is two bits and the reserved value returned above, so the
+         * index is inside the census by construction rather than by a bound
+         * checked here. The byte count is the output cursor's movement across
+         * the whole block, drain included: a match reserved inside this block
+         * moved the cursor when it was reserved, and the copy that retires it
+         * writes into the range that move already claimed. */
+        type_blocks[block_type]++;
+        type_bytes[block_type] += out_pos - block_out_start;
     }
     if (!final_block) {
         s.failed = true;
         return false;
     }
     st.blocks = blocks_read;
+    for (uint32_t n = 0; n < kGDeflateBlockTypeCount; n++) {
+        st.type_blocks[n] = type_blocks[n];
+        st.type_bytes[n] = type_bytes[n];
+    }
     *out_len = out_pos;
     return true;
 }

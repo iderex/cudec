@@ -1782,6 +1782,224 @@ carries the methodology its own numbers were taken under.
 - decode throughput: p50 0.335 GB/s / p90 0.315 GB/s / p99 0.307 GB/s
 ```
 
+## M4 perf lever: the block-type mix, retired on the census (issue #206)
+
+**The lever, and why it is answered here instead of on a device.** Stored and
+static-Huffman blocks are the cheap block types: a stored block carries no
+table and a static one uses the fixed code. A decode path specialised for them
+would be a second route through a security-critical round loop, and every
+branch of it would have to be re-covered by the validation ladder. What it
+could buy is bounded by how much of a real corpus is made of those blocks, and
+that is a property of what the compressor emits rather than of any kernel. So
+the count decides the lever before a kernel exists, which is the order #206
+fixed: count first, then decide.
+
+**The pre-registered rule this run was taken under**, written on #206 before
+the measurement: only if the mix is materially non-trivial is the
+specialisation implemented and measured, and "the mix does not justify a second
+path" is a full result to be recorded as one. The forced stored/static corpora
+in the M4 corpus set are decode-path coverage and are excluded from the
+argument by the same rule, because they are synthetic by construction.
+
+**Counting the openings would have answered the wrong question, and it would
+have answered it in the direction that flatters the lever.** A GDeflate block
+boundary is not findable by scanning (section 11.3), so the walk in
+`bench_gdeflate --blocktypes` reads the first block header of each page and
+stops. A stored block's length field is sixteen bits, and 65535 is one byte
+short of a page, so a full page of stored data is at least two stored blocks,
+always, while a page that uses a table can be one. A histogram of openings
+therefore undercounts exactly the block type the lever is about. What reaches a
+page's second block is a decode, so this census walks every page with cudec's
+own page decoder (`src/gdeflate_block.h`) and reads the per-type counts it
+produces.
+
+The census is taken over the same corpora and the same compressor pin as the M4
+CPU denominator above -- the eight corpus digests below reproduce the eight
+recorded in that entry byte for byte, which is what makes this a census of that
+corpus rather than of one resembling it. Recorded 2026-08-30. Reproduce with
+`bench_gdeflate --blockmix bench/corpora/silesia/*` and
+`bench_gdeflate --blockmix --assetlike`; nothing is timed and no figure here is
+a denominator.
+
+| corpus     | level | pages | blocks | blocks/page | stored blocks | static blocks | dynamic blocks | stored bytes | static bytes | dynamic bytes |
+| ---------- | ----- | ----- | ------ | ----------- | ------------- | ------------- | -------------- | ------------ | ------------ | ------------- |
+| Silesia    | 0     | 3234  | 6467   | 2.000       | 100.0000%     | 0.0000%       | 0.0000%        | 100.0000%    | 0.0000%      | 0.0000%       |
+| Silesia    | 1     | 3234  | 6742   | 2.085       | 0.0148%       | 0.0148%       | 99.9703%       | 0.0057%      | 0.0059%      | 99.9883%      |
+| Silesia    | 6     | 3234  | 6767   | 2.092       | 0.0296%       | 0.0443%       | 99.9261%       | 0.0115%      | 0.0255%      | 99.9630%      |
+| Silesia    | 12    | 3234  | 7308   | 2.260       | 0.0137%       | 0.0137%       | 99.9726%       | 0.0057%      | 0.0096%      | 99.9847%      |
+| asset-like | 0     | 3200  | 6400   | 2.000       | 100.0000%     | 0.0000%       | 0.0000%        | 100.0000%    | 0.0000%      | 0.0000%       |
+| asset-like | 1     | 3200  | 9600   | 3.000       | 0.0000%       | 0.0000%       | 100.0000%      | 0.0000%      | 0.0000%      | 100.0000%     |
+| asset-like | 6     | 3200  | 9600   | 3.000       | 0.0000%       | 0.0000%       | 100.0000%      | 0.0000%      | 0.0000%      | 100.0000%     |
+| asset-like | 12    | 3200  | 9600   | 3.000       | 0.0000%       | 0.0000%       | 100.0000%      | 0.0000%      | 0.0000%      | 100.0000%     |
+
+The table is a reading aid. The eight blocks below are the record.
+
+```
+## bench_gdeflate block-type mix
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, ratio 1.0021, cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- compressor: the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05, compression level 0
+- corpus digest: 88ed82d5ec9df3ad
+- read by: cudec's own page decoder (src/gdeflate_block.h), every page required to decode to its source bytes and every block and byte attributed to a type; this is a whole-page census and not a walk over openings
+- blocks: 6467 over 3234 pages (2.000 per page), 211938580 output bytes
+| type    | blocks | share of blocks | output bytes | share of bytes |
+| ------- | ------ | --------------- | ------------ | -------------- |
+| stored  |   6467 |       100.0000% |    211938580 |      100.0000% |
+| static  |      0 |         0.0000% |            0 |        0.0000% |
+| dynamic |      0 |         0.0000% |            0 |        0.0000% |
+```
+
+```
+## bench_gdeflate block-type mix
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, ratio 0.3581, cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- compressor: the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05, compression level 1
+- corpus digest: 131124d155e6672b
+- read by: cudec's own page decoder (src/gdeflate_block.h), every page required to decode to its source bytes and every block and byte attributed to a type; this is a whole-page census and not a walk over openings
+- blocks: 6742 over 3234 pages (2.085 per page), 211938580 output bytes
+| type    | blocks | share of blocks | output bytes | share of bytes |
+| ------- | ------ | --------------- | ------------ | -------------- |
+| stored  |      1 |         0.0148% |        12100 |        0.0057% |
+| static  |      1 |         0.0148% |        12604 |        0.0059% |
+| dynamic |   6740 |        99.9703% |    211913876 |       99.9883% |
+```
+
+```
+## bench_gdeflate block-type mix
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, ratio 0.3343, cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- compressor: the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05, compression level 6
+- corpus digest: 042b2473240db0b0
+- read by: cudec's own page decoder (src/gdeflate_block.h), every page required to decode to its source bytes and every block and byte attributed to a type; this is a whole-page census and not a walk over openings
+- blocks: 6767 over 3234 pages (2.092 per page), 211938580 output bytes
+| type    | blocks | share of blocks | output bytes | share of bytes |
+| ------- | ------ | --------------- | ------------ | -------------- |
+| stored  |      2 |         0.0296% |        24378 |        0.0115% |
+| static  |      3 |         0.0443% |        53991 |        0.0255% |
+| dynamic |   6762 |        99.9261% |    211860211 |       99.9630% |
+```
+
+```
+## bench_gdeflate block-type mix
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, ratio 0.3198, cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- compressor: the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05, compression level 12
+- corpus digest: 4b88e13a215ed884
+- read by: cudec's own page decoder (src/gdeflate_block.h), every page required to decode to its source bytes and every block and byte attributed to a type; this is a whole-page census and not a walk over openings
+- blocks: 7308 over 3234 pages (2.260 per page), 211938580 output bytes
+| type    | blocks | share of blocks | output bytes | share of bytes |
+| ------- | ------ | --------------- | ------------ | -------------- |
+| stored  |      1 |         0.0137% |        12092 |        0.0057% |
+| static  |      1 |         0.0137% |        20300 |        0.0096% |
+| dynamic |   7306 |        99.9726% |    211906188 |       99.9847% |
+```
+
+```
+## bench_gdeflate block-type mix
+- corpus: asset-like, 3200 pages, 209.72 MB original, ratio 1.0021, generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- compressor: the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05, compression level 0
+- corpus digest: 08ac6ec118b60189
+- read by: cudec's own page decoder (src/gdeflate_block.h), every page required to decode to its source bytes and every block and byte attributed to a type; this is a whole-page census and not a walk over openings
+- blocks: 6400 over 3200 pages (2.000 per page), 209715200 output bytes
+| type    | blocks | share of blocks | output bytes | share of bytes |
+| ------- | ------ | --------------- | ------------ | -------------- |
+| stored  |   6400 |       100.0000% |    209715200 |      100.0000% |
+| static  |      0 |         0.0000% |            0 |        0.0000% |
+| dynamic |      0 |         0.0000% |            0 |        0.0000% |
+```
+
+```
+## bench_gdeflate block-type mix
+- corpus: asset-like, 3200 pages, 209.72 MB original, ratio 0.7105, generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- compressor: the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05, compression level 1
+- corpus digest: 45690d97a5d3b054
+- read by: cudec's own page decoder (src/gdeflate_block.h), every page required to decode to its source bytes and every block and byte attributed to a type; this is a whole-page census and not a walk over openings
+- blocks: 9600 over 3200 pages (3.000 per page), 209715200 output bytes
+| type    | blocks | share of blocks | output bytes | share of bytes |
+| ------- | ------ | --------------- | ------------ | -------------- |
+| stored  |      0 |         0.0000% |            0 |        0.0000% |
+| static  |      0 |         0.0000% |            0 |        0.0000% |
+| dynamic |   9600 |       100.0000% |    209715200 |      100.0000% |
+```
+
+```
+## bench_gdeflate block-type mix
+- corpus: asset-like, 3200 pages, 209.72 MB original, ratio 0.7029, generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- compressor: the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05, compression level 6
+- corpus digest: 47dad3ea983dc577
+- read by: cudec's own page decoder (src/gdeflate_block.h), every page required to decode to its source bytes and every block and byte attributed to a type; this is a whole-page census and not a walk over openings
+- blocks: 9600 over 3200 pages (3.000 per page), 209715200 output bytes
+| type    | blocks | share of blocks | output bytes | share of bytes |
+| ------- | ------ | --------------- | ------------ | -------------- |
+| stored  |      0 |         0.0000% |            0 |        0.0000% |
+| static  |      0 |         0.0000% |            0 |        0.0000% |
+| dynamic |   9600 |       100.0000% |    209715200 |      100.0000% |
+```
+
+```
+## bench_gdeflate block-type mix
+- corpus: asset-like, 3200 pages, 209.72 MB original, ratio 0.6995, generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- compressor: the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05, compression level 12
+- corpus digest: cb272ab3765d8378
+- read by: cudec's own page decoder (src/gdeflate_block.h), every page required to decode to its source bytes and every block and byte attributed to a type; this is a whole-page census and not a walk over openings
+- blocks: 9600 over 3200 pages (3.000 per page), 209715200 output bytes
+| type    | blocks | share of blocks | output bytes | share of bytes |
+| ------- | ------ | --------------- | ------------ | -------------- |
+| stored  |      0 |         0.0000% |            0 |        0.0000% |
+| static  |      0 |         0.0000% |            0 |        0.0000% |
+| dynamic |   9600 |       100.0000% |    209715200 |      100.0000% |
+```
+
+**The verdict: the mix does not justify a second path, and the corpus splits
+into two populations rather than one.** Where the compressor compresses --
+levels 1, 6 and 12, on both corpora -- stored and static blocks together are at
+most **0.0739% of blocks and 0.0370% of the produced bytes**, which is five
+blocks of 6767 and 78369 bytes of 211938580 at Silesia level 6, the worst of
+the six cells. On the
+asset-like corpus they are exactly zero at every one of those levels. A
+specialised path acting on one part in two thousand seven hundred of the output
+cannot pay for a second route through the round loop, and the accept rule #206
+pre-registered asks for a recorded improvement on a non-synthetic corpus, which
+that share cannot produce.
+
+**Level 0 is 100% stored on both corpora and it is not the counter-example it
+looks like.** It is the one block-type guarantee the reference's own header
+gives -- level 0 emits uncompressed blocks by construction -- so that cell is
+the compressor declining to compress rather than a workload with cheap blocks
+in it. Two readings say it does not reopen the lever. First, the M4 CPU
+denominator above records level 0 as the FASTEST family on both corpora, 0.692
+and 0.678 GB/s against 0.292 to 0.373 for every compressed level, so a
+specialisation there would accelerate the case that is already fastest and
+leave the binding one untouched. Second, the stored block is not on the round
+loop to begin with: `src/gdeflate_block.h` dispatches it to its own byte loop
+that builds no table and enters no round, so the "cheap block paying the full
+round-loop machinery" the lever is named for is not what the decoder does. What
+the census leaves for a specialisation to act on is therefore the static blocks
+alone, and they are 0.0137% to 0.0443% of blocks.
+
+**What this closes and what it does not.** It closes #206: no kernel code ships
+and the second decode path is not built. It does NOT relieve the M4 kernel of
+giving stored and static blocks their own arms -- those arms are the format's
+block-type dispatch and are mandatory, not a specialisation -- and it says
+nothing about the round loop's cost on dynamic blocks, which is where 99.9% of
+the work is and which #204, #205 and #207 measure.
+
+**What this does not cover, stated as a bound rather than left to be assumed.**
+Two corpora (Silesia and the asset-like model), one compressor (the pinned
+NVIDIA/libdeflate gdeflate fork at the commit named in every block below), the
+four levels the M4 corpus set names, and the 64 KiB page granularity the format
+fixes. A different compressor, or a producer emitting stored blocks
+deliberately, could carry a materially higher share, and neither was measured.
+
+**A census that had collapsed back into a walk over openings would print the
+same shape, so something that runs separates the two.**
+`bench_gdeflate_blockmix_selfcheck` holds every page to decoding to its source
+bytes, holds the per-type counts to summing to the page's own block count and
+the per-type byte counts to summing to the page's output, and then holds the
+level-0 cell to two things it cannot satisfy by accident: every block stored,
+which is the compressor's own guarantee, and at least two blocks for every page
+larger than a stored block's length field can express, which no walk over
+openings can produce. Attributing every block to one type reds it on the first;
+attributing bytes from the page start rather than the block start reds it on
+the sum; counting one block per page -- the opening-walk reading -- reds it on
+the second.
+
 ## M5: the Zstd CPU denominator (issue #227)
 
 There is no Zstd kernel yet. This entry is the denominator a later device

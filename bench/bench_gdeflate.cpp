@@ -57,6 +57,7 @@
 
 #include <libdeflate.h>
 
+#include "gdeflate_block.h"
 #include "gdeflate_schedule.h"
 #include "xxhash64.h"
 
@@ -792,7 +793,8 @@ bool ParseCount(const char* text, size_t lo, size_t hi, size_t* out) {
 void Usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s [--warmup N] [--runs N] [--assetlike] "
-                 "[--blocktypes] [--selfcheck] [corpus files...]\n",
+                 "[--blocktypes] [--blockmix] [--selfcheck] "
+                 "[corpus files...]\n",
                  argv0);
 }
 
@@ -820,6 +822,235 @@ int RunBlocktypes(size_t warmup, size_t runs, bool selfcheck) {
     return ok ? 0 : 1;
 }
 
+/* THE BLOCK-TYPE MIX (issue #206), and what makes it a census rather than a
+ * histogram of openings.
+ *
+ * The specialisation lever this feeds asks whether a second decode path for
+ * stored and static blocks pays, and the evidence it rests on is how many
+ * blocks of each type the reference actually emits and how many bytes each
+ * type produces. A block boundary inside a page is not findable by scanning
+ * (masterplan 11.3), so the walk over first block headers that --blocktypes
+ * performs stops after one block per page and cannot answer that. Worse, it
+ * is biased AGAINST the type this lever cares about most: a stored block's
+ * length field is sixteen bits, 65535 is one byte short of a page, so a page
+ * of stored data is at least two blocks every time while a page that uses a
+ * table can be one. Counting openings undercounts stored blocks by
+ * construction.
+ *
+ * What reaches the second block is a decode, so this walks every page with
+ * cudec's own page decoder and reads the census it produces. That census is
+ * only worth what the decode is worth, so every page is required to decode
+ * to exactly its source bytes here, on top of the reference round trip the
+ * corpus already passed - a walk that drifted off the block structure would
+ * produce different bytes long before it produced a wrong count.
+ *
+ * IT REPORTS AND LOCKS NOTHING ABOUT ADVERSARIALITY. This is a measurement of
+ * what a compressor emits, not a corpus with a shape to defend, so it carries
+ * no density floor and no throughput number. */
+struct BlockMix {
+    size_t pages = 0;
+    uint64_t blocks = 0;
+    uint64_t out_bytes = 0;
+    uint64_t type_blocks[cudec_detail::kGDeflateBlockTypeCount] = {0, 0, 0};
+    uint64_t type_bytes[cudec_detail::kGDeflateBlockTypeCount] = {0, 0, 0};
+};
+
+/* Decode every page and fold its census in. Three things are required of each
+ * page, and each of them is a different way for the walk to be wrong:
+ *
+ *  - it decodes to exactly the source bytes, so the walk followed the real
+ *    block structure and not a plausible-looking wrong one;
+ *  - the per-type counts sum to the page's block count, so no block escaped
+ *    the accounting or was counted twice;
+ *  - the per-type byte counts sum to the page's output, so every produced
+ *    byte is attributed to exactly one block type.
+ *
+ * The last two are what separate a census from a tally that happens to add
+ * up to something. */
+bool CensusCorpus(const std::vector<unsigned char>& source,
+                  const Corpus& corpus, BlockMix* mix) {
+    size_t offset = 0;
+    for (size_t i = 0; i < corpus.compressed.size(); i++) {
+        const std::vector<unsigned char>& page = corpus.compressed[i];
+        const size_t want = corpus.originals[i].size();
+        std::vector<unsigned char> out(want == 0 ? 1 : want);
+        cudec_detail::GDeflatePageState st;
+        uint64_t produced = 0;
+        if (!cudec_detail::GDeflateDecodePage(st, page.data(), page.size(),
+                                              out.data(), want, &produced)) {
+            std::fprintf(stderr,
+                         "page %zu of %s was refused by the page decoder, so "
+                         "no block census can be read out of it\n",
+                         i, corpus.name.c_str());
+            return false;
+        }
+        if (produced != want ||
+            std::memcmp(out.data(), source.data() + offset, want) != 0) {
+            std::fprintf(stderr,
+                         "page %zu of %s decoded to bytes that are not its "
+                         "source, so the block walk behind the census did not "
+                         "follow this page\n",
+                         i, corpus.name.c_str());
+            return false;
+        }
+        uint64_t blocks_seen = 0;
+        uint64_t bytes_seen = 0;
+        for (uint32_t t = 0; t < cudec_detail::kGDeflateBlockTypeCount; t++) {
+            blocks_seen += st.type_blocks[t];
+            bytes_seen += st.type_bytes[t];
+            mix->type_blocks[t] += st.type_blocks[t];
+            mix->type_bytes[t] += st.type_bytes[t];
+        }
+        if (blocks_seen != st.blocks || bytes_seen != produced) {
+            std::fprintf(stderr,
+                         "page %zu of %s censused %llu blocks and %llu bytes "
+                         "against %u blocks and %llu bytes decoded - the "
+                         "attribution does not cover the page\n",
+                         i, corpus.name.c_str(),
+                         static_cast<unsigned long long>(blocks_seen),
+                         static_cast<unsigned long long>(bytes_seen),
+                         st.blocks,
+                         static_cast<unsigned long long>(produced));
+            return false;
+        }
+        mix->blocks += st.blocks;
+        mix->out_bytes += produced;
+        mix->pages++;
+        offset += want;
+    }
+    return true;
+}
+
+double Share(uint64_t part, uint64_t whole) {
+    return whole == 0 ? 0.0
+                      : 100.0 * static_cast<double>(part) /
+                            static_cast<double>(whole);
+}
+
+void PrintBlockMix(const Corpus& corpus, int level, const BlockMix& mix) {
+    std::printf("## bench_gdeflate block-type mix\n");
+    std::printf("- corpus: %s, %zu pages, %.2f MB original, ratio %.4f, %s\n",
+                corpus.name.c_str(), corpus.originals.size(),
+                static_cast<double>(corpus.original_bytes) / 1e6,
+                static_cast<double>(corpus.compressed_bytes) /
+                    static_cast<double>(corpus.original_bytes),
+                corpus.provenance.c_str());
+    std::printf("- compressor: the pinned NVIDIA/libdeflate gdeflate fork, "
+                "commit %s, compression level %d\n",
+                CUDEC_GDEFLATE_COMMIT, level);
+    std::printf("- corpus digest: %016llx\n",
+                static_cast<unsigned long long>(CorpusDigest(corpus)));
+    std::printf("- read by: cudec's own page decoder "
+                "(src/gdeflate_block.h), every page required to decode to its "
+                "source bytes and every block and byte attributed to a type; "
+                "this is a whole-page census and not a walk over openings\n");
+    std::printf("- blocks: %llu over %zu pages (%.3f per page), %llu output "
+                "bytes\n",
+                static_cast<unsigned long long>(mix.blocks), mix.pages,
+                mix.pages == 0 ? 0.0
+                               : static_cast<double>(mix.blocks) /
+                                     static_cast<double>(mix.pages),
+                static_cast<unsigned long long>(mix.out_bytes));
+    std::printf("| type    | blocks | share of blocks | output bytes | share "
+                "of bytes |\n");
+    std::printf("| ------- | ------ | --------------- | ------------ | "
+                "-------------- |\n");
+    for (uint32_t t = 0; t < cudec_detail::kGDeflateBlockTypeCount; t++) {
+        std::printf("| %-7s | %6llu | %14.4f%% | %12llu | %13.4f%% |\n",
+                    BlockTypeName(t),
+                    static_cast<unsigned long long>(mix.type_blocks[t]),
+                    Share(mix.type_blocks[t], mix.blocks),
+                    static_cast<unsigned long long>(mix.type_bytes[t]),
+                    Share(mix.type_bytes[t], mix.out_bytes));
+    }
+}
+
+/* The selfcheck's two anchors, and they are anchors rather than restatements
+ * of what the census just produced.
+ *
+ * The first is the only block-type guarantee the reference's own header
+ * gives: level 0 emits uncompressed blocks by construction. A census that
+ * misattributed a type would have to misattribute it here too, where the
+ * answer is known from outside this harness.
+ *
+ * The second is what proves the walk REACHES PAST THE FIRST BLOCK, which is
+ * the whole reason this path exists beside --blocktypes. A stored block's
+ * length field is sixteen bits and its maximum is one byte short of a page,
+ * so a full page of stored data is at least two stored blocks, always. A
+ * census that stopped at the opening would report exactly one block per page
+ * and fail here. */
+bool CheckLevelZeroAnchors(const Corpus& corpus, const BlockMix& mix) {
+    const uint64_t stored = mix.type_blocks[cudec_detail::kGDeflateBlockStored];
+    if (stored != mix.blocks ||
+        mix.type_bytes[cudec_detail::kGDeflateBlockStored] != mix.out_bytes) {
+        std::fprintf(stderr,
+                     "level 0 censused %llu of %llu blocks as stored and %llu "
+                     "of %llu bytes - the reference emits uncompressed blocks "
+                     "at level 0 by construction, so the census disagrees "
+                     "with the compressor rather than with an expectation\n",
+                     static_cast<unsigned long long>(stored),
+                     static_cast<unsigned long long>(mix.blocks),
+                     static_cast<unsigned long long>(
+                         mix.type_bytes[cudec_detail::kGDeflateBlockStored]),
+                     static_cast<unsigned long long>(mix.out_bytes));
+        return false;
+    }
+    size_t full_pages = 0;
+    for (size_t i = 0; i < corpus.originals.size(); i++) {
+        if (corpus.originals[i].size() > kStoredBlockMaxBytes) {
+            full_pages++;
+        }
+    }
+    if (mix.blocks < 2 * static_cast<uint64_t>(full_pages)) {
+        std::fprintf(stderr,
+                     "level 0 censused %llu blocks over %zu pages that each "
+                     "hold more than the %zu bytes a stored block's length "
+                     "field can express - such a page cannot be one block, so "
+                     "this walk is not reaching past the first one\n",
+                     static_cast<unsigned long long>(mix.blocks), full_pages,
+                     kStoredBlockMaxBytes);
+        return false;
+    }
+    return true;
+}
+
+/* The census path. It is handed the corpus source the level sweep would have
+ * used, so the two paths cannot disagree about what a corpus is, and it times
+ * nothing: what it produces is a table, and a timing beside it would invite
+ * the table to be read as a throughput result. */
+int RunBlockmix(const std::vector<unsigned char>& source,
+                const std::string& name, const std::string& provenance,
+                bool selfcheck, const uint64_t* expected) {
+    bool ok = true;
+    for (size_t i = 0; i < kLevelCount; i++) {
+        Corpus corpus;
+        corpus.name = name;
+        corpus.provenance = provenance;
+        corpus.composition = kCompositionNotAsserted;
+        if (!BuildCorpus(source, kLevels[i], &corpus)) {
+            return 1;
+        }
+        if (!CorpusRoundTrips(source, corpus)) {
+            return 1;
+        }
+        if (selfcheck &&
+            !CheckDigest(CorpusDigest(corpus), name, kLevels[i], expected[i])) {
+            ok = false;
+        }
+        BlockMix mix;
+        if (!CensusCorpus(source, corpus, &mix)) {
+            return 1;
+        }
+        if (selfcheck && kLevels[i] == 0 &&
+            !CheckLevelZeroAnchors(corpus, mix)) {
+            ok = false;
+        }
+        PrintBlockMix(corpus, kLevels[i], mix);
+        std::printf("\n");
+    }
+    return ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -828,6 +1059,7 @@ int main(int argc, char** argv) {
     bool selfcheck = false;
     bool assetlike = false;
     bool blocktypes = false;
+    bool blockmix = false;
     std::vector<std::string> files;
 
     for (int i = 1; i < argc; i++) {
@@ -836,6 +1068,8 @@ int main(int argc, char** argv) {
             assetlike = true;
         } else if (arg == "--blocktypes") {
             blocktypes = true;
+        } else if (arg == "--blockmix") {
+            blockmix = true;
         } else if (arg == "--selfcheck") {
             selfcheck = true;
         } else if (arg == "--runs" && i + 1 < argc) {
@@ -867,6 +1101,15 @@ int main(int argc, char** argv) {
                      "--blocktypes builds its own corpora, one per forced "
                      "block type; do not pass corpus files or --assetlike "
                      "with it\n");
+        return 2;
+    }
+
+    if (blockmix && blocktypes) {
+        std::fprintf(stderr,
+                     "--blockmix censuses the level sweep's corpora and "
+                     "--blocktypes builds forced-type corpora of its own; "
+                     "they answer different questions and cannot be asked "
+                     "for at once\n");
         return 2;
     }
 
@@ -924,6 +1167,11 @@ int main(int argc, char** argv) {
 
     const uint64_t* expected =
         assetlike ? kAssetlikeSelfcheckDigests : kSelfcheckDigests;
+
+    if (blockmix) {
+        return RunBlockmix(source, name, provenance, selfcheck, expected);
+    }
+
     bool ok = true;
     for (size_t i = 0; i < kLevelCount; i++) {
         uint64_t digest = 0;
