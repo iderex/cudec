@@ -64,6 +64,8 @@
  * is a divergence about the page and never about the convention. */
 #include "gdeflate_block.h"
 
+#include "gdeflate_structure.h"
+
 #include <libdeflate.h>
 
 #include <cstddef>
@@ -113,6 +115,51 @@ void Trap(const char* what, size_t size) {
 }
 
 }  // namespace
+
+/* The structure-aware mutator (issue #193). This target's envelope is three
+ * bytes - the page count and the capacity, the two values a caller supplies
+ * and a page never states - so a structured mutation has to write them as well
+ * as the page. It writes ONE page: a generated page split across four chunks
+ * is four malformed pages, which is what the plain byte mutator already
+ * produces in quantity.
+ *
+ * The capacity is drawn rather than kept, because it is half of what this
+ * target is about: the same page against a capacity below what it produces is
+ * the output-overrun branch, and against a generous one is the decode.
+ *
+ * A branch that cannot produce an input falls through to libFuzzer's own
+ * mutator rather than returning the buffer unchanged: returning `size` with
+ * nothing altered feeds the engine a duplicate and costs an exec. */
+extern "C" size_t LLVMFuzzerCustomMutator(uint8_t* data, size_t size,
+                                          size_t max_size, unsigned int seed) {
+    if (!cudec_fuzz::StructuredEnabled()) {
+        return LLVMFuzzerMutate(data, size, max_size);
+    }
+    cudec_fuzz::Rng rng(seed);
+    const uint32_t choice = rng.Below(4);
+    if (choice < 2 && max_size > kMinPageBytes + 3u) {
+        /* A short tail rather than the writer's: refill past the last word is
+         * a branch this decoder refuses explicitly, and it is reachable only
+         * when the page ends. */
+        std::vector<unsigned char> page = cudec_fuzz::SynthPage(rng, 8u);
+        size_t room = (max_size - 3u) & ~static_cast<size_t>(3);
+        if (page.size() > room) {
+            page.resize(room);
+        }
+        if (page.size() >= kMinPageBytes) {
+            const uint32_t cap = static_cast<uint32_t>(rng.Below(kMaxCapacity));
+            data[0] = 0; /* npages = 1 */
+            data[1] = static_cast<uint8_t>(cap & 0xFFu);
+            data[2] = static_cast<uint8_t>((cap >> 8) & 0xFFu);
+            std::memcpy(data + 3, page.data(), page.size());
+            return page.size() + 3u;
+        }
+    } else if (choice == 2 && size > 3u) {
+        cudec_fuzz::PerturbTail(rng, data, size, 3u);
+        return size;
+    }
+    return LLVMFuzzerMutate(data, size, max_size);
+}
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     /* Three bytes of envelope, then the pages. The page count and the capacity
