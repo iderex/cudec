@@ -50,7 +50,26 @@ int main() {
     REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, caps, 1, results,
                                           nullptr) == CUDEC_ERR_CUDA);
 
-    std::printf("PASS: launch-failure branch reports CUDEC_ERR_CUDA with "
-                "zero visible devices, on both batch entries\n");
+    /* The GDeflate entry, whose second half is the OPPOSITE assertion and
+     * is why it belongs in this file at all (issue #216). With no visible
+     * device, any CUDA call this entry made would fail, so an entry that
+     * launched, or merely drained the pending error state, would answer
+     * CUDEC_ERR_CUDA here. Answering the defined not-implemented status
+     * instead is the evidence that a batch it accepts reaches the CUDA
+     * runtime not at all. Twice, for the reason the calls above are twice:
+     * a first-touch context init failing once would look the same. */
+    REQUIRE(cudec_gdeflate_decompress_batch(nullptr, sizes, dsts, caps, 1,
+                                            results, nullptr) ==
+            CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 1,
+                                            results, nullptr) ==
+            CUDEC_ERR_NOT_IMPLEMENTED);
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 1,
+                                            results, nullptr) ==
+            CUDEC_ERR_NOT_IMPLEMENTED);
+
+    std::printf("PASS: with zero visible devices the two kernel-backed batch "
+                "entries report CUDEC_ERR_CUDA and the GDeflate entry "
+                "reports CUDEC_ERR_NOT_IMPLEMENTED\n");
     return 0;
 }

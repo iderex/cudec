@@ -63,3 +63,35 @@ cudec_status cudec_snappy_decompress_batch(const void* const* d_src_ptrs,
         d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
         d_results, stream);
 }
+
+/* The GDeflate entry is the frozen contract without the kernel behind it
+ * yet (issue #216). It shares the validator with the two above rather than
+ * growing its own, so the reject classes cannot drift apart while they are
+ * being frozen, and then stops: no launch, and deliberately no
+ * cudaGetLastError() drain either. Draining is how the entries above buy a
+ * post-launch check that reports their own submission; with nothing
+ * submitted there is nothing to report, and consuming a caller's pending
+ * error on the way to answering "not built here" would be this entry
+ * altering CUDA state it never used.
+ *
+ * That absence is what tests/launch_fail.cpp reads: with no visible device
+ * an entry that made any CUDA call would answer CUDEC_ERR_CUDA, so the
+ * not-implemented answer there is the evidence that this path touches the
+ * runtime at all only through the validator, which touches it not at
+ * all. */
+cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
+                                             const size_t* d_src_sizes,
+                                             void* const* d_dst_ptrs,
+                                             const size_t* d_dst_capacities,
+                                             size_t chunk_count,
+                                             cudec_chunk_result* d_results,
+                                             cudec_stream_t stream) {
+    (void)stream;
+    const cudec_status valid = cudec_detail::validate_batch_args(
+        d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
+        d_results);
+    if (valid != CUDEC_OK) {
+        return valid;
+    }
+    return CUDEC_ERR_NOT_IMPLEMENTED;
+}

@@ -4,9 +4,12 @@
  * the header's layout check through the pre-C11 negative-array-size
  * fallback, which no other translation unit compiles.
  *
- * Every path exercised here is a documented synchronous reject that makes
- * no CUDA call (see cudec.h), so this test runs green on the GPU-less CI
- * runner - the pointers below are host memory and are never dereferenced. */
+ * Every path exercised here returns synchronously without making a CUDA
+ * call (see cudec.h): the documented argument rejects, and the one
+ * documented ACCEPT that answers CUDEC_ERR_NOT_IMPLEMENTED because this
+ * build carries no GDeflate kernel. So this test runs green on the
+ * GPU-less CI runner - the pointers below are host memory and are never
+ * dereferenced. */
 #include "cudec.h"
 
 #include <stdint.h>
@@ -101,6 +104,42 @@ int main(void) {
     REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, caps, SIZE_MAX,
                                           aligned,
                                           0) == CUDEC_ERR_INVALID_ARGUMENT);
+
+    /* The same eight classes on the GDeflate entry (issue #216), written
+     * out call for call for the reason the Snappy block above is: a future
+     * entry wired to its own validator, or to none, would pass a test that
+     * only counted on the sharing. */
+    REQUIRE(cudec_gdeflate_decompress_batch(0, sizes, dsts, caps, 1, aligned,
+                                            0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, 0, dsts, caps, 1, aligned,
+                                            0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, 0, caps, 1, aligned,
+                                            0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, 0, 1, aligned,
+                                            0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 1, 0,
+                                            0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 1,
+                                            misaligned,
+                                            0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 0,
+                                            aligned,
+                                            0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, SIZE_MAX,
+                                            aligned,
+                                            0) == CUDEC_ERR_INVALID_ARGUMENT);
+
+    /* The ninth class, which exists on this entry and on neither of the
+     * others: a batch that PASSES validation while this build carries no
+     * GDeflate kernel is answered with the defined not-implemented status.
+     * Safe here for the same reason every call above is - the entry makes
+     * no CUDA call and dereferences none of these host pointers - and it is
+     * what freezes the contract: the day the kernel lands this line becomes
+     * an assertion about output, and until then it refuses both a silent
+     * CUDEC_OK over a batch nothing decoded and an absent symbol. */
+    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 1,
+                                            aligned,
+                                            0) == CUDEC_ERR_NOT_IMPLEMENTED);
 
     /* The frame entry point resolves its own C linkage here. Every call
      * below is a documented argument reject that returns before any CUDA
