@@ -437,6 +437,15 @@ cudec_add_test(batch_limit_width_lock SOURCES batch_limit_width_lock.cpp)
 target_include_directories(batch_limit_width_lock
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
+# The width-to-instantiation choice the batch entries dispatch on (issue
+# #242). Host-side because that is the only place the wave64 answer can be
+# executed at all: no machine here has a wave64 device, so the width is handed
+# to the selector rather than read from one. The refusal arm is what the entry
+# turns into CUDEC_ERR_UNSUPPORTED.
+cudec_add_test(wave_dispatch SOURCES wave_dispatch.cpp)
+target_include_directories(wave_dispatch
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
 cudec_add_test(frame_host_negative SOURCES frame_host_negative.cpp)
 target_include_directories(frame_host_negative
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)

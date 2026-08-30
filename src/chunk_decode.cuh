@@ -71,11 +71,12 @@ template <int WaveSize>
 inline constexpr unsigned kBlockThreadsFor =
     static_cast<unsigned>(WaveSize) * kBlockWarps;
 
-/* The one width this CUDA build instantiates. It is named here rather than
- * written as digits at each launch, for the reason issue #211 gives, and it
- * is a compile-time constant on purpose: the runtime-width dispatch is a
- * sibling issue, and until it lands the CUDA translation units emit exactly
- * one kernel per format. */
+/* The width every CUDA device reports, named rather than written as digits
+ * for the reason issue #211 gives. IT IS NO LONGER WHAT THE SHIPPED ENTRY
+ * LAUNCHES AT: since #242 the entry reads the width from the runtime and
+ * selects the instantiation, so this constant is what the fixed-width callers
+ * that never leave CUDA - the bench and the determinism harness - are written
+ * against, and what tests/wave_width_gpu.cu pins the CUDA answer to. */
 constexpr int kCudaWaveSize = static_cast<int>(kWarpSize);
 
 constexpr unsigned kBlockThreads = kBlockThreadsFor<kCudaWaveSize>;
@@ -117,8 +118,9 @@ __global__ void __launch_bounds__(kBlockThreadsFor<WaveSize>)
      *    full-mask __syncwarp() is executed by a fraction of a wave. Both
      *    halves of that argument scale with the width rather than with the
      *    digits they used to be written in.
-     * The shipped entry always launches kBlockThreads, but the kernel must
-     * not depend on its caller for either property. Both tests are
+     * The shipped entry launches a whole number of waves at whichever width
+     * it selected, but the kernel must not depend on its caller for either
+     * property. Both tests are
      * grid-uniform (gridDim/blockDim only), so neither can strand lanes at a
      * __syncwarp().
      *

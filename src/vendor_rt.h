@@ -60,6 +60,10 @@
 #define CUDEC_RT_EVENT_SYNCHRONIZE hipEventSynchronize
 #define CUDEC_RT_DEVICE_SYNCHRONIZE hipDeviceSynchronize
 #define CUDEC_RT_GET_LAST_ERROR hipGetLastError
+#define CUDEC_RT_GET_DEVICE hipGetDevice
+#define CUDEC_RT_DEVICE_GET_ATTRIBUTE hipDeviceGetAttribute
+#define CUDEC_RT_ATTR_WAVE_WIDTH hipDeviceAttributeWarpSize
+#define CUDEC_RT_FIXED_WAVE_WIDTH 0
 
 #else
 #include <cuda_runtime.h>
@@ -88,6 +92,10 @@
 #define CUDEC_RT_EVENT_SYNCHRONIZE cudaEventSynchronize
 #define CUDEC_RT_DEVICE_SYNCHRONIZE cudaDeviceSynchronize
 #define CUDEC_RT_GET_LAST_ERROR cudaGetLastError
+#define CUDEC_RT_GET_DEVICE cudaGetDevice
+#define CUDEC_RT_DEVICE_GET_ATTRIBUTE cudaDeviceGetAttribute
+#define CUDEC_RT_ATTR_WAVE_WIDTH cudaDevAttrWarpSize
+#define CUDEC_RT_FIXED_WAVE_WIDTH 32
 
 #endif
 
@@ -141,6 +149,46 @@ inline error_t event_synchronize(event_t e) {
 }
 inline error_t device_synchronize() { return CUDEC_RT_DEVICE_SYNCHRONIZE(); }
 inline error_t get_last_error() { return CUDEC_RT_GET_LAST_ERROR(); }
+
+/* WHETHER THE BACKEND FIXES THE WAVE WIDTH, and zero where it does not. This
+ * is the one difference between the two backends that reaches past the mapping
+ * table, so it is written here as a table entry rather than as a preprocessor
+ * branch at the dispatch. Every CUDA device that exists reports 32; on HIP the
+ * width is 32 on RDNA and 64 on CDNA and only the device knows which. */
+inline constexpr int fixed_wave_width = CUDEC_RT_FIXED_WAVE_WIDTH;
+
+/* The one composite in this file, and the exception the paragraph above is
+ * written against. The device's wave width is ONE question that both runtimes
+ * answer in two calls, so splitting it across the seam would put the same
+ * two-step at every call site and give each of them its own chance to skip the
+ * error check on the first. The attribute is read rather than the whole
+ * property struct: it names the same field of the same runtime, it costs no
+ * kilobyte-sized copy, and it is per-device, so a caller that changed device
+ * between two submissions gets its own device's width instead of a cached
+ * process-wide one. On failure *out is left alone - the caller has a status to
+ * act on and must not read a width nobody wrote (issue #242). */
+inline error_t device_wave_width(int* out) {
+    int device = 0;
+    const error_t e = CUDEC_RT_GET_DEVICE(&device);
+    if (e != success) {
+        return e;
+    }
+    return CUDEC_RT_DEVICE_GET_ATTRIBUTE(out, CUDEC_RT_ATTR_WAVE_WIDTH, device);
+}
+
+/* The width a launch is built for, which is what the dispatch asks. On a
+ * backend that fixes the width this is a constant and the runtime is never
+ * touched - so a submission on such a backend gains no call that can fail, and
+ * the GPU-less launch-failure test keeps reaching the launch it is about. On a
+ * backend that does not, the query is the answer and its failure is the
+ * caller's, never a default. */
+inline error_t wave_width_for_launch(int* out) {
+    if (fixed_wave_width != 0) {
+        *out = fixed_wave_width;
+        return success;
+    }
+    return device_wave_width(out);
+}
 
 }  // namespace cudec_rt
 

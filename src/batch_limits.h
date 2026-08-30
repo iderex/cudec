@@ -57,6 +57,44 @@ constexpr size_t kMaxBatchChunks =
 static_assert(kMaxBatchChunks < SIZE_MAX,
               "the SIZE_MAX over-limit contract test relies on this");
 
+/* WHICH KERNEL THE DISPATCH LAUNCHES FOR A WIDTH THE DEVICE REPORTED, and the
+ * one place that decision is written (issue #242). Host logic with nothing
+ * device-specific in it, which is why it lives in this header rather than in
+ * src/chunk_decode.cuh: the wave64 answer can then be exercised on a machine
+ * with no wave64 device, and on a machine with no device at all.
+ *
+ * THE DEFAULT ARM REFUSES AND MUST NOT FALL BACK TO 32. A width this build
+ * emits no kernel for is not a hardware detail to paper over: the kernel maps
+ * chunks onto lanes by the width it was instantiated at, so launching the
+ * 32-lane kernel on a device whose wave is some other size gives a block that
+ * is not a whole number of waves - and that is the case src/chunk_decode.cuh
+ * documents as leaving every output byte whose index modulo the width lands in
+ * the missing part written by nobody. A silent wrong answer, on the fail-closed
+ * side of a decoder. The caller gets CUDEC_ERR_UNSUPPORTED instead.
+ *
+ * The enumerators carry the widths as their values so a reader cannot pair the
+ * wrong one with a launch, and the type still refuses to convert to a width
+ * implicitly. */
+constexpr int kWaveWidth32 = 32;
+constexpr int kWaveWidth64 = 64;
+
+enum class WaveInstantiation {
+    kUnsupported = 0,
+    kWave32 = kWaveWidth32,
+    kWave64 = kWaveWidth64
+};
+
+inline WaveInstantiation select_wave_instantiation(int reported_width) {
+    switch (reported_width) {
+        case kWaveWidth32:
+            return WaveInstantiation::kWave32;
+        case kWaveWidth64:
+            return WaveInstantiation::kWave64;
+        default:
+            return WaveInstantiation::kUnsupported;
+    }
+}
+
 }  // namespace cudec_detail
 
 #endif /* CUDEC_BATCH_LIMITS_H */
