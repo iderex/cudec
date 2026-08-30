@@ -768,7 +768,7 @@ which is what let the `is_copy` flag go rather than be carried across the
 seam. The copy engine runs both halves unconditionally and has nothing to
 branch on, which is the "copy engine checks nothing" rule with one contract
 behind it instead of two. `tests/CMakeLists.txt` locks the single source the
-way it already locks `cuda_raii.h` and the batch limit.
+way it already locks `vendor_raii.h` and the batch limit.
 
 ### The batch entry
 
@@ -2382,14 +2382,27 @@ uses onto their HIP spellings, keyed on `__HIP_PLATFORM_AMD__`, and the
 kernel sources stay one set of files.
 
 The surface that shim has to carry is small and is readable rather than
-guessed. The host layer's CUDA runtime use is concentrated in
-`src/cuda_raii.h`, which touches `cudaMalloc`, `cudaFree`, `cudaHostAlloc`,
-`cudaFreeHost`, `cudaEventCreate`, `cudaEventDestroy`,
-`cudaStreamCreateWithFlags` and `cudaStreamDestroy`, plus the error type and
-the two flag constants those calls take. That header is therefore the
-ownership boundary the panel adopts, which is where #240 already assumed it
-would land. Anything outside it that reaches for the runtime directly is a
-finding against this design rather than a case for widening the shim.
+guessed. The host layer's runtime use was concentrated in the shared RAII
+owners, which touch the two allocation pairs, the stream and event owners,
+the error type and the two flag constants those calls take.
+
+**Landed** (#240) as `src/vendor_rt.h`, and the boundary moved one step out
+from where this section put it. The owners are still the concentration, but
+`src/frame.cpp` and `src/stream.cpp` reach the runtime directly as well, so a
+shim owned by the owners' header would have left those two outside it. The
+seam is its own header instead: it names the backend, every other file under
+`src/` - the owners in `src/vendor_raii.h` included - goes through
+`cudec_rt::`, and a configure-time rule in `tests/CMakeLists.txt` reds the
+build on a `cuda`- or `hip`-prefixed spelling anywhere else. Anything outside
+the seam that reaches for the runtime directly is now a red configure rather
+than a finding.
+
+The mapping is proven consistent and is not proven correct. A second
+configure-time rule refuses a table whose two arms carry different operation
+sets, which is the failure that would otherwise build clean here and red only
+under ROCm; whether each HIP name is the right partner for its CUDA name is
+what no reading of this tree can answer, and #210's compile-only job is the
+route to a compiler that can.
 
 ### 15.2 The wave width is a template parameter, and the reason is a platform fact
 

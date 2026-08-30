@@ -3,7 +3,7 @@
 #include "lz4_block.h"
 #include "snappy_block.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt.h"
 
 namespace {
 
@@ -28,14 +28,15 @@ cudec_status submit_batch(const void* const* d_src_ptrs,
     /* Drain any error already pending on this thread so the post-launch
      * check reports this submission alone; the header documents that the
      * call consumes the pending error state. */
-    (void)cudaGetLastError();
+    (void)cudec_rt::get_last_error();
 
     cudec_detail::chunk_decode_batch<Parser, false, cudec_detail::kCudaWaveSize>
         <<<cudec_detail::decode_grid_blocks(chunk_count),
            cudec_detail::kBlockThreads, 0, stream>>>(
             d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
             d_results);
-    return cudaGetLastError() == cudaSuccess ? CUDEC_OK : CUDEC_ERR_CUDA;
+    return cudec_rt::get_last_error() == cudec_rt::success ? CUDEC_OK
+                                                           : CUDEC_ERR_CUDA;
 }
 
 }  // namespace
@@ -68,7 +69,8 @@ cudec_status cudec_snappy_decompress_batch(const void* const* d_src_ptrs,
  * yet (issue #216). It shares the validator with the two above rather than
  * growing its own, so the reject classes cannot drift apart while they are
  * being frozen, and then stops: no launch, and deliberately no
- * cudaGetLastError() drain either. Draining is how the entries above buy a
+ * cudec_rt::get_last_error() drain either. Draining is how the entries above
+ * buy a
  * post-launch check that reports their own submission; with nothing
  * submitted there is nothing to report, and consuming a caller's pending
  * error on the way to answering "not built here" would be this entry

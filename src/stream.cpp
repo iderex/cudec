@@ -29,9 +29,9 @@
 #include "batch_limits.h"
 #include "cudec.h"
 
-#include "cuda_raii.h"
+#include "vendor_raii.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt.h"
 
 #include <cstdint>
 #include <cstring>
@@ -127,15 +127,15 @@ cudec_status CopyWaveToHost(cudec_chunk_result* wr, const unsigned char* d_dst,
  * namespace, not an anonymous one) so this ABI-visible struct triggers no
  * subobject-linkage diagnostic. */
 struct cudec_stream_ctx {
-    cudec_cuda::StreamOwner stream;
-    cudec_cuda::EventOwner reuse_ev;
-    cudec_cuda::PinnedBuf p_src;
-    cudec_cuda::DevBuf d_src;
-    cudec_cuda::PinnedBuf p_meta;
-    cudec_cuda::DevBuf d_meta;
-    cudec_cuda::DevBuf d_dst; /* host-output staging only */
-    cudec_cuda::DevBuf d_results;
-    cudec_cuda::PinnedBuf p_results;
+    cudec_rt::StreamOwner stream;
+    cudec_rt::EventOwner reuse_ev;
+    cudec_rt::PinnedBuf p_src;
+    cudec_rt::DevBuf d_src;
+    cudec_rt::PinnedBuf p_meta;
+    cudec_rt::DevBuf d_meta;
+    cudec_rt::DevBuf d_dst; /* host-output staging only */
+    cudec_rt::DevBuf d_results;
+    cudec_rt::PinnedBuf p_results;
     bool poisoned = false;
 };
 
@@ -174,8 +174,8 @@ cudec_status CopyWaveToHost(cudec_chunk_result* wr, const unsigned char* d_dst,
             return CUDEC_ERR_CUDA;
         }
         if (bw != 0 && dst_ptrs[i] != nullptr &&
-            cudaMemcpy(dst_ptrs[i], d_dst + off, bw,
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudec_rt::memcpy(dst_ptrs[i], d_dst + off, bw,
+                       cudec_rt::memcpy_d2h) != cudec_rt::success) {
             return CUDEC_ERR_CUDA;
         }
         off += dst_caps[i];
@@ -287,7 +287,8 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
         }
     }
     if (max_wave_src == 0) {
-        max_wave_src = 1; /* cudaMalloc(0) is legal but avoid the corner */
+        /* A zero-size device allocation is legal but avoid the corner. */
+        max_wave_src = 1;
     }
     if (host_out && max_wave_dst == 0) {
         max_wave_dst = 1;
@@ -298,12 +299,12 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
     }
     const size_t results_bytes = chunk_count * sizeof(cudec_chunk_result);
 
-    /* Grow-only staging. A grow allocation failure (e.g. an oversized
-     * cudaMalloc) leaves the context's buffers partially grown; poison so only
+    /* Grow-only staging. A grow allocation failure (e.g. an oversized device
+     * allocation) leaves the context's buffers partially grown; poison so only
      * destruction is valid afterwards. This is a DEFINED failure, reachable
      * through the public API without any undefined behavior. */
 #define GROW(call) \
-    CUDEC_CUDA_CHECK(call, { ctx.poisoned = true; return CUDEC_ERR_CUDA; })
+    CUDEC_RT_CHECK(call, { ctx.poisoned = true; return CUDEC_ERR_CUDA; })
     GROW(ctx.p_src.ensure(max_wave_src));
     GROW(ctx.d_src.ensure(max_wave_src));
     GROW(ctx.p_meta.ensure(meta_bytes));
@@ -315,8 +316,8 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
     GROW(ctx.p_results.ensure(results_bytes));
 #undef GROW
 
-    cudaStream_t stream = ctx.stream.s;
-    cudaEvent_t reuse = ctx.reuse_ev.e;
+    cudec_rt::stream_t stream = ctx.stream.s;
+    cudec_rt::event_t reuse = ctx.reuse_ev.e;
 
     /* Seed the pinned result mirror with a DEFINED not-produced status: any wave
      * that does not complete before an error return then publishes CUDEC_ERR_CUDA
@@ -351,7 +352,7 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
          * runs the previous wave's decode and result readback. The first wave
          * never recorded the event. */
         if (have_pending_src &&
-            cudaEventSynchronize(reuse) != cudaSuccess) {
+            cudec_rt::event_synchronize(reuse) != cudec_rt::success) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
 
@@ -400,22 +401,24 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
             reinterpret_cast<const size_t*>(dm + 3 * meta_stride);
 
         if (src_off != 0 &&
-            cudaMemcpyAsync(d_src, p_src, src_off, cudaMemcpyHostToDevice,
-                            stream) != cudaSuccess) {
+            cudec_rt::memcpy_async(d_src, p_src, src_off, cudec_rt::memcpy_h2d,
+                            stream) != cudec_rt::success) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
-        if (cudaMemcpyAsync(ctx.d_meta.p, ctx.p_meta.p, meta_bytes,
-                            cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        if (cudec_rt::memcpy_async(ctx.d_meta.p, ctx.p_meta.p, meta_bytes,
+                                   cudec_rt::memcpy_h2d,
+                                   stream) != cudec_rt::success) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
         /* Record after both H2D copies so the next wave's reuse gate waits for
          * the pinned source AND metadata reads to complete. */
-        if (cudaEventRecord(reuse, stream) != cudaSuccess) {
+        if (cudec_rt::event_record(reuse, stream) != cudec_rt::success) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
         have_pending_src = true;
 
-        /* The per-wave result slice is offset*16 into a cudaMalloc base, so it
+        /* The per-wave result slice is offset*16 into a device-allocation
+         * base, so it
          * satisfies the batch entry's 16-byte-alignment requirement. */
         cudec_chunk_result* d_res =
             static_cast<cudec_chunk_result*>(ctx.d_results.p) + begin;
@@ -426,10 +429,10 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
         }
 
         /* Result readback into the pinned mirror (async). */
-        if (cudaMemcpyAsync(
+        if (cudec_rt::memcpy_async(
                 static_cast<cudec_chunk_result*>(ctx.p_results.p) + begin,
-                d_res, wn * sizeof(cudec_chunk_result), cudaMemcpyDeviceToHost,
-                stream) != cudaSuccess) {
+                d_res, wn * sizeof(cudec_chunk_result), cudec_rt::memcpy_d2h,
+                stream) != cudec_rt::success) {
             WAVE_FAIL(CUDEC_ERR_CUDA);
         }
 
@@ -441,7 +444,7 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
              * the D2H targets pageable caller memory and is therefore
              * synchronous, so host-output does not overlap (device-output is
              * the overlapped path). */
-            if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            if (cudec_rt::stream_synchronize(stream) != cudec_rt::success) {
                 WAVE_FAIL(CUDEC_ERR_CUDA);
             }
             cudec_chunk_result* wr =
@@ -459,10 +462,11 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
      * (the entry is synchronous), and surface any async fault as a defined
      * error. */
     cudec_status drain = wave_status;
-    if (cudaStreamSynchronize(stream) != cudaSuccess && drain == CUDEC_OK) {
+    if (cudec_rt::stream_synchronize(stream) != cudec_rt::success &&
+        drain == CUDEC_OK) {
         drain = CUDEC_ERR_CUDA;
     }
-    if (cudaGetLastError() != cudaSuccess && drain == CUDEC_OK) {
+    if (cudec_rt::get_last_error() != cudec_rt::success && drain == CUDEC_OK) {
         drain = CUDEC_ERR_CUDA;
     }
 
@@ -501,8 +505,8 @@ cudec_status cudec_stream_ctx_create(cudec_stream_ctx** out_ctx) {
     /* The only create-time device resources are the single stream and the
      * reuse event; the staging is allocated lazily on first decode (grow-only,
      * so create takes no sizing parameters). */
-    if (ctx->stream.create() != cudaSuccess ||
-        ctx->reuse_ev.create() != cudaSuccess) {
+    if (ctx->stream.create() != cudec_rt::success ||
+        ctx->reuse_ev.create() != cudec_rt::success) {
         delete ctx; /* RAII frees whichever of the two succeeded */
         return CUDEC_ERR_CUDA;
     }
@@ -553,7 +557,7 @@ void cudec_stream_ctx_destroy(cudec_stream_ctx* ctx) {
      * surfaces the fault, which is ignored) and guarantees no async work
      * touches the buffers the destructor is about to free. */
     if (ctx->stream.s != nullptr) {
-        (void)cudaStreamSynchronize(ctx->stream.s);
+        (void)cudec_rt::stream_synchronize(ctx->stream.s);
     }
     delete ctx;
 }

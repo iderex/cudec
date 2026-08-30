@@ -1,0 +1,147 @@
+/* The vendor runtime seam: the ONE translation unit in src/ that names a
+ * backend runtime. Every other file under src/ reaches the device runtime
+ * through cudec_rt:: and never spells cudaXxx or hipXxx, so the host
+ * orchestration (frame.cpp, stream.cpp, the RAII owners in vendor_raii.h) is
+ * one set of sources compiled for either backend - masterplan section 15.
+ *
+ * WHY A MAPPING TABLE AND NOT A SET OF #defines OVER THE CALL SITES. The
+ * llama.cpp vendors/hip.h pattern redefines the CUDA names to the HIP ones and
+ * leaves the callers spelling cudaMalloc on both backends. That reads as CUDA
+ * source that secretly is not, and it makes "which calls does the port owe?"
+ * unanswerable without compiling. Here the two arms are two columns of the
+ * same table: what the port owes is the length of the table, a reader compares
+ * the columns by eye, and a configure-time rule (tests/CMakeLists.txt, issue
+ * #240) reds the build when one column grows an entry the other does not.
+ *
+ * WHAT THIS HEADER DOES NOT CLAIM. No hipcc has ever compiled the HIP arm: no
+ * ROCm toolchain exists on the machine this landed from, and CMakeLists.txt
+ * refuses CUDEC_ENABLE_HIP fail-closed for the same reason. The mapping is
+ * proven CONSISTENT (both arms define the same operations, the CUDA arm builds
+ * and passes the whole gate) and is NOT proven CORRECT: a name mapped to the
+ * wrong HIP entry point compiles clean on CUDA and reds only under a compiler
+ * nobody here has. Issue #210 is the route to that compiler.
+ *
+ * INTERNAL - never part of the public C ABI in include/cudec.h. The public
+ * status CUDEC_ERR_CUDA keeps its name on both backends: it is an ABI
+ * constant a caller compiled against, not a spelling this seam may move. */
+#ifndef CUDEC_VENDOR_RT_H
+#define CUDEC_VENDOR_RT_H
+
+#include <cstddef>
+
+/* __HIP_PLATFORM_AMD__ is defined by hipcc when it targets AMD, and by nothing
+ * else - so the CUDA arm is the default and a host compiler that knows about
+ * neither backend still lands on a real runtime header rather than on an empty
+ * shim. Fail-closed: there is no third arm that stubs the calls out. */
+#if defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime.h>
+
+#define CUDEC_RT_ERROR_T hipError_t
+#define CUDEC_RT_STREAM_T hipStream_t
+#define CUDEC_RT_EVENT_T hipEvent_t
+#define CUDEC_RT_MEMCPY_KIND_T hipMemcpyKind
+#define CUDEC_RT_SUCCESS hipSuccess
+#define CUDEC_RT_MEMCPY_H2D hipMemcpyHostToDevice
+#define CUDEC_RT_MEMCPY_D2H hipMemcpyDeviceToHost
+#define CUDEC_RT_STREAM_NONBLOCKING hipStreamNonBlocking
+#define CUDEC_RT_HOST_ALLOC_DEFAULT hipHostMallocDefault
+#define CUDEC_RT_MALLOC hipMalloc
+#define CUDEC_RT_FREE hipFree
+#define CUDEC_RT_HOST_ALLOC hipHostMalloc
+#define CUDEC_RT_HOST_FREE hipHostFree
+#define CUDEC_RT_MEMCPY hipMemcpy
+#define CUDEC_RT_MEMCPY_ASYNC hipMemcpyAsync
+#define CUDEC_RT_STREAM_CREATE_WITH_FLAGS hipStreamCreateWithFlags
+#define CUDEC_RT_STREAM_DESTROY hipStreamDestroy
+#define CUDEC_RT_STREAM_SYNCHRONIZE hipStreamSynchronize
+#define CUDEC_RT_EVENT_CREATE hipEventCreate
+#define CUDEC_RT_EVENT_DESTROY hipEventDestroy
+#define CUDEC_RT_EVENT_RECORD hipEventRecord
+#define CUDEC_RT_EVENT_SYNCHRONIZE hipEventSynchronize
+#define CUDEC_RT_DEVICE_SYNCHRONIZE hipDeviceSynchronize
+#define CUDEC_RT_GET_LAST_ERROR hipGetLastError
+
+#else
+#include <cuda_runtime.h>
+
+#define CUDEC_RT_ERROR_T cudaError_t
+#define CUDEC_RT_STREAM_T cudaStream_t
+#define CUDEC_RT_EVENT_T cudaEvent_t
+#define CUDEC_RT_MEMCPY_KIND_T cudaMemcpyKind
+#define CUDEC_RT_SUCCESS cudaSuccess
+#define CUDEC_RT_MEMCPY_H2D cudaMemcpyHostToDevice
+#define CUDEC_RT_MEMCPY_D2H cudaMemcpyDeviceToHost
+#define CUDEC_RT_STREAM_NONBLOCKING cudaStreamNonBlocking
+#define CUDEC_RT_HOST_ALLOC_DEFAULT cudaHostAllocDefault
+#define CUDEC_RT_MALLOC cudaMalloc
+#define CUDEC_RT_FREE cudaFree
+#define CUDEC_RT_HOST_ALLOC cudaHostAlloc
+#define CUDEC_RT_HOST_FREE cudaFreeHost
+#define CUDEC_RT_MEMCPY cudaMemcpy
+#define CUDEC_RT_MEMCPY_ASYNC cudaMemcpyAsync
+#define CUDEC_RT_STREAM_CREATE_WITH_FLAGS cudaStreamCreateWithFlags
+#define CUDEC_RT_STREAM_DESTROY cudaStreamDestroy
+#define CUDEC_RT_STREAM_SYNCHRONIZE cudaStreamSynchronize
+#define CUDEC_RT_EVENT_CREATE cudaEventCreate
+#define CUDEC_RT_EVENT_DESTROY cudaEventDestroy
+#define CUDEC_RT_EVENT_RECORD cudaEventRecord
+#define CUDEC_RT_EVENT_SYNCHRONIZE cudaEventSynchronize
+#define CUDEC_RT_DEVICE_SYNCHRONIZE cudaDeviceSynchronize
+#define CUDEC_RT_GET_LAST_ERROR cudaGetLastError
+
+#endif
+
+namespace cudec_rt {
+
+using error_t = CUDEC_RT_ERROR_T;
+using stream_t = CUDEC_RT_STREAM_T;
+using event_t = CUDEC_RT_EVENT_T;
+using memcpy_kind_t = CUDEC_RT_MEMCPY_KIND_T;
+
+inline constexpr error_t success = CUDEC_RT_SUCCESS;
+inline constexpr memcpy_kind_t memcpy_h2d = CUDEC_RT_MEMCPY_H2D;
+inline constexpr memcpy_kind_t memcpy_d2h = CUDEC_RT_MEMCPY_D2H;
+
+/* One thin inline per operation, so the seam costs nothing at run time and a
+ * call site cannot pass a flag the port has not mapped. The two allocation
+ * pairs hide their flag argument on purpose: the pinned flag is the only one
+ * this library ever wants, and the backends spell it differently. */
+inline error_t device_malloc(void** p, size_t bytes) {
+    return CUDEC_RT_MALLOC(p, bytes);
+}
+inline error_t device_free(void* p) { return CUDEC_RT_FREE(p); }
+inline error_t host_alloc(void** p, size_t bytes) {
+    return CUDEC_RT_HOST_ALLOC(p, bytes, CUDEC_RT_HOST_ALLOC_DEFAULT);
+}
+inline error_t host_free(void* p) { return CUDEC_RT_HOST_FREE(p); }
+inline error_t memcpy(void* dst, const void* src, size_t bytes,
+                      memcpy_kind_t kind) {
+    return CUDEC_RT_MEMCPY(dst, src, bytes, kind);
+}
+inline error_t memcpy_async(void* dst, const void* src, size_t bytes,
+                            memcpy_kind_t kind, stream_t s) {
+    return CUDEC_RT_MEMCPY_ASYNC(dst, src, bytes, kind, s);
+}
+inline error_t stream_create_nonblocking(stream_t* s) {
+    return CUDEC_RT_STREAM_CREATE_WITH_FLAGS(s, CUDEC_RT_STREAM_NONBLOCKING);
+}
+inline error_t stream_destroy(stream_t s) {
+    return CUDEC_RT_STREAM_DESTROY(s);
+}
+inline error_t stream_synchronize(stream_t s) {
+    return CUDEC_RT_STREAM_SYNCHRONIZE(s);
+}
+inline error_t event_create(event_t* e) { return CUDEC_RT_EVENT_CREATE(e); }
+inline error_t event_destroy(event_t e) { return CUDEC_RT_EVENT_DESTROY(e); }
+inline error_t event_record(event_t e, stream_t s) {
+    return CUDEC_RT_EVENT_RECORD(e, s);
+}
+inline error_t event_synchronize(event_t e) {
+    return CUDEC_RT_EVENT_SYNCHRONIZE(e);
+}
+inline error_t device_synchronize() { return CUDEC_RT_DEVICE_SYNCHRONIZE(); }
+inline error_t get_last_error() { return CUDEC_RT_GET_LAST_ERROR(); }
+
+}  // namespace cudec_rt
+
+#endif  // CUDEC_VENDOR_RT_H
