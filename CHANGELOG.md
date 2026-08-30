@@ -24,6 +24,22 @@ write (#82). Everything in it is in the tree today.
   asynchronous: its return value covers argument validation and launch
   submission, and the per-chunk statuses are valid once the stream reaches the
   end of the launch.
+- **Snappy raw-stream batch decode on the GPU.**
+  `cudec_snappy_decompress_batch` decodes N independent raw Snappy streams -
+  the varint-prefixed block `google/snappy`'s own `Compress` produces - in one
+  launch on a caller-provided stream, and the batch contract holds argument for
+  argument against the LZ4 entry above: the same device-side arrays, the same
+  per-chunk `cudec_chunk_result`, the same synchronous argument rejects, the
+  same launch limit, and the same asynchronous launch. The Snappy FRAMING
+  format - stream identifier, framed chunks, masked CRC-32C - is not decoded
+  here and no entry point decodes it, so a framed stream is a malformed raw one
+  and is refused with `CUDEC_ERR_CORRUPT_INPUT` rather than partially decoded.
+  The declared uncompressed length that opens every raw stream is
+  attacker-controlled and sizes nothing: it is checked against that chunk's
+  capacity before an element is parsed, a declaration above the capacity reports
+  `CUDEC_ERR_OUTPUT_TOO_SMALL`, and every later overrun of it reports
+  `CUDEC_ERR_CORRUPT_INPUT`. There is no Snappy streaming entry point and no
+  milestone carries one: Snappy is batch-only by decision, not by omission.
 - **`.lz4` frame decode.** `cudec_lz4f_decompress` decodes the frame format's
   block-independent subset, host memory to host memory, driving the batch
   decoder internally. The header, block and content checksums and the optional
@@ -85,9 +101,25 @@ write (#82). Everything in it is in the tree today.
 
 ### Supported subset, stated as limits rather than implied
 
-- LZ4 only. Snappy, GDeflate, Zstd and the HIP port are planned milestones with
-  no code in this release; the milestone table in
-  [README.md](README.md) is the current state.
+- **Formats, stated one at a time.** One sentence covering four formats is read
+  as a promise in the direction that costs a consumer the most, so each format
+  states its own limit and none of them can be refuted by resolving a symbol out
+  of `include/cudec.h`.
+  - **LZ4** decodes on the GPU: block batch, the `.lz4` frame subset bounded
+    below, and the pinned-host streaming path.
+  - **Snappy** decodes on the GPU, raw streams only, through the batch entry and
+    nothing else. The framing format is not decoded by any entry point.
+  - **GDeflate** has a declared entry point whose contract is frozen and no
+    kernel behind it. A batch it accepts is answered
+    `CUDEC_ERR_NOT_IMPLEMENTED`, and no CUDA call is made.
+  - **Zstd** has host-side format parsers under `src/` and no public surface at
+    all: `include/cudec.h` names no Zstd entry point, on any build.
+  - **The HIP port** carries no device sources. `CUDEC_ENABLE_HIP` exists to
+    fail the configure rather than to produce a build.
+
+  The milestone table in [README.md](README.md) carries the same list against
+  the milestones that own each one.
+
 - Frames must be block-independent and carry no dictionary id.
 - Decode only. Nothing here compresses.
 - NVIDIA GPUs. The default architecture list is `80` plus `86-real`, and the
@@ -103,9 +135,11 @@ write (#82). Everything in it is in the tree today.
 
 - **Fail-closed decode.** A malformed, truncated or hostile chunk produces a
   defined error with `bytes_written == 0`, never an out-of-bounds access and
-  never partial output presented as success. Held to liblz4 1.10.0 as the
-  authority on validity over the fixture corpus, its mutants and hand-crafted
-  negatives; the parser twin runs that comparison on the GPU-less CI runner and
+  never partial output presented as success. Each format is held to its own
+  reference as the authority on validity - liblz4 1.10.0 for LZ4, google/snappy
+  1.2.2 for Snappy, including the three malformed streams snappy's own test
+  suite carries - over the fixture corpus, its mutants and hand-crafted
+  negatives; the parser twins run that comparison on the GPU-less CI runner and
   the device twins repeat it on hardware.
 - **Determinism.** Same input, bit-identical output. The levels this holds at,
   and what each one is measured against, are in
