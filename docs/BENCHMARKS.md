@@ -1949,7 +1949,9 @@ The table is a reading aid. The eight blocks below are the record.
 **The verdict: the mix does not justify a second path, and the corpus splits
 into two populations rather than one.** Where the compressor compresses --
 levels 1, 6 and 12, on both corpora -- stored and static blocks together are at
-most **0.0740% of blocks and 0.0370% of the produced bytes**, and on the
+most **0.0739% of blocks and 0.0370% of the produced bytes**, which is five
+blocks of 6767 and 78369 bytes of 211938580 at Silesia level 6, the worst of
+the six cells. On the
 asset-like corpus they are exactly zero at every one of those levels. A
 specialised path acting on one part in two thousand seven hundred of the output
 cannot pay for a second route through the round loop, and the accept rule #206

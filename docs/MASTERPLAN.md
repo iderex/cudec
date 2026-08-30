@@ -1790,8 +1790,9 @@ second path, and the question is closed before the kernel exists.** A
 whole-page block-type census over the recorded M4 corpora - the same eight
 cells the CPU denominator was taken on, proved by the eight corpus digests
 reproducing - finds that at every level where the reference actually
-compresses, stored and static blocks together are at most 0.0740% of blocks
-and 0.0370% of the produced bytes, and exactly zero of both on the
+compresses, stored and static blocks together are at most 0.0739% of blocks
+and 0.0370% of the produced bytes - five blocks of 6767 at the worst of the
+six cells - and exactly zero of both on the
 asset-like corpus. Level 0 is 100% stored on both corpora and does not
 reopen it: that is the compressor declining to compress, it is already the
 fastest family in the denominator table, and the stored block is not on the
