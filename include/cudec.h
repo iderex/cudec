@@ -31,10 +31,13 @@ typedef enum cudec_status {
     CUDEC_ERR_CORRUPT_INPUT = 2,
     CUDEC_ERR_OUTPUT_TOO_SMALL = 3,
     CUDEC_ERR_CUDA = 4,
-    /* Reserved for an API entry point or decode path declared here but not
-     * yet implemented (e.g. a future format). No current entry point
-     * returns it; kept at this fixed value so a caller's switch stays
-     * exhaustive once it is wired up. */
+    /* An API entry point or decode path declared here but not implemented
+     * in this build. It is what a declared-but-unbuilt entry answers a
+     * batch it has already accepted, so the freeze on that entry's symbol
+     * and signature never depends on a build configuration:
+     * cudec_gdeflate_decompress_batch returns it today, and the value is
+     * fixed so a caller's switch stays exhaustive across the build that
+     * stops returning it. */
     CUDEC_ERR_NOT_IMPLEMENTED = 5,
     /* A well-formed frame that uses a feature cudec does not decode, or a
      * legal frame type it declines (block-linked mode, a dictionary id, a
@@ -141,6 +144,46 @@ cudec_status cudec_snappy_decompress_batch(const void* const* d_src_ptrs,
                                            size_t chunk_count,
                                            cudec_chunk_result* d_results,
                                            cudec_stream_t stream);
+
+/* Batch GDeflate page decode. The batch contract above holds argument for
+ * argument: the same device-side arrays of chunk_count entries holding
+ * device pointers, the same 16-byte-aligned d_results, the same per-chunk
+ * result semantics, the same synchronous CUDEC_ERR_INVALID_ARGUMENT reject
+ * classes against the same launch limit, and the same asynchronous launch
+ * on `stream`. Nothing about the batch contract varies by format.
+ *
+ * The supported surface is the RAW GDeflate page - the unit the format
+ * decompresses into one 64 KiB tile - with its compressed size in
+ * d_src_sizes and its output capacity in d_dst_capacities, both supplied
+ * by the caller. No container is parsed here and none ever will be: the
+ * TileStream envelope that records where a file's pages are is a
+ * caller-side layer, so a whole TileStream handed to this entry is a
+ * malformed page and is rejected as CUDEC_ERR_CORRUPT_INPUT rather than
+ * stepped into. The bound on every write is that page's
+ * d_dst_capacities entry and never a length read out of the page.
+ *
+ * Per page, and isolated to that page: CUDEC_ERR_CORRUPT_INPUT for a
+ * malformed page, CUDEC_ERR_OUTPUT_TOO_SMALL when the decode would pass
+ * the supplied capacity, bytes_written == 0 on either, and the
+ * destination contents then unspecified but never presented as a valid
+ * decode.
+ *
+ * THIS BUILD CARRIES NO GDEFLATE KERNEL, AND THAT IS A DEFINED STATUS
+ * RATHER THAN AN ABSENT SYMBOL. A batch that passes the validation above
+ * returns CUDEC_ERR_NOT_IMPLEMENTED, having made no CUDA call at all - so
+ * this entry, unlike the two above, also leaves the thread's pending CUDA
+ * error state untouched on a call it accepts. The symbol, the signature
+ * and every reject class above are frozen now and do not move when the
+ * kernel lands; only the answer to an accepted batch does. A symbol that
+ * was absent instead would make the freeze conditional on a build
+ * configuration, which is two contracts wearing one name. */
+cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
+                                             const size_t* d_src_sizes,
+                                             void* const* d_dst_ptrs,
+                                             const size_t* d_dst_capacities,
+                                             size_t chunk_count,
+                                             cudec_chunk_result* d_results,
+                                             cudec_stream_t stream);
 
 /* Decode a single LZ4 frame (the .lz4 container: magic, frame descriptor,
  * data blocks, end mark, optional checksums) from host memory into host

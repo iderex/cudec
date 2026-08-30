@@ -41,8 +41,17 @@ write (#82). Everything in it is in the tree today.
 - **A defined status for every outcome.** `cudec_status` covers argument
   rejects, corrupt input, an output buffer too small, and CUDA faults, with
   `CUDEC_ERR_UNSUPPORTED` for a stream cudec understands and will not decode and
-  `CUDEC_ERR_NOT_IMPLEMENTED` reserved for entry points that do not exist yet.
-  No exception crosses the ABI and every CUDA call's error is checked.
+  `CUDEC_ERR_NOT_IMPLEMENTED` for an entry point that is declared here and not
+  built in this configuration. No exception crosses the ABI and every CUDA
+  call's error is checked.
+- **The GDeflate batch entry, frozen ahead of its kernel.**
+  `cudec_gdeflate_decompress_batch` takes the same arguments as the LZ4 and
+  Snappy entries and refuses the same argument classes; its surface is the raw
+  GDeflate page with a caller-supplied size and capacity, and no container is
+  parsed. This build carries no GDeflate kernel, so a batch the entry accepts
+  is answered `CUDEC_ERR_NOT_IMPLEMENTED` and no CUDA call is made. The symbol
+  and the signature do not move when the kernel lands; only the answer to an
+  accepted batch does.
 - **`cudec_version()`** and the `CUDEC_VERSION_*` macros, single-sourced: the
   build system reads the version out of the public header, and a conformance
   test refuses a mismatch between the two.
