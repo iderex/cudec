@@ -194,6 +194,23 @@ add_test(NAME bench_gdeflate_assetlike_selfcheck COMMAND bench_gdeflate
 add_test(NAME bench_gdeflate_blocktypes_selfcheck COMMAND bench_gdeflate
                                                   --blocktypes --selfcheck)
 
+# The whole-page block-type census (issue #206). Separate entry from the one
+# above because it proves the opposite property: that one asserts a corpus
+# still OPENS with the block type its family is named for, this one asserts
+# the walk REACHES PAST that opening. A stored block's length field is sixteen
+# bits, so a full page of stored data is at least two blocks, and a census
+# that had collapsed back to reading openings would report one block per page
+# and red here while the entry above stayed green. It also holds the census to
+# the one block-type guarantee the reference's own header gives - level 0
+# emits uncompressed blocks - so a misattributed type reds against the
+# compressor rather than against an expectation.
+#
+# CPU-only, like the entries above: the census reads cudec's own page decoder
+# from src/gdeflate_block.h, which is host/device single-source and needs no
+# device to run on the host side.
+add_test(NAME bench_gdeflate_blockmix_selfcheck COMMAND bench_gdeflate
+                                                 --blockmix --selfcheck)
+
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
 # sequence-compression entry point and decoded by the reference, so the
@@ -272,6 +289,6 @@ set_tests_properties(
   bench_frame_selfcheck bench_snappy_selfcheck
   bench_snappy_worst_selfcheck bench_snappy_worstlit_selfcheck
   bench_gdeflate_selfcheck bench_gdeflate_assetlike_selfcheck
-  bench_gdeflate_blocktypes_selfcheck
+  bench_gdeflate_blocktypes_selfcheck bench_gdeflate_blockmix_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()

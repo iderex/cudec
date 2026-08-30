@@ -1785,6 +1785,24 @@ it an entropy-shaped path like any other, and whether it deserves a fast
 path is a measurement question that belongs to the perf pass, filed as #206
 against a measured block-type mix.
 
+**Measured outcome (issue #206, 2026-08-30): the mix does not justify a
+second path, and the question is closed before the kernel exists.** A
+whole-page block-type census over the recorded M4 corpora - the same eight
+cells the CPU denominator was taken on, proved by the eight corpus digests
+reproducing - finds that at every level where the reference actually
+compresses, stored and static blocks together are at most 0.0740% of blocks
+and 0.0370% of the produced bytes, and exactly zero of both on the
+asset-like corpus. Level 0 is 100% stored on both corpora and does not
+reopen it: that is the compressor declining to compress, it is already the
+fastest family in the denominator table, and the stored block is not on the
+round loop in the first place - `src/gdeflate_block.h` dispatches it to its
+own byte loop that builds no table and enters no round. So #206 closes with
+no kernel code. What that does NOT settle is the round loop's cost on
+dynamic blocks, where 99.9% of the work is; that stays with #204, #205 and
+#207. `docs/BENCHMARKS.md` carries the table, the bounds of the corpora it
+was taken over, and the guard that separates this census from a walk over
+page openings, which would have undercounted stored blocks by construction.
+
 ### 13.3 The validation ladder
 
 Every value read from the stream is checked before its first use as an
