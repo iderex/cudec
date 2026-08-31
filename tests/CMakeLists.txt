@@ -200,6 +200,16 @@ cudec_add_test(gdeflate_block_twin SOURCES gdeflate_block_twin.cpp LIBS
                gdeflate_oracle)
 target_include_directories(gdeflate_block_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The run-time half of the reject-ladder lock (issue #183), whose static half
+# is the configure-time scan further down this file. One negative per declared
+# rung of enum GDeflateReject, each asserting the rung it lands on, and a sweep
+# requiring every rung to be reached or declared unreachable with its argument.
+# It asks no oracle - which rung this decoder takes is a question about this
+# tree - so it links nothing and stays GPU-less, reaching src/ for the three
+# headers under test.
+cudec_add_test(gdeflate_ladder_lock SOURCES gdeflate_ladder_lock.cpp)
+target_include_directories(gdeflate_ladder_lock
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.
@@ -1588,6 +1598,332 @@ if(_snappy_violations)
   message(FATAL_ERROR "the Snappy parser core is not single-sourced, or its "
                       "reject ladder and its refusal sites have drifted "
                       "apart (issue #173):\n${_snappy_violations}")
+endif()
+
+# ---- The GDeflate reject ladder is derived from the code (issue #183).
+#
+# Same honest scope as every check above: a drift detector under the KNOWN
+# SPELLINGS, not tamper-proofing. A refusal spelled through a helper this scan
+# does not know, or a ladder re-copied under fresh names, is out of reach of a
+# text scan and is what review is for.
+#
+# The rule. Every refusal in the three GDeflate headers goes through one of the
+# three choke points in src/gdeflate_schedule.h and names a branch that
+# `enum GDeflateReject` declares, and each declared branch is named by EXACTLY
+# ONE site. That makes the ladder's branch set DERIVED from the code rather
+# than restated beside it, and it is the static half of a pair: the three twins
+# hold the run-time half, requiring a negative to reach every branch a page can
+# reach. Adding a rung therefore costs an enumerator here and a negative there,
+# and a rung that quietly reuses a neighbour's enumerator to avoid both is what
+# the exactly-one count refuses.
+#
+# Why the sticky field is guarded too. The flag and the branch are one verdict:
+# a site that sets `failed` by hand names no rung and is invisible to both
+# halves of the pair, and a site that writes `reject` by hand can name a rung
+# it did not take. Both are refused outside the choke points, which is the one
+# place either may be written.
+function(cudec_check_gdeflate_locks src_dir out_violations)
+  set(_violations "")
+  set(_headers gdeflate_schedule.h gdeflate_tables.h gdeflate_block.h)
+  foreach(_name IN LISTS _headers)
+    if(NOT EXISTS ${src_dir}/${_name})
+      string(APPEND _violations
+             "  ${src_dir}/${_name} is missing: the GDeflate ladder is "
+             "single-sourced across the three headers (issue #183)\n")
+    endif()
+  endforeach()
+  if(_violations)
+    set(${out_violations} "${_violations}" PARENT_SCOPE)
+    return()
+  endif()
+
+  # The declared branches, read out of the enumeration between its None and
+  # Count sentinels. An enumerator carrying an explicit value is a SECTION
+  # SENTINEL rather than a rung - that is what lets each twin walk its own
+  # header's range - and the distinction is the presence of an initialiser
+  # rather than a list of sentinel names somebody has to keep in step here.
+  cudec_code_lines(${src_dir}/gdeflate_schedule.h _schedule_lines)
+  set(_declared "")
+  set(_in_enum FALSE)
+  foreach(_line IN LISTS _schedule_lines)
+    if(_line MATCHES "enum GDeflateReject[ \t]*{")
+      set(_in_enum TRUE)
+      continue()
+    endif()
+    if(_in_enum)
+      if(_line MATCHES "kGDeflateRejectCount")
+        set(_in_enum FALSE)
+        continue()
+      endif()
+      if(_line MATCHES "^[ \t]*(kGDeflateReject[A-Za-z0-9_]*)[ \t]*,")
+        list(APPEND _declared ${CMAKE_MATCH_1})
+      endif()
+    endif()
+  endforeach()
+  if(NOT _declared)
+    string(APPEND _violations
+           "  gdeflate_schedule.h declares no reject ladder: "
+           "'enum GDeflateReject' must enumerate one branch per reject reason "
+           "(issue #183)\n")
+  endif()
+
+  # The refusal sites, over all three headers. The choke points are defined in
+  # the first of them, so their own definition lines and their own writes to
+  # the sticky state are what the scan steps over - tracked as a state rather
+  # than matched by name, because a rule that skipped every line mentioning the
+  # choke point would skip a violation that mentions it too.
+  set(_named "")
+  foreach(_name IN LISTS _headers)
+    cudec_code_lines(${src_dir}/${_name} _lines)
+    set(_lineno 0)
+    set(_in_choke FALSE)
+    foreach(_line IN LISTS _lines)
+      math(EXPR _lineno "${_lineno} + 1")
+      if(_line MATCHES "inline bool GDeflate(Refuse|RefuseAs|TableRefuse)\\(")
+        set(_in_choke TRUE)
+      elseif(_line MATCHES "^}")
+        set(_in_choke FALSE)
+      endif()
+      if(NOT _in_choke)
+        # The choke point, refused first: a refusal that sets the flag by hand
+        # reaches no branch, so it is invisible to the count below and to the
+        # twins alike, and it is the one shape that could add a rung with both
+        # halves of the pair still green.
+        if(_line MATCHES "\\.failed[ \t]*=[ \t]*true")
+          string(APPEND _violations
+                 "  ${_name}:${_lineno}: sets the failure flag without going "
+                 "through GDeflateRefuse - every refusal names its ladder "
+                 "branch (issue #183)\n")
+        endif()
+        # The same for the branch itself. Clearing it is how a decode starts,
+        # so only a write of an actual rung is refused here.
+        if(_line MATCHES "\\.reject[ \t]*=" AND
+           NOT _line MATCHES "\\.reject[ \t]*=[ \t]*kGDeflateRejectNone")
+          string(APPEND _violations
+                 "  ${_name}:${_lineno}: names a ladder branch outside "
+                 "GDeflateRefuse (issue #183)\n")
+        endif()
+      endif()
+      if(_line MATCHES "GDeflate(Table)?Refuse\\(" AND
+         NOT _line MATCHES "inline bool GDeflate")
+        # The branch has to be on the line the call opens on. A wrapped first
+        # argument would hide the name from this scan exactly as a wrapped
+        # mask hides from the collective rule.
+        if(_line MATCHES "GDeflate(Table)?Refuse\\([^,]+,[ \t]*(kGDeflateReject[A-Za-z0-9_]*)")
+          list(APPEND _named ${CMAKE_MATCH_2})
+        else()
+          string(APPEND _violations
+                 "  ${_name}:${_lineno}: a GDeflateRefuse call with no ladder "
+                 "branch on its own line (issue #183)\n")
+        endif()
+      endif()
+    endforeach()
+  endforeach()
+
+  foreach(_branch IN LISTS _declared)
+    set(_count 0)
+    foreach(_site IN LISTS _named)
+      if(_site STREQUAL _branch)
+        math(EXPR _count "${_count} + 1")
+      endif()
+    endforeach()
+    if(_count EQUAL 0)
+      string(APPEND _violations
+             "  ladder branch '${_branch}' is declared and no refusal site "
+             "names it (issue #183)\n")
+    elseif(NOT _count EQUAL 1)
+      string(APPEND _violations
+             "  ladder branch '${_branch}' is named by ${_count} refusal "
+             "sites: a new rung takes a new branch, so that the twin's "
+             "negative for it cannot be satisfied by its neighbour "
+             "(issue #183)\n")
+    endif()
+  endforeach()
+  foreach(_site IN LISTS _named)
+    if(NOT _site IN_LIST _declared)
+      string(APPEND _violations
+             "  a refusal site names '${_site}', which 'enum GDeflateReject' "
+             "does not declare (issue #183)\n")
+    endif()
+  endforeach()
+
+  set(${out_violations} "${_violations}" PARENT_SCOPE)
+endfunction()
+
+# The rules above are run against planted source trees before they are trusted
+# against the real one, and every violating probe is matched against the TEXT
+# its own rule emits rather than against a non-empty result - so one rule
+# cannot cover for another that has quietly stopped matching. The probe headers
+# are read, never compiled, which is why they are this terse.
+set(_gdeflate_probe_root ${CMAKE_CURRENT_BINARY_DIR}/gdeflate-lock-probes)
+file(REMOVE_RECURSE ${_gdeflate_probe_root})
+
+# A compliant ladder header: two rungs, one section sentinel, the choke points,
+# two sites. Each block is ONE string rather than a list of lines, because the
+# variants below are cut from it with string(REPLACE) and a list would come
+# back joined on semicolons - a stray separator written into a C header.
+#
+# The head is 27 lines, so an injected rung starts at line 28, which is the
+# number the line-scoped rules are asserted on below.
+set(_gd_head "#ifndef PROBE_GDEFLATE_SCHEDULE_H
+#define PROBE_GDEFLATE_SCHEDULE_H
+namespace cudec_detail {
+enum GDeflateReject {
+    kGDeflateRejectNone = 0,
+    kGDeflateRejectAlpha,
+    kGDeflateRejectBeta,
+    kGDeflateRejectScheduleFirst = kGDeflateRejectAlpha,
+    kGDeflateRejectCount
+};
+struct GDeflateSchedule {
+    bool failed;
+    GDeflateReject reject;
+};
+inline bool GDeflateRefuse(GDeflateSchedule& s, GDeflateReject branch) {
+    if (!s.failed) {
+        s.failed = true;
+        s.reject = branch;
+    }
+    return false;
+}
+inline bool GDeflateTableRefuse(GDeflateReject* slot, GDeflateReject branch) {
+    *slot = branch;
+    return false;
+}
+inline bool Walk(GDeflateSchedule& s, bool first) {
+    if (first) {
+")
+set(_gd_tail "    }
+    return GDeflateRefuse(s, kGDeflateRejectBeta);
+}
+}  // namespace cudec_detail
+#endif
+")
+set(_gd_site "        return GDeflateRefuse(s, kGDeflateRejectAlpha);
+")
+# The two headers a probe does not vary. They have to exist, because an absent
+# one is its own rule and would answer for every probe below.
+set(_gd_other "/* not the header the ladder lives in */
+")
+
+function(cudec_write_gdeflate_probe dir head site tail other)
+  file(WRITE ${dir}/gdeflate_schedule.h "${head}" "${site}" "${tail}")
+  file(WRITE ${dir}/gdeflate_tables.h "${other}")
+  file(WRITE ${dir}/gdeflate_block.h "${other}")
+endfunction()
+
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/clean "${_gd_head}"
+                           "${_gd_site}" "${_gd_tail}" "${_gd_other}")
+# The tree with no ladder header at all.
+file(WRITE ${_gdeflate_probe_root}/missing_header/other.cu "void probe() {}
+")
+# A rung that sets the sticky flag by hand.
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/bare_flag "${_gd_head}"
+                           "        s.failed = true;
+        return false;
+" "${_gd_tail}" "${_gd_other}")
+# A rung that names a branch by writing the sticky field directly.
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/bare_branch "${_gd_head}"
+                           "        s.reject = kGDeflateRejectAlpha;
+        return GDeflateRefuse(s, kGDeflateRejectAlpha);
+" "${_gd_tail}" "${_gd_other}")
+# Clearing the branch is how a decode starts and must stay silent, or the rule
+# above would refuse the initialisation every page needs.
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/clears_branch "${_gd_head}"
+                           "        s.reject = kGDeflateRejectNone;
+        return GDeflateRefuse(s, kGDeflateRejectAlpha);
+" "${_gd_tail}" "${_gd_other}")
+# A rung whose branch is wrapped onto the next line, out of a line-scoped
+# scan's sight.
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/wrapped_refuse "${_gd_head}"
+                           "        return GDeflateRefuse(
+            s, kGDeflateRejectAlpha);
+" "${_gd_tail}" "${_gd_other}")
+# A branch nothing refuses through: the shape a deleted rung leaves behind.
+string(REPLACE "    kGDeflateRejectBeta,
+" "    kGDeflateRejectBeta,
+    kGDeflateRejectGamma,
+" _gd_extra_branch "${_gd_head}")
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/branch_unused
+                           "${_gd_extra_branch}" "${_gd_site}" "${_gd_tail}"
+                           "${_gd_other}")
+# A site naming a branch the enumeration does not carry: the shape a rung added
+# without an enumerator leaves behind.
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/site_undeclared "${_gd_head}"
+                           "        return GDeflateRefuse(s, kGDeflateRejectGamma);
+" "${_gd_tail}" "${_gd_other}")
+# Two rungs behind one branch - a new rung borrowing its neighbour's
+# enumerator, which would let the twin's negative for the old rung stand in for
+# the new one.
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/branch_shared "${_gd_head}"
+                           "        if (!first) {
+            return GDeflateRefuse(s, kGDeflateRejectAlpha);
+        }
+${_gd_site}" "${_gd_tail}" "${_gd_other}")
+# No enumeration at all.
+string(REGEX REPLACE "enum GDeflateReject" "enum SomethingElse" _gd_no_enum
+                     "${_gd_head}")
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/no_enum "${_gd_no_enum}"
+                           "${_gd_site}" "${_gd_tail}" "${_gd_other}")
+# Prose is not code. This header is compliant and its comments spell out both a
+# bare flag write and a wrapped refusal; a scan that read comments would refuse
+# the file that documents itself best.
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/prose "${_gd_head}"
+                           "        /* Not: s.failed = true; and not a wrapped
+         * GDeflateRefuse( either. */
+${_gd_site}" "${_gd_tail}" "${_gd_other}")
+# A violation below an unbalanced bracket - the shape that reads only the top
+# of a file (issue #294). The rule must still report, and at the line it is on.
+cudec_write_gdeflate_probe(${_gdeflate_probe_root}/bracket_above "${_gd_head}"
+                           "        /* Reading page[from .. as the real header does. */
+        s.failed = true;
+" "${_gd_tail}" "${_gd_other}")
+
+# The compliant probes come first and carry no expected text: a lock that
+# refuses honest work is a worse defect than one rule gone quiet, and the
+# clean, clears_branch and prose entries are what keep the rules from being
+# written as blanket refusals.
+set(_gdeflate_lock_probes
+    "clean|"
+    "clears_branch|"
+    "prose|"
+    "missing_header|gdeflate_schedule.h is missing"
+    "bare_flag|gdeflate_schedule.h:28: sets the failure flag without going"
+    "bare_branch|gdeflate_schedule.h:28: names a ladder branch outside"
+    "wrapped_refuse|gdeflate_schedule.h:28: a GDeflateRefuse call with no ladder"
+    "branch_unused|ladder branch 'kGDeflateRejectGamma' is declared and no refusal"
+    "site_undeclared|a refusal site names 'kGDeflateRejectGamma', which"
+    "branch_shared|ladder branch 'kGDeflateRejectAlpha' is named by 2 refusal"
+    "no_enum|declares no reject ladder"
+    "bracket_above|gdeflate_schedule.h:29: sets the failure flag without going")
+foreach(_entry IN LISTS _gdeflate_lock_probes)
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\1" _probe "${_entry}")
+  string(REGEX REPLACE "^([^|]+)\\|(.*)$" "\\2" _expected "${_entry}")
+  cudec_check_gdeflate_locks(${_gdeflate_probe_root}/${_probe} _probe_result)
+  if(_expected STREQUAL "")
+    # Checked here rather than through string(FIND): an empty needle is found
+    # at position 0 in every string, so the branch below would assert nothing.
+    if(_probe_result)
+      message(FATAL_ERROR "the GDeflate lock refuses a compliant probe: "
+                          "${_probe} must come back silent (issue #183). It "
+                          "reported:\n${_probe_result}")
+    endif()
+  else()
+    string(FIND "${_probe_result}" "${_expected}" _found_at)
+    if(_found_at EQUAL -1)
+      message(FATAL_ERROR "the GDeflate lock is dead for one rule: probe "
+                          "${_probe} did not report \"${_expected}\" "
+                          "(issue #183). It reported:\n${_probe_result}")
+    endif()
+  endif()
+endforeach()
+
+# And now against the tree the rules are for.
+cudec_check_gdeflate_locks(${CMAKE_CURRENT_SOURCE_DIR}/../src
+                           _gdeflate_violations)
+if(_gdeflate_violations)
+  message(FATAL_ERROR "the GDeflate reject ladder and its refusal sites have "
+                      "drifted apart (issue #183):\n${_gdeflate_violations}")
 endif()
 
 # ---- Termination, warp-collective integrity, and determinism as structural

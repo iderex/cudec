@@ -143,16 +143,24 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflateReverseBits(uint32_t code,
  * the table unusable for every vector the reference refuses, and for the two
  * it refuses that the format cannot produce (a length past `kMaxLen`, an
  * alphabet past the capacity) - both are caller errors rather than bad input,
- * and refusing is the answer that cannot be mistaken for a decode. */
+ * and refusing is the answer that cannot be mistaken for a decode.
+ *
+ * `why` is where the rung is named. This runs on a length vector with no
+ * schedule in reach - a test builds a table out of bytes it wrote itself, and
+ * so does the static block - so the ladder branch goes into the caller's slot
+ * and the caller holding a schedule raises it with GDeflateRefuseAs. A null
+ * slot is a caller that does not want the reason, never a caller that gets a
+ * table it should not have. */
 template <uint32_t kCapSyms, uint32_t kRootBits, uint32_t kMaxLen>
 CUDEC_HOST_DEVICE inline bool GDeflateBuildTable(
     const unsigned char* lens, uint32_t num_syms,
-    GDeflateHuffTable<kCapSyms, kRootBits, kMaxLen>& t) {
+    GDeflateHuffTable<kCapSyms, kRootBits, kMaxLen>& t,
+    GDeflateReject* why = nullptr) {
     static_assert(kRootBits <= kMaxLen,
                   "a root wider than the longest codeword would index slots "
                   "no code can reach");
     if (num_syms > kCapSyms) {
-        return false;
+        return GDeflateTableRefuse(why, kGDeflateRejectTablePastCapacity);
     }
     for (uint32_t len = 0; len <= kMaxLen; len++) {
         t.count[len] = 0;
@@ -168,7 +176,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateBuildTable(
              * bits - so it is a caller error, and it is refused rather than
              * truncated because a truncated length silently describes a
              * different code. */
-            return false;
+            return GDeflateTableRefuse(why, kGDeflateRejectTableLengthPastMax);
         }
         t.count[len] = static_cast<uint16_t>(t.count[len] + 1u);
     }
@@ -192,7 +200,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateBuildTable(
         /* Over-subscribed: the lengths claim more of the codespace than
          * exists, so at least two symbols share a prefix and no assignment
          * exists. */
-        return false;
+        return GDeflateTableRefuse(why, kGDeflateRejectTableOverSubscribed);
     }
 
     /* Canonical order, and the first index of each length. Both are needed by
@@ -236,7 +244,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateBuildTable(
             return true;
         }
         if (codespace != (full >> 1) || t.count[1] != 1) {
-            return false;
+            return GDeflateTableRefuse(why, kGDeflateRejectTableIncomplete);
         }
         /* One symbol at length 1. The reference gives it both codewords, 0 and
          * 1, so a single bit resolves it whichever way that bit falls; the
@@ -302,7 +310,7 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflateDecodeSymbol(
         /* Stricter than the reference, deliberately: it hands back a symbol
          * the stream never encoded, and a distance built from that symbol is
          * indistinguishable from one the page asked for. */
-        s.failed = true;
+        GDeflateRefuse(s, kGDeflateRejectEmptyTableUsed);
         return kGDeflateNoSymbol;
     }
     if (t.kind == kGDeflateTableSingle) {
@@ -334,7 +342,7 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflateDecodeSymbol(
             return t.sorted[t.first_index[len] + (code - t.first_code[len])];
         }
     }
-    s.failed = true;
+    GDeflateRefuse(s, kGDeflateRejectCodewordNotInCode);
     return kGDeflateNoSymbol;
 }
 
@@ -458,15 +466,16 @@ CUDEC_HOST_DEVICE inline bool GDeflateReadCodeLengths(
     }
 
     GDeflatePrecodeTable precode;
-    if (!GDeflateBuildTable(precode_lens, kGDeflateNumPrecodeSyms, precode)) {
+    GDeflateReject precode_why = kGDeflateRejectNone;
+    if (!GDeflateBuildTable(precode_lens, kGDeflateNumPrecodeSyms, precode,
+                            &precode_why)) {
         /* The flag, not just the return. A precode that is not a code is bad
          * input like any other refusal here, and this header's own contract
          * says a caller that checks the sticky flag once at the end reads the
          * same verdict as one that checks after every call - so a refusal that
          * left the flag clear would break that contract silently. Found by
          * fuzz/fuzz_gdeflate_tables.cpp on its first seed replay. */
-        s.failed = true;
-        return false;
+        return GDeflateRefuseAs(s, precode_why);
     }
 
     /* The expansion starts at a reset exactly as the header did, so the first
@@ -495,8 +504,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateReadCodeLengths(
             if (i == 0) {
                 /* Nothing to repeat. The reference refuses this as well, and
                  * it is the one repeat-code refusal the two decoders share. */
-                s.failed = true;
-                return false;
+                return GDeflateRefuse(s, kGDeflateRejectRepeatNothingBefore);
             }
             rep_val = out.lens[i - 1];
             rep_count = 3u + GDeflatePop(s, 2);
@@ -513,8 +521,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateReadCodeLengths(
              * slack this alphabet does not carry. Written as a subtraction on
              * the side that cannot overflow - `i` is below `total` here, so
              * `total - i` is what is left rather than a sum that could wrap. */
-            s.failed = true;
-            return false;
+            return GDeflateRefuse(s, kGDeflateRejectRepeatRunPastAlphabet);
         }
         for (uint32_t n = 0; n < rep_count; n++) {
             out.lens[i++] = rep_val;
@@ -539,16 +546,20 @@ CUDEC_HOST_DEVICE inline bool GDeflateReadDynamicTables(
     if (!GDeflateReadCodeLengths(s, page, lens)) {
         return false;
     }
-    if (!GDeflateBuildTable(lens.lens, lens.num_litlen, litlen)) {
+    GDeflateReject why = kGDeflateRejectNone;
+    if (!GDeflateBuildTable(lens.lens, lens.num_litlen, litlen, &why)) {
         /* A vector that is not a code is bad input, so the schedule carries
          * the same verdict a bad round would leave: a caller that checks only
-         * the flag must not read this as a page still worth decoding. */
-        s.failed = true;
-        return false;
+         * the flag must not read this as a page still worth decoding. The rung
+         * is the one the construction named, not a second one saying which of
+         * the two vectors carried it: what refused is the property of the
+         * lengths, and a rung per call site would be two rungs one negative
+         * could not tell apart. */
+        return GDeflateRefuseAs(s, why);
     }
-    if (!GDeflateBuildTable(lens.lens + lens.num_litlen, lens.num_dist, dist)) {
-        s.failed = true;
-        return false;
+    if (!GDeflateBuildTable(lens.lens + lens.num_litlen, lens.num_dist, dist,
+                            &why)) {
+        return GDeflateRefuseAs(s, why);
     }
     return true;
 }

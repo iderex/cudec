@@ -115,7 +115,9 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflateDistExtra(uint32_t sym) {
  * lengths). Built through the same construction every other table goes
  * through, so a static block and a dynamic block share one decoder. */
 CUDEC_HOST_DEVICE inline bool GDeflateStaticTables(GDeflateLitLenTable& litlen,
-                                                   GDeflateDistTable& dist) {
+                                                   GDeflateDistTable& dist,
+                                                   GDeflateReject* why =
+                                                       nullptr) {
     unsigned char lens[kGDeflateNumLitLenSyms];
     for (uint32_t i = 0; i < kGDeflateNumLitLenSyms; i++) {
         if (i < 144) {
@@ -128,14 +130,14 @@ CUDEC_HOST_DEVICE inline bool GDeflateStaticTables(GDeflateLitLenTable& litlen,
             lens[i] = 8;
         }
     }
-    if (!GDeflateBuildTable(lens, kGDeflateNumLitLenSyms, litlen)) {
+    if (!GDeflateBuildTable(lens, kGDeflateNumLitLenSyms, litlen, why)) {
         return false;
     }
     unsigned char dist_lens[kGDeflateNumDistSyms];
     for (uint32_t i = 0; i < kGDeflateNumDistSyms; i++) {
         dist_lens[i] = 5;
     }
-    return GDeflateBuildTable(dist_lens, kGDeflateNumDistSyms, dist);
+    return GDeflateBuildTable(dist_lens, kGDeflateNumDistSyms, dist, why);
 }
 
 /* One lane's outstanding match: the length it reserved and where in the output
@@ -196,8 +198,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateDoCopy(GDeflatePageState& st,
      * cannot be the place a narrowing hides: `offset` is at most 65536 and
      * `c.out_pos` is where the reservation started. */
     if (static_cast<uint64_t>(offset) > c.out_pos) {
-        s.failed = true;
-        return false;
+        return GDeflateRefuse(s, kGDeflateRejectMatchBeforeOutput);
     }
     const uint64_t src = c.out_pos - offset;
     /* Byte by byte, forwards, which is what an overlapping match MEANS: a
@@ -261,8 +262,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
         GDeflateEnsure(s, page);
 
         if (block_type == kGDeflateBlockReserved) {
-            s.failed = true;
-            return false;
+            return GDeflateRefuse(s, kGDeflateRejectBlockTypeReserved);
         }
 
         if (block_type == kGDeflateBlockStored) {
@@ -285,9 +285,16 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
             if (s.failed) {
                 return false;
             }
-            if (len > out_cap - out_pos || len > reachable) {
-                s.failed = true;
-                return false;
+            /* Two rungs rather than one condition, for the reason the pop
+             * width and the lane occupancy are two in the schedule: a length
+             * past what the caller can hold and a length past what the page
+             * can still supply are different defects, and a single rung would
+             * let a negative for either stand in for the other. */
+            if (len > out_cap - out_pos) {
+                return GDeflateRefuse(s, kGDeflateRejectStoredPastCap);
+            }
+            if (len > reachable) {
+                return GDeflateRefuse(s, kGDeflateRejectStoredPastPage);
             }
             for (uint32_t n = 0; n < len; n++) {
                 out[out_pos] = static_cast<unsigned char>(GDeflatePop(s, 8));
@@ -299,9 +306,9 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
             }
         } else {
             if (block_type == kGDeflateBlockStatic) {
-                if (!GDeflateStaticTables(st.litlen, st.dist)) {
-                    s.failed = true;
-                    return false;
+                GDeflateReject static_why = kGDeflateRejectNone;
+                if (!GDeflateStaticTables(st.litlen, st.dist, &static_why)) {
+                    return GDeflateRefuseAs(s, static_why);
                 }
             } else if (!GDeflateReadDynamicTables(s, page, st.lens, st.litlen,
                                                   st.dist)) {
@@ -334,8 +341,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
                 }
                 if (sym < kGDeflateEndOfBlock) {
                     if (out_pos == out_cap) {
-                        s.failed = true;
-                        return false;
+                        return GDeflateRefuse(s, kGDeflateRejectLiteralPastCap);
                     }
                     out[out_pos] = static_cast<unsigned char>(sym);
                     out_pos++;
@@ -359,8 +365,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
                     return false;
                 }
                 if (length > out_cap - out_pos) {
-                    s.failed = true;
-                    return false;
+                    return GDeflateRefuse(s, kGDeflateRejectMatchPastCap);
                 }
                 /* The reservation, not the copy. The distance symbol this
                  * match needs arrives on this same lane one round of its own
@@ -379,8 +384,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
                 /* The round cap was reached with no end-of-block. A page that
                  * ran that far has produced more rounds than its own capacity
                  * admits, so it is refused rather than reported as a decode. */
-                s.failed = true;
-                return false;
+                return GDeflateRefuse(s, kGDeflateRejectRoundFuelExhausted);
             }
 
             /* The drain: one round per lane, retiring whatever is still
@@ -407,8 +411,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
         type_bytes[block_type] += out_pos - block_out_start;
     }
     if (!final_block) {
-        s.failed = true;
-        return false;
+        return GDeflateRefuse(s, kGDeflateRejectNoFinalBlock);
     }
     st.blocks = blocks_read;
     for (uint32_t n = 0; n < kGDeflateBlockTypeCount; n++) {
