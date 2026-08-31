@@ -162,7 +162,7 @@ Development here is AI-assisted. Claude (Anthropic) helps with individual
 process steps - generating and analysing code, running the adversarial
 security reviews, and translating documentation and comments into English. It
 never hands over finished, unreviewed work: each step is only a proposal. A
-human maintainer reviews, understands, edits where needed, and signs off on
+human reviews, understands, edits where needed, and signs off on
 every one - the AI proposes, a person decides, and a human stays responsible
 for every line that ships, at all times. The review discipline is modelled,
 as far as is practical for a volunteer project, on the change-control

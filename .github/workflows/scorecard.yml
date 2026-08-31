@@ -11,9 +11,9 @@
 #
 # The public dashboard is deliberately not fed. `publish_results` stays false
 # and no `id-token: write` is granted, because publishing would send this
-# repository's posture to a third-party service, which is a decision the
-# maintainer takes and not a side effect of adding a workflow. The results are
-# visible where the other analysis lands: Security -> Code scanning.
+# repository's posture to a third-party service, which is a decision I take
+# and not a side effect of adding a workflow. The results are visible where
+# the other analysis lands: Security -> Code scanning.
 #
 # The push trigger on `main` is not optional decoration. Scorecard's
 # branch-protection and maintained checks read the default branch, so a run

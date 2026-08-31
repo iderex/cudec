@@ -13,7 +13,7 @@ set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE NEVER)
 include(FetchContent)
 
 # The M3 oracle, pinned by the SHA-256 of the tag archive. snappy publishes no
-# maintainer-uploaded release asset, so this is the fallback the pinning
+# upstream-uploaded release asset, so this is the fallback the pinning
 # policy names (docs/MASTERPLAN.md section 5): the auto-generated archive,
 # pinned, with a future hash mismatch read as the invariant working rather
 # than as noise. Cross-checked at pin time against a second packaging

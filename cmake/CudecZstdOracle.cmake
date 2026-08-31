@@ -14,7 +14,7 @@ set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE NEVER)
 include(FetchContent)
 
 # facebook/zstd, the M5 oracle, pinned by the SHA-256 of the
-# MAINTAINER-UPLOADED release asset - the shape the pinning policy prefers and
+# UPSTREAM-UPLOADED release asset - the shape the pinning policy prefers and
 # lz4 already uses, rather than the auto-generated /archive/ tarball snappy
 # had to fall back to.
 #

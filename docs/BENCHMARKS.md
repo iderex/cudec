@@ -2485,8 +2485,8 @@ exists so that the absence of AMD numbers everywhere above is a recorded fact
 rather than a silence.
 
 **What has and has not happened on AMD, as of this entry.** Every number in
-this file was taken on one NVIDIA device (RTX 3080, sm_86, CUDA 12.6). The
-maintainer hardware is NVIDIA-only, so no AMD GPU has ever executed this
+this file was taken on one NVIDIA device (RTX 3080, sm_86, CUDA 12.6). My
+hardware is NVIDIA-only, so no AMD GPU has ever executed this
 decoder for the project, and no AMD measurement exists to record. There is also
 no AMD build. `CUDEC_ENABLE_HIP` now exists in `CMakeLists.txt`, and it refuses
 on every machine: cudec has no HIP device sources yet, so the option holds the
@@ -2497,11 +2497,11 @@ compile gate land (issue #111) and the "compiled" half becomes a thing a
 workflow run can be pointed at.
 
 **What a community result is, and what it is not.** A third-party measurement
-on hardware the maintainer does not have and cannot re-run. It is recorded as
+on hardware I do not have and cannot re-run. It is recorded as
 exactly that. It is **not** promoted to a project baseline and it does **not**
 gate merges: the rule that regressions against a recorded baseline block a
-merge (MASTERPLAN section 5) applies to the CUDA baselines above, which the
-maintainer can reproduce on demand, and extending it to a number nobody here can
+merge (MASTERPLAN section 5) applies to the CUDA baselines above, which I
+can reproduce on demand, and extending it to a number nobody here can
 reproduce would make an unreproducible figure into a merge veto. A community
 result informs; it does not gate.
 

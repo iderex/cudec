@@ -167,9 +167,9 @@ measured and **rejected**, which is the part a changelog usually loses.
 
 ### Known gaps
 
-- Compute Sanitizer cannot attach to the device on the maintainer's machine, so
+- Compute Sanitizer cannot attach to the device on my machine, so
   the four-tool sweep has never produced a clean run there. The runner script is
   in the tree and the blocker is tracked; nothing in this release is claimed to
   have passed it.
-- The GPU tests run on the maintainer's hardware, not in CI, which has no GPU.
+- The GPU tests run on my hardware, not in CI, which has no GPU.
   CI builds both configurations and runs the host-side subset.
