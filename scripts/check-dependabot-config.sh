@@ -31,11 +31,19 @@ set -eu
 
 cfg="${1:-.github/dependabot.yml}"
 
-# Pinned 2026-08-06 against https://www.schemastore.org/dependabot-2.0.json
+# Pinned 2026-08-31 against https://www.schemastore.org/dependabot-2.0.json
 # (json.schemastore.org 301-redirects there). Recompute with:
 #   curl -fsSL "$schema_url" | sha256sum
+#
+# Moved from 46255f69 on 2026-08-31 after reading what changed upstream (#422).
+# One commit touched the file in the window, SchemaStore 07a2d101 "make
+# multi-ecosystem patterns optional", and its whole diff is the removal of one
+# conditional: a config naming multi-ecosystem-group no longer has to name
+# patterns. That is a loosening, so it cannot invalidate a document that
+# validated before it, and this repository uses neither key - so the rule that
+# went away could never have applied here.
 schema_url="https://www.schemastore.org/dependabot-2.0.json"
-schema_sha256="46255f692a8d661325e9d044b50f4b687aff68633b716420b64e460fb212b471"
+schema_sha256="c6c2432adc55b40f828b0f987f8024bb9b8926a978301e9cdf4fe3410ee7cf31"
 
 # Exact versions, so the gate's own dependencies cannot move underneath it.
 yaml_pkg="js-yaml@4.1.0"
