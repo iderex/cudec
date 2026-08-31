@@ -6,7 +6,7 @@
  * does not return a bad status, it holds the launch - and with it every other
  * chunk in the batch and the stream behind it.
  *
- * A plain cudaStreamSynchronize would inherit exactly that hang and stall the
+ * A plain stream synchronise would inherit exactly that hang and stall the
  * suite, so the launch is fenced with an event and polled against a wall-clock
  * deadline: an expiry FAILS the test with a message instead of blocking. The
  * ctest TIMEOUT on this target is the second line of defence; the process exit
@@ -24,7 +24,7 @@
 #include "lz4_block.h"
 #include "require.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt_test.h"
 
 #include <chrono>
 #include <cstdint>
@@ -101,8 +101,8 @@ int BuildBatch(const std::vector<Chunk>& chunks, Batch* batch) {
 
     batch->n = n;
     batch->dst_arena_size = dst_total;
-    REQUIRE_CUDA(cudaMalloc(&batch->d_src_blob, src_total));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_dst_arena, dst_total));
+    REQUIRE_RT(cudec_rt::device_malloc(&batch->d_src_blob, src_total));
+    REQUIRE_RT(cudec_rt::device_malloc(&batch->d_dst_arena, dst_total));
     for (size_t i = 0; i < n; i++) {
         for (size_t k = 0; k < sizes[i]; k++) {
             src_blob[src_off[i] + k] = chunks[i].src[k];
@@ -111,55 +111,62 @@ int BuildBatch(const std::vector<Chunk>& chunks, Batch* batch) {
         h_srcs[i] = batch->d_src_blob + src_off[i];
         h_dsts[i] = batch->d_dst_arena + dst_off[i];
     }
-    REQUIRE_CUDA(cudaMemcpy(batch->d_src_blob, src_blob.data(), src_total,
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemset(batch->d_dst_arena, kDstPoison, dst_total));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_src_blob, src_blob.data(), src_total,
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(
+        cudec_rt::device_memset(batch->d_dst_arena, kDstPoison, dst_total));
 
-    REQUIRE_CUDA(cudaMalloc(&batch->d_srcs, n * sizeof(*batch->d_srcs)));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_dsts, n * sizeof(*batch->d_dsts)));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_sizes, n * sizeof(*batch->d_sizes)));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_caps, n * sizeof(*batch->d_caps)));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_results, n * sizeof(*batch->d_results)));
-    REQUIRE_CUDA(cudaMemcpy(batch->d_srcs, h_srcs.data(),
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&batch->d_srcs, n * sizeof(*batch->d_srcs)));
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&batch->d_dsts, n * sizeof(*batch->d_dsts)));
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&batch->d_sizes, n * sizeof(*batch->d_sizes)));
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&batch->d_caps, n * sizeof(*batch->d_caps)));
+    REQUIRE_RT(cudec_rt::device_malloc(&batch->d_results,
+                                       n * sizeof(*batch->d_results)));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_srcs, h_srcs.data(),
                             n * sizeof(*batch->d_srcs),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(batch->d_dsts, h_dsts.data(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_dsts, h_dsts.data(),
                             n * sizeof(*batch->d_dsts),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(batch->d_sizes, sizes.data(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_sizes, sizes.data(),
                             n * sizeof(*batch->d_sizes),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(batch->d_caps, caps.data(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_caps, caps.data(),
                             n * sizeof(*batch->d_caps),
-                            cudaMemcpyHostToDevice));
+                            cudec_rt::memcpy_h2d));
     /* The 0xFF sentinel is out of the status enum's range, so a chunk the
      * kernel never reached cannot be mistaken for a decoded one. */
-    REQUIRE_CUDA(
-        cudaMemset(batch->d_results, 0xFF, n * sizeof(*batch->d_results)));
+    REQUIRE_RT(
+        cudec_rt::device_memset(batch->d_results, 0xFF,
+                                n * sizeof(*batch->d_results)));
     return 0;
 }
 
 /* Submits the batch and waits on an event, not on the stream: a launch that
  * does not finish must be REPORTED, never waited on. */
 int DecodeWithWatchdog(const Batch& b, size_t begin, size_t count) {
-    cudaStream_t stream;
-    cudaEvent_t finished;
-    REQUIRE_CUDA(cudaStreamCreate(&stream));
-    REQUIRE_CUDA(cudaEventCreateWithFlags(&finished, cudaEventDisableTiming));
+    cudec_rt::stream_t stream;
+    cudec_rt::event_t finished;
+    REQUIRE_RT(cudec_rt::stream_create(&stream));
+    REQUIRE_RT(cudec_rt::event_create_untimed(&finished));
     REQUIRE(cudec_lz4_decompress_batch(b.d_srcs + begin, b.d_sizes + begin,
                                        b.d_dsts + begin, b.d_caps + begin,
                                        count, b.d_results + begin,
                                        stream) == CUDEC_OK);
-    REQUIRE_CUDA(cudaEventRecord(finished, stream));
+    REQUIRE_RT(cudec_rt::event_record(finished, stream));
 
     const auto start = std::chrono::steady_clock::now();
     while (true) {
-        const cudaError_t query = cudaEventQuery(finished);
-        if (query == cudaSuccess) {
+        const cudec_rt::error_t query = cudec_rt::event_query(finished);
+        if (query == cudec_rt::success) {
             break;
         }
-        REQUIRE_CTX(query == cudaErrorNotReady, "cudaEventQuery failed: %s",
-                    cudaGetErrorString(query));
+        REQUIRE_CTX(query == cudec_rt::error_not_ready,
+                    "event query failed: %s", cudec_rt::error_string(query));
         const double elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           start)
@@ -174,8 +181,8 @@ int DecodeWithWatchdog(const Batch& b, size_t begin, size_t count) {
                     begin, begin + count, kDeadlineSeconds);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    REQUIRE_CUDA(cudaEventDestroy(finished));
-    REQUIRE_CUDA(cudaStreamDestroy(stream));
+    REQUIRE_RT(cudec_rt::event_destroy(finished));
+    REQUIRE_RT(cudec_rt::stream_destroy(stream));
     return 0;
 }
 
@@ -201,24 +208,24 @@ struct UnsupportedGeometry {
 };
 
 int RequireGeometryRefused(const Batch& b, const UnsupportedGeometry& g) {
-    cudaStream_t stream;
-    cudaEvent_t finished;
-    REQUIRE_CUDA(cudaStreamCreate(&stream));
-    REQUIRE_CUDA(cudaEventCreateWithFlags(&finished, cudaEventDisableTiming));
+    cudec_rt::stream_t stream;
+    cudec_rt::event_t finished;
+    REQUIRE_RT(cudec_rt::stream_create(&stream));
+    REQUIRE_RT(cudec_rt::event_create_untimed(&finished));
     cudec_detail::chunk_decode_batch<cudec_detail::Lz4Parser, false,
                                     cudec_detail::kCudaWaveSize>
         <<<g.blocks, g.threads, 0, stream>>>(b.d_srcs, b.d_sizes, b.d_dsts,
                                              b.d_caps, b.n, b.d_results);
-    REQUIRE_CUDA(cudaGetLastError());
-    REQUIRE_CUDA(cudaEventRecord(finished, stream));
+    REQUIRE_RT(cudec_rt::get_last_error());
+    REQUIRE_RT(cudec_rt::event_record(finished, stream));
     const auto start = std::chrono::steady_clock::now();
     while (true) {
-        const cudaError_t query = cudaEventQuery(finished);
-        if (query == cudaSuccess) {
+        const cudec_rt::error_t query = cudec_rt::event_query(finished);
+        if (query == cudec_rt::success) {
             break;
         }
-        REQUIRE_CTX(query == cudaErrorNotReady, "cudaEventQuery failed: %s",
-                    cudaGetErrorString(query));
+        REQUIRE_CTX(query == cudec_rt::error_not_ready,
+                    "event query failed: %s", cudec_rt::error_string(query));
         const double elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           start)
@@ -229,17 +236,17 @@ int RequireGeometryRefused(const Batch& b, const UnsupportedGeometry& g) {
                     g.name, kDeadlineSeconds);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    REQUIRE_CUDA(cudaEventDestroy(finished));
-    REQUIRE_CUDA(cudaStreamDestroy(stream));
+    REQUIRE_RT(cudec_rt::event_destroy(finished));
+    REQUIRE_RT(cudec_rt::stream_destroy(stream));
 
     /* Refused means refused: every result record still carries the 0xFF
      * sentinel BuildBatch primed, and every destination byte is still poison.
      * Without this the test would pass on a kernel that decoded half of each
      * chunk and returned. */
     std::vector<cudec_chunk_result> results(b.n);
-    REQUIRE_CUDA(cudaMemcpy(results.data(), b.d_results,
+    REQUIRE_RT(cudec_rt::memcpy(results.data(), b.d_results,
                             b.n * sizeof(*b.d_results),
-                            cudaMemcpyDeviceToHost));
+                            cudec_rt::memcpy_d2h));
     for (size_t i = 0; i < b.n; i++) {
         REQUIRE_CTX(results[i].status == -1 && results[i].reserved == 0xFFFFFFFFu &&
                         results[i].bytes_written == UINT64_MAX,
@@ -248,8 +255,8 @@ int RequireGeometryRefused(const Batch& b, const UnsupportedGeometry& g) {
                     g.name, i, b.names[i].c_str());
     }
     std::vector<unsigned char> arena(b.dst_arena_size, 0);
-    REQUIRE_CUDA(cudaMemcpy(arena.data(), b.d_dst_arena, b.dst_arena_size,
-                            cudaMemcpyDeviceToHost));
+    REQUIRE_RT(cudec_rt::memcpy(arena.data(), b.d_dst_arena, b.dst_arena_size,
+                            cudec_rt::memcpy_d2h));
     for (size_t i = 0; i < arena.size(); i++) {
         REQUIRE_CTX(arena[i] == kDstPoison,
                     "%s: destination byte %zu was written by a geometry the "
@@ -261,9 +268,9 @@ int RequireGeometryRefused(const Batch& b, const UnsupportedGeometry& g) {
 
 int CheckResults(const Batch& b) {
     std::vector<cudec_chunk_result> results(b.n);
-    REQUIRE_CUDA(cudaMemcpy(results.data(), b.d_results,
+    REQUIRE_RT(cudec_rt::memcpy(results.data(), b.d_results,
                             b.n * sizeof(*b.d_results),
-                            cudaMemcpyDeviceToHost));
+                            cudec_rt::memcpy_d2h));
     size_t rejected = 0;
     for (size_t i = 0; i < b.n; i++) {
         const cudec_chunk_result& r = results[i];

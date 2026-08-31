@@ -27,7 +27,7 @@
 #include "fixtures.h"
 #include "require.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt_test.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -117,12 +117,12 @@ int main() {
     const std::vector<unsigned char> block = MakeBlock(match_len);
     const uint64_t dst_capacity = DecodedSize(match_len);
 
-    /* Refused, never skipped. cudaMemGetInfo is asked before anything is
+    /* Refused, never skipped. The free-memory query is asked before anything is
      * allocated so the message names the shortfall instead of an
      * out-of-memory return several calls later. */
     size_t free_bytes = 0;
     size_t total_bytes = 0;
-    REQUIRE_CUDA(cudaMemGetInfo(&free_bytes, &total_bytes));
+    REQUIRE_RT(cudec_rt::mem_get_info(&free_bytes, &total_bytes));
     const uint64_t needed = dst_capacity + block.size();
     REQUIRE_CTX(free_bytes >= needed,
                 "this test needs %llu bytes on the device and %zu are free "
@@ -132,39 +132,40 @@ int main() {
                 total_bytes);
 
     DeviceBatch b;
-    REQUIRE_CUDA(cudaMalloc(&b.src, block.size()));
-    REQUIRE_CUDA(cudaMalloc(&b.dst, static_cast<size_t>(dst_capacity)));
-    REQUIRE_CUDA(cudaMemcpy(b.src, block.data(), block.size(),
-                            cudaMemcpyHostToDevice));
+    REQUIRE_RT(cudec_rt::device_malloc(&b.src, block.size()));
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&b.dst, static_cast<size_t>(dst_capacity)));
+    REQUIRE_RT(cudec_rt::memcpy(b.src, block.data(), block.size(),
+                            cudec_rt::memcpy_h2d));
 
     const void* h_src_ptr = b.src;
     void* h_dst_ptr = b.dst;
     const size_t h_src_size = block.size();
     const size_t h_dst_cap = static_cast<size_t>(dst_capacity);
-    REQUIRE_CUDA(cudaMalloc(&b.src_ptrs, sizeof(h_src_ptr)));
-    REQUIRE_CUDA(cudaMalloc(&b.dst_ptrs, sizeof(h_dst_ptr)));
-    REQUIRE_CUDA(cudaMalloc(&b.src_sizes, sizeof(h_src_size)));
-    REQUIRE_CUDA(cudaMalloc(&b.dst_caps, sizeof(h_dst_cap)));
-    REQUIRE_CUDA(cudaMalloc(&b.results, sizeof(*b.results)));
-    REQUIRE_CUDA(cudaMemcpy(b.src_ptrs, &h_src_ptr, sizeof(h_src_ptr),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(b.dst_ptrs, &h_dst_ptr, sizeof(h_dst_ptr),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(b.src_sizes, &h_src_size, sizeof(h_src_size),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(b.dst_caps, &h_dst_cap, sizeof(h_dst_cap),
-                            cudaMemcpyHostToDevice));
+    REQUIRE_RT(cudec_rt::device_malloc(&b.src_ptrs, sizeof(h_src_ptr)));
+    REQUIRE_RT(cudec_rt::device_malloc(&b.dst_ptrs, sizeof(h_dst_ptr)));
+    REQUIRE_RT(cudec_rt::device_malloc(&b.src_sizes, sizeof(h_src_size)));
+    REQUIRE_RT(cudec_rt::device_malloc(&b.dst_caps, sizeof(h_dst_cap)));
+    REQUIRE_RT(cudec_rt::device_malloc(&b.results, sizeof(*b.results)));
+    REQUIRE_RT(cudec_rt::memcpy(b.src_ptrs, &h_src_ptr, sizeof(h_src_ptr),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(b.dst_ptrs, &h_dst_ptr, sizeof(h_dst_ptr),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(b.src_sizes, &h_src_size, sizeof(h_src_size),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(b.dst_caps, &h_dst_cap, sizeof(h_dst_cap),
+                            cudec_rt::memcpy_h2d));
 
-    cudaStream_t stream;
-    REQUIRE_CUDA(cudaStreamCreate(&stream));
+    cudec_rt::stream_t stream;
+    REQUIRE_RT(cudec_rt::stream_create(&stream));
     REQUIRE(cudec_lz4_decompress_batch(b.src_ptrs, b.src_sizes, b.dst_ptrs,
                                        b.dst_caps, 1, b.results,
                                        stream) == CUDEC_OK);
-    REQUIRE_CUDA(cudaStreamSynchronize(stream));
+    REQUIRE_RT(cudec_rt::stream_synchronize(stream));
 
     cudec_chunk_result result{};
-    REQUIRE_CUDA(cudaMemcpy(&result, b.results, sizeof(result),
-                            cudaMemcpyDeviceToHost));
+    REQUIRE_RT(cudec_rt::memcpy(&result, b.results, sizeof(result),
+                            cudec_rt::memcpy_d2h));
     REQUIRE_CTX(result.status == CUDEC_OK, "chunk status %d", result.status);
     REQUIRE_CTX(result.bytes_written == dst_capacity,
                 "bytes_written %llu, expected %llu",
@@ -176,8 +177,8 @@ int main() {
     const uint64_t window_begin = (uint64_t{1} << 32) - 29;
     const size_t window_bytes = 64;
     unsigned char window[window_bytes];
-    REQUIRE_CUDA(cudaMemcpy(window, b.dst + window_begin, window_bytes,
-                            cudaMemcpyDeviceToHost));
+    REQUIRE_RT(cudec_rt::memcpy(window, b.dst + window_begin, window_bytes,
+                            cudec_rt::memcpy_d2h));
     size_t differing = 0;
     for (size_t i = 0; i < window_bytes; i++) {
         if (window[i] != ExpectedByte(match_len, window_begin + i)) {
@@ -194,10 +195,10 @@ int main() {
      * nothing at all cannot pass. */
     unsigned char head[16];
     unsigned char tail[16];
-    REQUIRE_CUDA(
-        cudaMemcpy(head, b.dst, sizeof(head), cudaMemcpyDeviceToHost));
-    REQUIRE_CUDA(cudaMemcpy(tail, b.dst + dst_capacity - sizeof(tail),
-                            sizeof(tail), cudaMemcpyDeviceToHost));
+    REQUIRE_RT(
+        cudec_rt::memcpy(head, b.dst, sizeof(head), cudec_rt::memcpy_d2h));
+    REQUIRE_RT(cudec_rt::memcpy(tail, b.dst + dst_capacity - sizeof(tail),
+                            sizeof(tail), cudec_rt::memcpy_d2h));
     for (size_t i = 0; i < sizeof(head); i++) {
         REQUIRE_CTX(head[i] == ExpectedByte(match_len, i),
                     "head byte %zu is 0x%02X, expected 0x%02X", i, head[i],
@@ -211,14 +212,14 @@ int main() {
                     ExpectedByte(match_len, at));
     }
 
-    REQUIRE_CUDA(cudaStreamDestroy(stream));
-    REQUIRE_CUDA(cudaFree(b.results));
-    REQUIRE_CUDA(cudaFree(b.dst_caps));
-    REQUIRE_CUDA(cudaFree(b.src_sizes));
-    REQUIRE_CUDA(cudaFree(b.dst_ptrs));
-    REQUIRE_CUDA(cudaFree(b.src_ptrs));
-    REQUIRE_CUDA(cudaFree(b.dst));
-    REQUIRE_CUDA(cudaFree(b.src));
+    REQUIRE_RT(cudec_rt::stream_destroy(stream));
+    REQUIRE_RT(cudec_rt::device_free(b.results));
+    REQUIRE_RT(cudec_rt::device_free(b.dst_caps));
+    REQUIRE_RT(cudec_rt::device_free(b.src_sizes));
+    REQUIRE_RT(cudec_rt::device_free(b.dst_ptrs));
+    REQUIRE_RT(cudec_rt::device_free(b.src_ptrs));
+    REQUIRE_RT(cudec_rt::device_free(b.dst));
+    REQUIRE_RT(cudec_rt::device_free(b.src));
 
     std::printf(
         "PASS: 2^32 + 4096 byte match at offset 3 decodes bit-exact across "

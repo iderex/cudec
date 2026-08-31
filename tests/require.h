@@ -30,7 +30,12 @@
         }                                                                  \
     } while (0)
 
-#define REQUIRE_CUDA(call) REQUIRE((call) == cudaSuccess)
+/* A device-runtime call that must succeed. The comparison goes through
+ * the vendor seam rather than through a backend constant, so a test
+ * asserting on the runtime is one source for both backends (issue #243);
+ * the macro body is only expanded where a test uses it, so the host-only
+ * tests that include this header still pull in no runtime. */
+#define REQUIRE_RT(call) REQUIRE((call) == cudec_rt::success)
 
 /* Byte-diff for the buffer-shaped assertion domain: reports the first
  * mismatch offset plus a small hex window instead of a bare boolean. */
