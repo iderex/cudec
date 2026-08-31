@@ -217,7 +217,7 @@ is not an empty AMD field), and **hackability**.
   the CUDA version it was produced against. **racecheck detects
   shared-memory hazards only** - global-memory races are outside its scope,
   and a clean sweep is never read as clearance for them. Today the gate is
-  **parked**: owed and unproducible on the maintainer route, under WSL2 the
+  **parked**: owed and unproducible on my route, under WSL2 the
   device is in WDDM mode, the debugger interface the tools need is absent, and
   all four report the same two initialization errors against a program with no
   fault in it. Re-measured against the newest driver and toolkit pairing the
@@ -226,7 +226,7 @@ is not an empty AMD field), and **hackability**.
   evidence and not a dispensation from the gate: it was not moved to a paid GPU
   runner, and what would lift it is a device offering a debugger interface.
 - **Oracle pinning policy**: oracles are vendored via FetchContent from
-  maintainer-uploaded release assets, pinned by a self-computed SHA-256
+  upstream-uploaded release assets, pinned by a self-computed SHA-256
   cross-checked against a second packaging ecosystem; auto-generated
   `/archive/` tarballs are avoided (GitHub regenerated them in 2023 and
   their hashes moved). Where a project publishes no uploaded asset, the
@@ -281,8 +281,8 @@ is not an empty AMD field), and **hackability**.
   ladder.
 - **Zstd complexity.** M5 is months, not weeks; the README does not promise
   it until M4 has shipped.
-- **Single-machine development.** CI has no GPU; kernel tests run on the
-  maintainer's hardware. The CI gate covers build + host-side tests; GPU
+- **Single-machine development.** CI has no GPU; kernel tests run on my
+  hardware. The CI gate covers build + host-side tests; GPU
   test results are recorded in the PR before merge.
 
 ## 8. Open design questions (settled via design issues before use)
@@ -866,7 +866,7 @@ streaming-entry scope decision. Numbers and kernel never move in the same
 PR, and the perf pass inherits section 9's pre-registered zero-regression
 rule on the worst case from its first baseline.
 
-**No open maintainer decision.** Every fork above was settled at the panel;
+**No open release-gate decision.** Every fork above was settled at the panel;
 none of them is a call that needs the release gate.
 
 ## 11. M4 GDeflate format dossier
@@ -874,7 +874,7 @@ none of them is a call that needs the release gate.
 What GDeflate is, sourced, so that the kernel design panel and the
 table/parse core work from one record instead of each re-reading a draft.
 Facts and provenance only. No design decision is taken below, and the legal
-posture is settled in its own maintainer-gated issue.
+posture is settled in its own release-gated issue.
 
 ### 11.1 Provenance: three artifacts, no single specification
 
@@ -1264,7 +1264,7 @@ Recording where the verification apparatus came from is worth doing on its
 own terms, and it means the vendoring rung has nothing left to invent.
 
 **This subsection is about attribution only.** The patent position and the
-implementation-provenance posture were a separate, maintainer-gated
+implementation-provenance posture were a separate, release-gated
 decision; it is taken, and section 16 carries it. Nothing here softens it.
 
 ## 12. M5 Zstd v1 decode subset (RFC 8878)

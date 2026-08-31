@@ -112,7 +112,7 @@ non-deterministic in it to control:
 - `tests/CMakeLists.txt` - the structural axis: the floating-point ban above,
   checked at configure time, with probes that prove the check still bites.
 
-The GPU-to-GPU axis is **reasoned, not measured**: the maintainer's gate runs one
+The GPU-to-GPU axis is **reasoned, not measured**: my gate runs one
 device (an RTX 3080, `sm_86`). It rests on the integer-only argument above rather
 than on a two-GPU comparison, and it is stated that way deliberately - a claim
 without a measurement is not a measurement. A second device joins the gate when

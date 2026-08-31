@@ -1582,7 +1582,7 @@ endif()
 #    is what makes the gpu_to_gpu level in docs/DETERMINISM.md hold by
 #    construction rather than by measurement;
 #  - wave width: no bare 32 or 64 outside the one line that binds it to a
-#    name. The maintainer's hardware is NVIDIA, so a hardcoded 32 left in a
+#    name. My hardware is NVIDIA, so a hardcoded 32 left in a
 #    lane-stride expression is invisible to every test that can be run here
 #    and wrong on every wave64 device (issue #211). A width must arrive as the
 #    `WaveSize` template parameter or as a constant named after it, and the

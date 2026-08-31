@@ -12,7 +12,7 @@ include_guard(GLOBAL)
 # line at all.
 set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE NEVER)
 
-# liblz4, pinned by the SHA-256 of the maintainer-uploaded release asset
+# liblz4, pinned by the SHA-256 of the upstream-uploaded release asset
 # (self-computed at pin time and cross-checked against conan-center; the
 # auto-generated /archive/ tarballs are avoided - GitHub regenerated them
 # in 2023 and their hashes moved). Test-only dependency: the link

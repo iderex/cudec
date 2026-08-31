@@ -349,7 +349,7 @@ jobs:
           ./build-consumer-nocuda/consumer
 
       # The host-side subset; gpu-labeled tests run in this same container
-      # on the maintainer's machine and their output is pasted into the PR.
+      # on my machine and their output is pasted into the PR.
       # Fail-closed plumbing: --no-tests=error reds a vacuous zero-test
       # selection, and the identity greps pin BOTH sets by name - a known
       # host test silently dropping out of the CI selection (say, by

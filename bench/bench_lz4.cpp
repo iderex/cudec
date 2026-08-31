@@ -77,7 +77,7 @@ static_assert(kLongmatchOffset >= kLongmatchMatchLen,
  * It is a MODEL of the workload, not the workload. A synthetic mixture is
  * not a measurement on real game data, and no number taken here may be
  * quoted as one; docs/BENCHMARK-METHODOLOGY.md carries the same sentence
- * beside the corpus entry. The maintainer's decision on issue #139 chose the
+ * beside the corpus entry. My decision on issue #139 chose the
  * generator over a hash-pinned asset pack deliberately: no network, no mirror
  * that can rot, no licence review on a third-party package, and CI stays
  * offline. A vetted pack may later join the set beside this generator; it
