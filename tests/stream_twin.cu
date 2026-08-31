@@ -15,7 +15,7 @@
 #include "fixtures.h"
 #include "require.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt_test.h"
 
 #include <cstdio>
 #include <cstring>
@@ -60,9 +60,10 @@ int RunStreamCtx(cudec_stream_ctx* ctx, const std::vector<SChunk>& chunks,
             h_dst[i] = host_dst[i].data();
         } else {
             void* d = nullptr;
-            REQUIRE_CUDA(cudaMalloc(&d, chunks[i].cap ? chunks[i].cap : 1));
+            REQUIRE_RT(
+                cudec_rt::device_malloc(&d, chunks[i].cap ? chunks[i].cap : 1));
             if (chunks[i].cap) {
-                REQUIRE_CUDA(cudaMemset(d, kPoison, chunks[i].cap));
+                REQUIRE_RT(cudec_rt::device_memset(d, kPoison, chunks[i].cap));
             }
             h_dst[i] = d;
         }
@@ -83,8 +84,8 @@ int RunStreamCtx(cudec_stream_ctx* ctx, const std::vector<SChunk>& chunks,
             std::memcpy((*dst_bytes)[i].data(), host_dst[i].data(),
                         chunks[i].cap);
         } else {
-            REQUIRE_CUDA(cudaMemcpy((*dst_bytes)[i].data(), h_dst[i],
-                                    chunks[i].cap, cudaMemcpyDeviceToHost));
+            REQUIRE_RT(cudec_rt::memcpy((*dst_bytes)[i].data(), h_dst[i],
+                                    chunks[i].cap, cudec_rt::memcpy_d2h));
         }
     }
     return 0;
@@ -391,7 +392,8 @@ int main() {
 
     /* Poison path: a decode forced to a DEFINED CUDA fault poisons the context.
      * An impossibly large device staging (an oversized dst capacity for the
-     * host-output path) fails its cudaMalloc with a defined error BEFORE any
+     * host-output path) fails its device allocation with a defined error
+     * BEFORE any
      * staging copy runs - the grow precedes the wave loop, so the huge capacity
      * is never dereferenced (no undefined behavior). The next decode returns
      * CUDEC_ERR_CUDA; destroy still frees. */
@@ -461,8 +463,8 @@ int main() {
         constexpr unsigned char kStage = 0x5C;
 
         unsigned char* d_stage = nullptr;
-        REQUIRE_CUDA(cudaMalloc(&d_stage, kCap + kSlack));
-        REQUIRE_CUDA(cudaMemset(d_stage, kStage, kCap + kSlack));
+        REQUIRE_RT(cudec_rt::device_malloc(&d_stage, kCap + kSlack));
+        REQUIRE_RT(cudec_rt::device_memset(d_stage, kStage, kCap + kSlack));
 
         std::vector<unsigned char> host(kCap + kSlack, kPoison);
         void* dsts[1] = {host.data()};
@@ -517,7 +519,7 @@ int main() {
         for (size_t j = 16; j < host.size(); j++) {
             REQUIRE_CTX(host[j] == kPoison, "short bw wrote past bw at %zu", j);
         }
-        REQUIRE_CUDA(cudaFree(d_stage));
+        REQUIRE_RT(cudec_rt::device_free(d_stage));
     }
 
     std::printf("PASS: reused-context decode bit-identical to fresh across "

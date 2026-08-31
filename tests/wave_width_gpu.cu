@@ -30,7 +30,7 @@
 #include "lz4_block.h"
 #include "require.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt_test.h"
 
 #include <cstdio>
 #include <cstring>
@@ -77,12 +77,14 @@ int BothInstantiationsAreInTheBinary() {
      * main turns a non-zero answer into the test's own failure. */
     using cudec_detail::chunk_decode_batch;
     using cudec_detail::Lz4Parser;
-    cudaFuncAttributes at_wave32;
-    cudaFuncAttributes at_wave64;
-    REQUIRE_CUDA(cudaFuncGetAttributes(
-        &at_wave32, chunk_decode_batch<Lz4Parser, false, kWave32>));
-    REQUIRE_CUDA(cudaFuncGetAttributes(
-        &at_wave64, chunk_decode_batch<Lz4Parser, false, kWave64>));
+    cudec_rt::func_attributes_t at_wave32;
+    cudec_rt::func_attributes_t at_wave64;
+    REQUIRE_RT(cudec_rt::func_get_attributes(
+        &at_wave32, reinterpret_cast<const void*>(
+                        &chunk_decode_batch<Lz4Parser, false, kWave32>)));
+    REQUIRE_RT(cudec_rt::func_get_attributes(
+        &at_wave64, reinterpret_cast<const void*>(
+                        &chunk_decode_batch<Lz4Parser, false, kWave64>)));
     REQUIRE(at_wave32.maxThreadsPerBlock ==
             static_cast<int>(cudec_detail::kBlockThreadsFor<kWave32>));
     REQUIRE(at_wave64.maxThreadsPerBlock ==
@@ -143,29 +145,30 @@ int main() {
     size_t* d_sizes = nullptr;
     size_t* d_caps = nullptr;
     cudec_chunk_result* d_results = nullptr;
-    REQUIRE_CUDA(cudaMalloc(&d_src, block.size()));
-    REQUIRE_CUDA(cudaMalloc(&d_dst, payload.size()));
-    REQUIRE_CUDA(cudaMalloc(&d_src_ptrs, sizeof(void*)));
-    REQUIRE_CUDA(cudaMalloc(&d_dst_ptrs, sizeof(void*)));
-    REQUIRE_CUDA(cudaMalloc(&d_sizes, sizeof(size_t)));
-    REQUIRE_CUDA(cudaMalloc(&d_caps, sizeof(size_t)));
-    REQUIRE_CUDA(cudaMalloc(&d_results, sizeof(cudec_chunk_result)));
-    REQUIRE_CUDA(cudaMemcpy(d_src, block.data(), block.size(),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemset(d_dst, 0, payload.size()));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_src, block.size()));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_dst, payload.size()));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_src_ptrs, sizeof(void*)));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_dst_ptrs, sizeof(void*)));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_sizes, sizeof(size_t)));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_caps, sizeof(size_t)));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_results, sizeof(cudec_chunk_result)));
+    REQUIRE_RT(cudec_rt::memcpy(d_src, block.data(), block.size(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::device_memset(d_dst, 0, payload.size()));
 
     const void* h_src_ptr = d_src;
     void* h_dst_ptr = d_dst;
     const size_t h_size = block.size();
     const size_t h_cap = payload.size();
-    REQUIRE_CUDA(cudaMemcpy(d_src_ptrs, &h_src_ptr, sizeof(void*),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(d_dst_ptrs, &h_dst_ptr, sizeof(void*),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(
-        cudaMemcpy(d_sizes, &h_size, sizeof(size_t), cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(
-        cudaMemcpy(d_caps, &h_cap, sizeof(size_t), cudaMemcpyHostToDevice));
+    REQUIRE_RT(cudec_rt::memcpy(d_src_ptrs, &h_src_ptr, sizeof(void*),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(d_dst_ptrs, &h_dst_ptr, sizeof(void*),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(
+        cudec_rt::memcpy(d_sizes, &h_size, sizeof(size_t),
+                         cudec_rt::memcpy_h2d));
+    REQUIRE_RT(
+        cudec_rt::memcpy(d_caps, &h_cap, sizeof(size_t), cudec_rt::memcpy_h2d));
 
     /* The launch geometry is derived from the parameter, exactly as the
      * shipped entry derives it. Hoisted into a named constant because the
@@ -177,18 +180,18 @@ int main() {
                                      cudec_detail::kCudaWaveSize>
         <<<1, kThreads>>>(d_src_ptrs, d_sizes, d_dst_ptrs, d_caps, 1,
                           d_results);
-    REQUIRE_CUDA(cudaGetLastError());
-    REQUIRE_CUDA(cudaDeviceSynchronize());
+    REQUIRE_RT(cudec_rt::get_last_error());
+    REQUIRE_RT(cudec_rt::device_synchronize());
 
     cudec_chunk_result result;
-    REQUIRE_CUDA(cudaMemcpy(&result, d_results, sizeof(result),
-                            cudaMemcpyDeviceToHost));
+    REQUIRE_RT(cudec_rt::memcpy(&result, d_results, sizeof(result),
+                            cudec_rt::memcpy_d2h));
     REQUIRE(result.status == CUDEC_OK);
     REQUIRE(result.bytes_written == payload.size());
 
     std::vector<unsigned char> out(payload.size(), 0);
-    REQUIRE_CUDA(cudaMemcpy(out.data(), d_dst, out.size(),
-                            cudaMemcpyDeviceToHost));
+    REQUIRE_RT(cudec_rt::memcpy(out.data(), d_dst, out.size(),
+                            cudec_rt::memcpy_d2h));
     REQUIRE(std::memcmp(out.data(), payload.data(), payload.size()) == 0);
 
     std::printf("PASS: both wave widths instantiate; the shipped width "

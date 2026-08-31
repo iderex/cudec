@@ -26,7 +26,7 @@
 #include "snappy_block.h"
 #include "require.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt_test.h"
 
 #include <cstdio>
 #include <string>
@@ -105,10 +105,10 @@ int BuildBatch(const std::vector<Chunk>& chunks, Batch* batch) {
 
     batch->n = n;
     batch->dst_arena_size = dst_total;
-    REQUIRE_CUDA(cudaMalloc(&batch->d_src_blob, src_total));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_dst_arena, dst_total));
-    REQUIRE_CUDA(cudaMemcpy(batch->d_src_blob, src_blob.data(), src_total,
-                            cudaMemcpyHostToDevice));
+    REQUIRE_RT(cudec_rt::device_malloc(&batch->d_src_blob, src_total));
+    REQUIRE_RT(cudec_rt::device_malloc(&batch->d_dst_arena, dst_total));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_src_blob, src_blob.data(), src_total,
+                            cudec_rt::memcpy_h2d));
 
     std::vector<const void*> h_srcs(n);
     std::vector<void*> h_dsts(n);
@@ -117,23 +117,28 @@ int BuildBatch(const std::vector<Chunk>& chunks, Batch* batch) {
         h_srcs[i] = batch->d_src_blob + src_off[i];
         h_dsts[i] = batch->d_dst_arena + dst_off[i];
     }
-    REQUIRE_CUDA(cudaMalloc(&batch->d_srcs, n * sizeof(*batch->d_srcs)));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_dsts, n * sizeof(*batch->d_dsts)));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_sizes, n * sizeof(*batch->d_sizes)));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_caps, n * sizeof(*batch->d_caps)));
-    REQUIRE_CUDA(cudaMalloc(&batch->d_results, n * sizeof(*batch->d_results)));
-    REQUIRE_CUDA(cudaMemcpy(batch->d_srcs, h_srcs.data(),
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&batch->d_srcs, n * sizeof(*batch->d_srcs)));
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&batch->d_dsts, n * sizeof(*batch->d_dsts)));
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&batch->d_sizes, n * sizeof(*batch->d_sizes)));
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&batch->d_caps, n * sizeof(*batch->d_caps)));
+    REQUIRE_RT(cudec_rt::device_malloc(&batch->d_results,
+                                       n * sizeof(*batch->d_results)));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_srcs, h_srcs.data(),
                             n * sizeof(*batch->d_srcs),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(batch->d_dsts, h_dsts.data(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_dsts, h_dsts.data(),
                             n * sizeof(*batch->d_dsts),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(batch->d_sizes, sizes.data(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_sizes, sizes.data(),
                             n * sizeof(*batch->d_sizes),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(batch->d_caps, caps.data(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(batch->d_caps, caps.data(),
                             n * sizeof(*batch->d_caps),
-                            cudaMemcpyHostToDevice));
+                            cudec_rt::memcpy_h2d));
     return 0;
 }
 
@@ -142,9 +147,10 @@ int BuildBatch(const std::vector<Chunk>& chunks, Batch* batch) {
  * Without this a later run could "match" by inheriting the previous run's
  * bytes. */
 int ResetDeviceState(const Batch& b) {
-    REQUIRE_CUDA(cudaMemset(b.d_dst_arena, kDstPoison, b.dst_arena_size));
-    REQUIRE_CUDA(
-        cudaMemset(b.d_results, 0xFF, b.n * sizeof(*b.d_results)));
+    REQUIRE_RT(
+        cudec_rt::device_memset(b.d_dst_arena, kDstPoison, b.dst_arena_size));
+    REQUIRE_RT(
+        cudec_rt::device_memset(b.d_results, 0xFF, b.n * sizeof(*b.d_results)));
     return 0;
 }
 
@@ -152,11 +158,11 @@ int Download(const Batch& b, std::vector<unsigned char>* dst,
              std::vector<cudec_chunk_result>* results) {
     dst->assign(b.dst_arena_size, 0);
     results->assign(b.n, cudec_chunk_result{});
-    REQUIRE_CUDA(cudaMemcpy(dst->data(), b.d_dst_arena, b.dst_arena_size,
-                            cudaMemcpyDeviceToHost));
-    REQUIRE_CUDA(cudaMemcpy(results->data(), b.d_results,
+    REQUIRE_RT(cudec_rt::memcpy(dst->data(), b.d_dst_arena, b.dst_arena_size,
+                            cudec_rt::memcpy_d2h));
+    REQUIRE_RT(cudec_rt::memcpy(results->data(), b.d_results,
                             b.n * sizeof(*b.d_results),
-                            cudaMemcpyDeviceToHost));
+                            cudec_rt::memcpy_d2h));
     return 0;
 }
 
@@ -191,10 +197,12 @@ std::vector<Geometry> Geometries(size_t chunk_count) {
 using BatchEntry = cudec_status (*)(const void* const*, const size_t*,
                                     void* const*, const size_t*, size_t,
                                     cudec_chunk_result*, cudec_stream_t);
-using DirectLaunch = void (*)(const Batch&, const Geometry&, cudaStream_t);
+using DirectLaunch = void (*)(const Batch&, const Geometry&,
+                              cudec_rt::stream_t);
 
 template <class Parser>
-void LaunchDirect(const Batch& b, const Geometry& g, cudaStream_t stream) {
+void LaunchDirect(const Batch& b, const Geometry& g,
+                  cudec_rt::stream_t stream) {
     cudec_detail::chunk_decode_batch<Parser, false,
                                     cudec_detail::kCudaWaveSize>
         <<<g.blocks, g.threads, 0, stream>>>(b.d_srcs, b.d_sizes, b.d_dsts,
@@ -209,24 +217,24 @@ struct Format {
 
 int RunDirect(const Format& f, const Batch& b, const Geometry& g) {
     REQUIRE(ResetDeviceState(b) == 0);
-    cudaStream_t stream;
-    REQUIRE_CUDA(cudaStreamCreate(&stream));
+    cudec_rt::stream_t stream;
+    REQUIRE_RT(cudec_rt::stream_create(&stream));
     f.launch(b, g, stream);
-    REQUIRE_CUDA(cudaGetLastError());
-    REQUIRE_CUDA(cudaStreamSynchronize(stream));
-    REQUIRE_CUDA(cudaStreamDestroy(stream));
+    REQUIRE_RT(cudec_rt::get_last_error());
+    REQUIRE_RT(cudec_rt::stream_synchronize(stream));
+    REQUIRE_RT(cudec_rt::stream_destroy(stream));
     return 0;
 }
 
 /* The shipped entry point, once over the whole batch. */
 int RunShippedEntry(const Format& f, const Batch& b) {
     REQUIRE(ResetDeviceState(b) == 0);
-    cudaStream_t stream;
-    REQUIRE_CUDA(cudaStreamCreate(&stream));
+    cudec_rt::stream_t stream;
+    REQUIRE_RT(cudec_rt::stream_create(&stream));
     REQUIRE(f.entry(b.d_srcs, b.d_sizes, b.d_dsts, b.d_caps, b.n, b.d_results,
                     stream) == CUDEC_OK);
-    REQUIRE_CUDA(cudaStreamSynchronize(stream));
-    REQUIRE_CUDA(cudaStreamDestroy(stream));
+    REQUIRE_RT(cudec_rt::stream_synchronize(stream));
+    REQUIRE_RT(cudec_rt::stream_destroy(stream));
     return 0;
 }
 
@@ -236,9 +244,9 @@ int RunShippedEntry(const Format& f, const Batch& b) {
  * control. Per-chunk independence means the output must not notice. */
 int RunSplitStreams(const Format& f, const Batch& b, unsigned stream_count) {
     REQUIRE(ResetDeviceState(b) == 0);
-    std::vector<cudaStream_t> streams(stream_count);
+    std::vector<cudec_rt::stream_t> streams(stream_count);
     for (unsigned s = 0; s < stream_count; s++) {
-        REQUIRE_CUDA(cudaStreamCreate(&streams[s]));
+        REQUIRE_RT(cudec_rt::stream_create(&streams[s]));
     }
     const size_t per = (b.n + stream_count - 1) / stream_count;
     for (unsigned s = 0; s < stream_count; s++) {
@@ -254,8 +262,8 @@ int RunSplitStreams(const Format& f, const Batch& b, unsigned stream_count) {
                         b.d_results + begin, streams[s]) == CUDEC_OK);
     }
     for (unsigned s = 0; s < stream_count; s++) {
-        REQUIRE_CUDA(cudaStreamSynchronize(streams[s]));
-        REQUIRE_CUDA(cudaStreamDestroy(streams[s]));
+        REQUIRE_RT(cudec_rt::stream_synchronize(streams[s]));
+        REQUIRE_RT(cudec_rt::stream_destroy(streams[s]));
     }
     return 0;
 }

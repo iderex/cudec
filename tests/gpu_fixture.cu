@@ -18,7 +18,7 @@
 #include "fixtures.h"
 #include "require.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt_test.h"
 
 #include <cstdio>
 #include <fstream>
@@ -51,20 +51,21 @@ int UploadBatchTables(size_t n, const std::vector<const void*>& h_srcs,
                       const std::vector<size_t>& h_caps,
                       const void*** d_srcs, void*** d_dsts, size_t** d_sizes,
                       size_t** d_caps, cudec_chunk_result** d_results) {
-    REQUIRE_CUDA(cudaMalloc(d_srcs, n * sizeof(**d_srcs)));
-    REQUIRE_CUDA(cudaMalloc(d_dsts, n * sizeof(**d_dsts)));
-    REQUIRE_CUDA(cudaMalloc(d_sizes, n * sizeof(**d_sizes)));
-    REQUIRE_CUDA(cudaMalloc(d_caps, n * sizeof(**d_caps)));
-    REQUIRE_CUDA(cudaMalloc(d_results, n * sizeof(**d_results)));
-    REQUIRE_CUDA(cudaMemcpy(*d_srcs, h_srcs.data(), n * sizeof(**d_srcs),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(*d_dsts, h_dsts.data(), n * sizeof(**d_dsts),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(*d_sizes, h_sizes.data(), n * sizeof(**d_sizes),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(*d_caps, h_caps.data(), n * sizeof(**d_caps),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemset(*d_results, 0xFF, n * sizeof(**d_results)));
+    REQUIRE_RT(cudec_rt::device_malloc(d_srcs, n * sizeof(**d_srcs)));
+    REQUIRE_RT(cudec_rt::device_malloc(d_dsts, n * sizeof(**d_dsts)));
+    REQUIRE_RT(cudec_rt::device_malloc(d_sizes, n * sizeof(**d_sizes)));
+    REQUIRE_RT(cudec_rt::device_malloc(d_caps, n * sizeof(**d_caps)));
+    REQUIRE_RT(cudec_rt::device_malloc(d_results, n * sizeof(**d_results)));
+    REQUIRE_RT(cudec_rt::memcpy(*d_srcs, h_srcs.data(), n * sizeof(**d_srcs),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(*d_dsts, h_dsts.data(), n * sizeof(**d_dsts),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(*d_sizes, h_sizes.data(), n * sizeof(**d_sizes),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(*d_caps, h_caps.data(), n * sizeof(**d_caps),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(
+        cudec_rt::device_memset(*d_results, 0xFF, n * sizeof(**d_results)));
     return 0;
 }
 
@@ -90,13 +91,14 @@ int RunBatch(const std::vector<Chunk>& chunks, BatchEntry entry,
         void* d_src = nullptr;
         void* d_dst = nullptr;
         const size_t src_size = chunks[i].src->size();
-        REQUIRE_CUDA(cudaMalloc(&d_src, src_size ? src_size : 1));
+        REQUIRE_RT(cudec_rt::device_malloc(&d_src, src_size ? src_size : 1));
         if (src_size) {
-            REQUIRE_CUDA(cudaMemcpy(d_src, chunks[i].src->data(), src_size,
-                                    cudaMemcpyHostToDevice));
+            REQUIRE_RT(cudec_rt::memcpy(d_src, chunks[i].src->data(), src_size,
+                                    cudec_rt::memcpy_h2d));
         }
-        REQUIRE_CUDA(cudaMalloc(&d_dst, chunks[i].dst_capacity));
-        REQUIRE_CUDA(cudaMemset(d_dst, kDstPoison, chunks[i].dst_capacity));
+        REQUIRE_RT(cudec_rt::device_malloc(&d_dst, chunks[i].dst_capacity));
+        REQUIRE_RT(
+            cudec_rt::device_memset(d_dst, kDstPoison, chunks[i].dst_capacity));
         h_srcs[i] = d_src;
         h_dsts[i] = d_dst;
         h_sizes[i] = src_size;
@@ -111,21 +113,22 @@ int RunBatch(const std::vector<Chunk>& chunks, BatchEntry entry,
     REQUIRE(UploadBatchTables(n, h_srcs, h_dsts, h_sizes, h_caps, &d_srcs,
                               &d_dsts, &d_sizes, &d_caps, &d_results) == 0);
 
-    cudaStream_t stream;
-    REQUIRE_CUDA(cudaStreamCreate(&stream));
+    cudec_rt::stream_t stream;
+    REQUIRE_RT(cudec_rt::stream_create(&stream));
     REQUIRE(entry(d_srcs, d_sizes, d_dsts, d_caps, n, d_results, stream) ==
             CUDEC_OK);
-    REQUIRE_CUDA(cudaStreamSynchronize(stream));
-    REQUIRE_CUDA(cudaStreamDestroy(stream));
+    REQUIRE_RT(cudec_rt::stream_synchronize(stream));
+    REQUIRE_RT(cudec_rt::stream_destroy(stream));
 
     results->assign(n, cudec_chunk_result{});
-    REQUIRE_CUDA(cudaMemcpy(results->data(), d_results,
-                            n * sizeof(*d_results), cudaMemcpyDeviceToHost));
+    REQUIRE_RT(cudec_rt::memcpy(results->data(), d_results,
+                            n * sizeof(*d_results), cudec_rt::memcpy_d2h));
     dst_bytes->assign(n, {});
     for (size_t i = 0; i < n; i++) {
         (*dst_bytes)[i].assign(h_caps[i], 0);
-        REQUIRE_CUDA(cudaMemcpy((*dst_bytes)[i].data(), h_dsts[i], h_caps[i],
-                                cudaMemcpyDeviceToHost));
+        REQUIRE_RT(cudec_rt::memcpy((*dst_bytes)[i].data(), h_dsts[i],
+                                    h_caps[i],
+                                cudec_rt::memcpy_d2h));
     }
     /* Process teardown reclaims the device allocations; the harness keeps
      * no device state across tests (RUN_SERIAL on the gpu label). */
@@ -266,9 +269,10 @@ int main() {
         const size_t wrap_n = 40000;
         unsigned char* d_src_one;
         unsigned char* d_dst_one;
-        REQUIRE_CUDA(cudaMalloc(&d_src_one, 1));
-        REQUIRE_CUDA(cudaMemset(d_src_one, 0, 1)); /* empty-block token */
-        REQUIRE_CUDA(cudaMalloc(&d_dst_one, 1));
+        REQUIRE_RT(cudec_rt::device_malloc(&d_src_one, 1));
+        /* empty-block token */
+        REQUIRE_RT(cudec_rt::device_memset(d_src_one, 0, 1));
+        REQUIRE_RT(cudec_rt::device_malloc(&d_dst_one, 1));
         std::vector<const void*> h_s(wrap_n, d_src_one);
         std::vector<void*> h_d(wrap_n, d_dst_one);
         std::vector<size_t> h_sz(wrap_n, 1);
@@ -282,10 +286,10 @@ int main() {
                                   &d_sz, &d_cp, &d_r) == 0);
         REQUIRE(cudec_lz4_decompress_batch(d_s, d_sz, d_d, d_cp, wrap_n, d_r,
                                            nullptr) == CUDEC_OK);
-        REQUIRE_CUDA(cudaDeviceSynchronize());
+        REQUIRE_RT(cudec_rt::device_synchronize());
         std::vector<cudec_chunk_result> wrap_res(wrap_n);
-        REQUIRE_CUDA(cudaMemcpy(wrap_res.data(), d_r, wrap_n * sizeof(*d_r),
-                                cudaMemcpyDeviceToHost));
+        REQUIRE_RT(cudec_rt::memcpy(wrap_res.data(), d_r, wrap_n * sizeof(*d_r),
+                                cudec_rt::memcpy_d2h));
         for (size_t i = 0; i < wrap_n; i++) {
             REQUIRE_CTX(wrap_res[i].status == CUDEC_OK, "wrap chunk %zu", i);
             REQUIRE_CTX(wrap_res[i].bytes_written == 0, "wrap chunk %zu", i);

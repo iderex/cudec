@@ -25,7 +25,7 @@
 #include "require.h"
 #include "snappy_block.h"
 
-#include <cuda_runtime.h>
+#include "vendor_rt_test.h"
 
 #include <cstdio>
 #include <cstring>
@@ -142,34 +142,37 @@ int main() {
     unsigned long long* d_sizes = nullptr;
     unsigned long long* d_caps = nullptr;
     Trace* d_traces = nullptr;
-    REQUIRE_CUDA(cudaMalloc(&d_streams, flat.size()));
-    REQUIRE_CUDA(cudaMalloc(&d_offsets, offsets.size() * sizeof(*d_offsets)));
-    REQUIRE_CUDA(cudaMalloc(&d_sizes, sizes.size() * sizeof(*d_sizes)));
-    REQUIRE_CUDA(cudaMalloc(&d_caps, caps.size() * sizeof(*d_caps)));
-    REQUIRE_CUDA(cudaMalloc(&d_traces, count * sizeof(*d_traces)));
-    REQUIRE_CUDA(cudaMemcpy(d_streams, flat.data(), flat.size(),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(d_offsets, offsets.data(),
+    REQUIRE_RT(cudec_rt::device_malloc(&d_streams, flat.size()));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_offsets,
+                                       offsets.size() * sizeof(*d_offsets)));
+    REQUIRE_RT(
+        cudec_rt::device_malloc(&d_sizes, sizes.size() * sizeof(*d_sizes)));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_caps, caps.size() * sizeof(*d_caps)));
+    REQUIRE_RT(cudec_rt::device_malloc(&d_traces, count * sizeof(*d_traces)));
+    REQUIRE_RT(cudec_rt::memcpy(d_streams, flat.data(), flat.size(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(d_offsets, offsets.data(),
                             offsets.size() * sizeof(*d_offsets),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(d_sizes, sizes.data(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(d_sizes, sizes.data(),
                             sizes.size() * sizeof(*d_sizes),
-                            cudaMemcpyHostToDevice));
-    REQUIRE_CUDA(cudaMemcpy(d_caps, caps.data(),
+                            cudec_rt::memcpy_h2d));
+    REQUIRE_RT(cudec_rt::memcpy(d_caps, caps.data(),
                             caps.size() * sizeof(*d_caps),
-                            cudaMemcpyHostToDevice));
+                            cudec_rt::memcpy_h2d));
     /* Poisoned, so a trace the kernel never wrote cannot pass as a match. */
-    REQUIRE_CUDA(cudaMemset(d_traces, 0xFF, count * sizeof(*d_traces)));
+    REQUIRE_RT(
+        cudec_rt::device_memset(d_traces, 0xFF, count * sizeof(*d_traces)));
 
     ParseOnDevice<<<(count + kThreadsPerBlock - 1) / kThreadsPerBlock,
                     kThreadsPerBlock>>>(d_streams, d_offsets, d_sizes,
                                         d_caps, count, d_traces);
-    REQUIRE_CUDA(cudaGetLastError());
-    REQUIRE_CUDA(cudaDeviceSynchronize());
+    REQUIRE_RT(cudec_rt::get_last_error());
+    REQUIRE_RT(cudec_rt::device_synchronize());
 
     std::vector<Trace> device_traces(count);
-    REQUIRE_CUDA(cudaMemcpy(device_traces.data(), d_traces,
-                            count * sizeof(Trace), cudaMemcpyDeviceToHost));
+    REQUIRE_RT(cudec_rt::memcpy(device_traces.data(), d_traces,
+                            count * sizeof(Trace), cudec_rt::memcpy_d2h));
 
     size_t accepted = 0;
     for (unsigned i = 0; i < count; i++) {
@@ -203,11 +206,11 @@ int main() {
     REQUIRE(accepted > 0);
     REQUIRE(accepted < count);
 
-    REQUIRE_CUDA(cudaFree(d_streams));
-    REQUIRE_CUDA(cudaFree(d_offsets));
-    REQUIRE_CUDA(cudaFree(d_sizes));
-    REQUIRE_CUDA(cudaFree(d_caps));
-    REQUIRE_CUDA(cudaFree(d_traces));
+    REQUIRE_RT(cudec_rt::device_free(d_streams));
+    REQUIRE_RT(cudec_rt::device_free(d_offsets));
+    REQUIRE_RT(cudec_rt::device_free(d_sizes));
+    REQUIRE_RT(cudec_rt::device_free(d_caps));
+    REQUIRE_RT(cudec_rt::device_free(d_traces));
 
     std::printf("PASS: %u streams parsed identically by the host compiler and "
                 "nvcc from one header (%zu accepted, %zu rejected)\n",

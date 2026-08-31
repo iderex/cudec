@@ -75,6 +75,16 @@ function(cudec_add_test name)
   endif()
   add_executable(${name} ${T_SOURCES})
   target_link_libraries(${name} PRIVATE cudec ${T_LIBS})
+  # A device-side test reaches src/: at minimum for the vendor seam it drives
+  # the runtime through (tests/vendor_rt_test.h includes src/vendor_rt.h,
+  # issue #243), and several also launch the shipped kernel or twin a format
+  # header directly. Granted here rather than per target for the reason the
+  # vendor-seam glob states about its own scope - a device test added tomorrow
+  # is covered on the day it lands, not on the day somebody remembers it.
+  if(T_GPU OR T_HUGE)
+    target_include_directories(${name}
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+  endif()
   set_target_properties(
     ${name} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
                        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
@@ -236,10 +246,6 @@ target_compile_definitions(
 # element trace. Without it the device half of the header is a comment. Not
 # the device gate set (#154) - one thread, no warp cooperation, no kernel.
 cudec_add_test(snappy_block_device SOURCES snappy_block_device.cu GPU)
-if(TARGET snappy_block_device)
-  target_include_directories(snappy_block_device
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-endif()
 # The M5 oracle proving itself (issue #181): the pin downloads, the two
 # flavours build, and the compressor and the decode entry points agree on real
 # bytes - plus one refusal per error class the fail-closed matrix will read.
@@ -489,43 +495,24 @@ endif()
 # width, so a wave64 instantiation that stopped compiling, or a block shape
 # that stopped following the parameter, would leave the whole suite green.
 # This test makes the second instantiation a build product and runs the
-# shipped one, and it needs the internal kernel header from src/ to reach
-# either.
+# shipped one.
 cudec_add_test(wave_width_gpu SOURCES wave_width_gpu.cu GPU)
-if(TARGET wave_width_gpu)
-  target_include_directories(wave_width_gpu
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-endif()
+# frame_twin verifies the library's own xxhash32.h against liblz4's XXH32,
+# which it reaches through the src/ include every device test is granted.
 cudec_add_test(frame_twin SOURCES frame_twin.cu LIBS lz4_frame_oracle GPU)
-# frame_twin verifies the library's own xxhash32.h against liblz4's XXH32.
-# Guarded: the host-only sanitizer build (issue #42) skips the GPU targets, so
-# this follow-up only runs when the target actually exists.
-if(TARGET frame_twin)
-  target_include_directories(frame_twin
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-endif()
 cudec_add_test(stream_twin SOURCES stream_twin.cu LIBS cudec_test_fixtures GPU)
 # The same hostile corpus on the device, behind a host-side watchdog: a warp
 # that never leaves its sequence loop holds the launch, so this one polls an
 # event against a deadline instead of blocking on the stream (issue #72).
+# It also launches the kernel directly, to reach a geometry the shipped entry
+# point never produces: fewer threads than one warp.
 cudec_add_test(termination_gpu SOURCES termination_gpu.cu LIBS
                cudec_test_fixtures GPU)
-# It also launches the kernel directly, to reach a geometry the shipped entry
-# point never produces (fewer threads than one warp), so it needs the internal
-# header from src/.
-if(TARGET termination_gpu)
-  target_include_directories(termination_gpu
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-endif()
+
 # Determinism across launch geometry - the axis the existing same-batch-twice
-# compare cannot see. It launches the shipped kernel directly, so it needs the
-# internal header from src/ (like bench/ does).
+# compare cannot see. It launches the shipped kernel directly.
 cudec_add_test(determinism_gpu SOURCES determinism_gpu.cu LIBS
                cudec_test_fixtures GPU)
-if(TARGET determinism_gpu)
-  target_include_directories(determinism_gpu
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-endif()
 
 # The one arm of the decode kernel no ordinary fixture reaches: a match past
 # 2^32, which selects the 64-bit gather (issue #331). Deleting the test that
@@ -683,14 +670,15 @@ endforeach()
 # status CUDEC_ERR_CUDA (a caller compiled against that name and this seam may
 # not move it), on the cudec_rt:: spellings the seam introduces, on prose that
 # says CUDA, or on an English word that merely contains "hip".
-function(cudec_scan_vendor_spelling _text _label _out)
+function(cudec_scan_vendor_spelling _text _label _seam _out)
   set(_hits "")
   # A leading space so a match at offset zero still has a left context to
   # test; the class before the prefix is what keeps "chip" and "cudec" out.
   if(" ${_text}" MATCHES "[^A-Za-z0-9_]((cuda|hip)[A-Z_][A-Za-z0-9_]*)")
     string(APPEND _hits "${_label}: names a backend runtime directly "
-           "('${CMAKE_MATCH_1}'); every file under src/ except src/vendor_rt.h "
-           "reaches the runtime through cudec_rt:: (issue #240)\n")
+           "('${CMAKE_MATCH_1}'); every file beside ${_seam} in its own "
+           "tree reaches the runtime through cudec_rt:: "
+           "(issues #240, #243)\n")
   endif()
   set(${_out} "${_hits}" PARENT_SCOPE)
 endfunction()
@@ -702,7 +690,7 @@ endfunction()
 foreach(_violating "    return cudaMalloc(&p, bytes);"
                    "    return hipMemcpyAsync(d, s, n, k, st);"
                    "#include <cuda_runtime.h>")
-  cudec_scan_vendor_spelling("${_violating}" "probe" _probe_hit)
+  cudec_scan_vendor_spelling("${_violating}" "probe" "the seam" _probe_hit)
   if(NOT _probe_hit)
     message(FATAL_ERROR "the vendor-seam rule is dead: the planted violation "
                         "'${_violating}' was not reported (issue #240)")
@@ -710,7 +698,7 @@ foreach(_violating "    return cudaMalloc(&p, bytes);"
 endforeach()
 foreach(_near "return CUDEC_ERR_CUDA;" "return cudec_rt::device_malloc(&p, n);"
               "/* Every CUDA API error is checked, on chip and off. */")
-  cudec_scan_vendor_spelling("${_near}" "probe" _near_hit)
+  cudec_scan_vendor_spelling("${_near}" "probe" "the seam" _near_hit)
   if(_near_hit)
     message(FATAL_ERROR "the vendor-seam rule is over-wide: it reported the "
                         "legitimate spelling '${_near}' (issue #240)")
@@ -748,7 +736,8 @@ list(REMOVE_ITEM _vendor_scan_sources vendor_rt.h)
 set(_vendor_violations "")
 foreach(_source IN LISTS _vendor_scan_sources)
   file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_source} _vsrc)
-  cudec_scan_vendor_spelling("${_vsrc}" "src/${_source}" _found)
+  cudec_scan_vendor_spelling("${_vsrc}" "src/${_source}"
+                             "src/vendor_rt.h" _found)
   string(APPEND _vendor_violations "${_found}")
 endforeach()
 if(_vendor_violations)
@@ -847,6 +836,59 @@ cudec_vendor_arms_agree("${_vendor_rt_src}" _arms_why)
 if(_arms_why)
   message(FATAL_ERROR "src/vendor_rt.h maps the two backends unevenly: "
                       "${_arms_why}(issue #240)")
+endif()
+
+# ---- The harness's half of the same seam (issue #243). The validation ladder
+# drives the device itself - it allocates, poisons, copies back and asks the
+# driver questions the library never asks - so it names runtime operations
+# src/vendor_rt.h has no caller for. tests/vendor_rt_test.h is where those are
+# mapped, and the two rules below are rules one and two above, pointed at
+# tests/ instead of at src/.
+#
+# Why the harness is not simply covered by the scan above. The ladder makes
+# the same claim src/ does - ONE set of sources for both backends - and fails
+# the same way: a cudaMemcpy left in a .cu file compiles clean on the backend
+# this machine can build and reds only under a compiler nobody here has, so no
+# test result reports it first. The functions are shared; only the tree and
+# the exempted file differ.
+set(_vendor_rt_test ${CMAKE_CURRENT_SOURCE_DIR}/vendor_rt_test.h)
+if(NOT EXISTS ${_vendor_rt_test})
+  message(FATAL_ERROR "tests/vendor_rt_test.h is missing: it is the one place "
+                      "under tests/ a backend runtime is named (issue #243)")
+endif()
+file(GLOB_RECURSE _vendor_test_sources RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+     CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/*.c ${CMAKE_CURRENT_SOURCE_DIR}/*.cc
+     ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/*.cu
+     ${CMAKE_CURRENT_SOURCE_DIR}/*.cuh ${CMAKE_CURRENT_SOURCE_DIR}/*.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/*.hpp ${CMAKE_CURRENT_SOURCE_DIR}/*.inl)
+if(NOT _vendor_test_sources)
+  message(FATAL_ERROR "the harness vendor-seam scan found no sources under "
+                      "tests/ - the glob has stopped matching (issue #243)")
+endif()
+if(NOT vendor_rt_test.h IN_LIST _vendor_test_sources)
+  message(FATAL_ERROR "tests/vendor_rt_test.h is outside the harness "
+                      "vendor-seam glob, so the one file the rule exempts is a "
+                      "file it never saw (issue #243)")
+endif()
+list(REMOVE_ITEM _vendor_test_sources vendor_rt_test.h)
+set(_vendor_test_violations "")
+foreach(_source IN LISTS _vendor_test_sources)
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/${_source} _vsrc)
+  cudec_scan_vendor_spelling("${_vsrc}" "tests/${_source}"
+                             "tests/vendor_rt_test.h" _found)
+  string(APPEND _vendor_test_violations "${_found}")
+endforeach()
+if(_vendor_test_violations)
+  message(FATAL_ERROR "the harness vendor seam has leaked:\n"
+                      "${_vendor_test_violations}")
+endif()
+
+file(READ ${_vendor_rt_test} _vendor_rt_test_src)
+cudec_vendor_arms_agree("${_vendor_rt_test_src}" _arms_why)
+if(_arms_why)
+  message(FATAL_ERROR "tests/vendor_rt_test.h maps the two backends unevenly: "
+                      "${_arms_why}(issue #243)")
 endif()
 
 # Single-source lock for the shared decode element (issue #150): the one
