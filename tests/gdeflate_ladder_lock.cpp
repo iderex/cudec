@@ -356,6 +356,35 @@ int StoredRungs() {
     return 0;
 }
 
+/* A page of non-final stored blocks, each declaring zero bytes, which is the
+ * cheapest block the format has. It is the measurement behind the
+ * kGDeflateRejectNoFinalBlock declaration at the bottom of this file: the
+ * argument there is that a page runs out of words long before the block cap,
+ * and an argument about a fuel cap is exactly the kind that is wrong quietly.
+ * The page is asserted to land on the refill rung instead. */
+int NoFinalBlockStopsAtTheRefill() {
+    GDeflatePageWriter w;
+    for (uint32_t block = 0; block < 4096u; block++) {
+        w.Reset();
+        w.Push(1, 0);
+        w.Push(2, 0);
+        w.Ensure();
+        w.Push(16, 0);
+    }
+    REQUIRE(w.ok());
+    std::vector<unsigned char> page = w.Finish();
+    page.resize(page.size() -
+                static_cast<size_t>(cudec_test::kGDeflateWriterTailWords) * 4u);
+
+    GDeflatePageState st;
+    uint64_t out_len = 0;
+    std::vector<unsigned char> out(64, 0);
+    REQUIRE(!GDeflateDecodePage(st, page.data(), page.size(), out.data(),
+                                out.size(), &out_len));
+    REQUIRE(Landed(st.s, cudec_detail::kGDeflateRejectRefillPastEnd));
+    return 0;
+}
+
 /* A dynamic block whose body is `symbols`, over a literal/length code that can
  * spell every symbol they use. */
 bool PageWithSymbols(const std::vector<unsigned char>& litlen_lens,
@@ -537,11 +566,13 @@ int MatchRungs() {
  * lane, so the capacity refusals answer first on every page that would run
  * that far.
  *
- * kGDeflateRejectNoFinalBlock - the block cap with no final block. A block
- * costs lane 0 at least its own three header bits and a refill, so a page
- * carries at most about as many blocks as it has words, while the cap is
- * twenty-one times that; a page of non-final blocks runs out of words, and
- * kGDeflateRejectRefillPastEnd is what it lands on. */
+ * kGDeflateRejectNoFinalBlock - the block cap with no final block. The
+ * cheapest non-final block is a stored one declaring zero bytes, which costs
+ * lane 0 nineteen bits - three of header and sixteen of length - and lane 0 is
+ * refilled from one word each time those reads drop it under the watermark, so
+ * a page yields fewer than two blocks per word it carries. The cap is
+ * twenty-one per word, so a page of non-final blocks runs out of words first
+ * and kGDeflateRejectRefillPastEnd is what it lands on. */
 bool DeclaredUnreachable(int branch) {
     return branch == cudec_detail::kGDeflateRejectCodewordNotInCode ||
            branch == cudec_detail::kGDeflateRejectRoundFuelExhausted ||
@@ -598,6 +629,9 @@ int main() {
         return 1;
     }
     if (StoredRungs() != 0) {
+        return 1;
+    }
+    if (NoFinalBlockStopsAtTheRefill() != 0) {
         return 1;
     }
     if (LiteralPastCapRung() != 0) {
