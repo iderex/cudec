@@ -113,11 +113,11 @@ cudec_status cudec_snappy_decompress_batch(const void* const* d_src_ptrs,
         d_results, stream);
 }
 
-/* The GDeflate entry is the frozen contract without the kernel behind it
- * yet (issue #216). It shares the validator with the two above rather than
- * growing its own, so the reject classes cannot drift apart while they are
- * being frozen, and then stops: no launch, and deliberately no
- * cudec_rt::get_last_error() drain either. Draining is how the entries above
+/* The GDeflate and Zstd entries are the frozen contracts without their
+ * kernels behind them yet (issues #216 and #427). Each shares the validator
+ * with the two above rather than growing its own, so the reject classes
+ * cannot drift apart while they are being frozen, and then stops: no launch,
+ * and deliberately no cudec_rt::get_last_error() drain either. Draining is how the entries above
  * buy a
  * post-launch check that reports their own submission; with nothing
  * submitted there is nothing to report, and consuming a caller's pending
@@ -136,6 +136,26 @@ cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
                                              size_t chunk_count,
                                              cudec_chunk_result* d_results,
                                              cudec_stream_t stream) {
+    (void)stream;
+    const cudec_status valid = cudec_detail::validate_batch_args(
+        d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
+        d_results);
+    if (valid != CUDEC_OK) {
+        return valid;
+    }
+    return CUDEC_ERR_NOT_IMPLEMENTED;
+}
+
+/* The Zstd entry, the same shape and for the same reasons - the comment above
+ * covers both, and the unit each accepts is the only thing that differs
+ * between them. */
+cudec_status cudec_zstd_decompress_batch(const void* const* d_src_ptrs,
+                                         const size_t* d_src_sizes,
+                                         void* const* d_dst_ptrs,
+                                         const size_t* d_dst_capacities,
+                                         size_t chunk_count,
+                                         cudec_chunk_result* d_results,
+                                         cudec_stream_t stream) {
     (void)stream;
     const cudec_status valid = cudec_detail::validate_batch_args(
         d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,

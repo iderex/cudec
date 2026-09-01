@@ -141,6 +141,30 @@ int main(void) {
                                             aligned,
                                             0) == CUDEC_ERR_NOT_IMPLEMENTED);
 
+    /* The same nine classes on the Zstd entry (issue #427), written out call
+     * for call for the reason the two blocks above are: a future entry wired
+     * to its own validator, or to none, would pass a test that only counted
+     * on the sharing. */
+    REQUIRE(cudec_zstd_decompress_batch(0, sizes, dsts, caps, 1, aligned,
+                                        0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, 0, dsts, caps, 1, aligned,
+                                        0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, 0, caps, 1, aligned,
+                                        0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, 0, 1, aligned,
+                                        0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 1, 0,
+                                        0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 1, misaligned,
+                                        0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 0, aligned,
+                                        0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, SIZE_MAX,
+                                        aligned,
+                                        0) == CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 1, aligned,
+                                        0) == CUDEC_ERR_NOT_IMPLEMENTED);
+
     /* The frame entry point resolves its own C linkage here. Every call
      * below is a documented argument reject that returns before any CUDA
      * call, so it runs on the GPU-less runner and never dereferences the

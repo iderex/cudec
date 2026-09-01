@@ -196,6 +196,54 @@ cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
                                              cudec_chunk_result* d_results,
                                              cudec_stream_t stream);
 
+/* Batch Zstd frame decode. The batch contract above holds argument for
+ * argument: the same device-side arrays of chunk_count entries holding
+ * device pointers, the same 16-byte-aligned d_results, the same per-chunk
+ * result semantics, the same synchronous CUDEC_ERR_INVALID_ARGUMENT reject
+ * classes against the same launch limit, and the same asynchronous launch
+ * on `stream`. Nothing about the batch contract varies by format.
+ *
+ * THE SUPPORTED UNIT IS ONE WHOLE FRAME PER CHUNK, and that is the format's
+ * choice rather than this ABI's. Blocks inside a frame are not independent -
+ * a match reaches back across a block boundary and entropy tables carry from
+ * one block to the next - while frames are, so the frame is the smallest
+ * thing this entry can be handed. A chunk holding several concatenated
+ * frames, or part of one, is a malformed frame and is rejected as such
+ * rather than stepped into. d_src_sizes carries the frame's compressed size
+ * and d_dst_capacities the caller's output capacity; the bound on every
+ * write is that capacity and never a length read out of the frame.
+ *
+ * The accepted envelope is docs/MASTERPLAN.md section 12.2 and is not
+ * restated here, because a copy of that table in this header would drift
+ * against the parser that decides it. What the classes mean does belong
+ * here: CUDEC_ERR_UNSUPPORTED names a frame this decoder declines - a
+ * skippable frame, a dictionary id, an absent content size, a window past
+ * the range this decoder authorises - and CUDEC_ERR_CORRUPT_INPUT names one
+ * that is malformed. The two are different answers because only one of them
+ * can be retried elsewhere.
+ *
+ * Per frame, and isolated to that frame: those two statuses,
+ * CUDEC_ERR_OUTPUT_TOO_SMALL when the decode would pass the supplied
+ * capacity, bytes_written == 0 on any of them, and the destination contents
+ * then unspecified but never presented as a valid decode.
+ *
+ * THIS BUILD CARRIES NO ZSTD KERNEL, AND THAT IS A DEFINED STATUS RATHER
+ * THAN AN ABSENT SYMBOL. A batch that passes the validation above returns
+ * CUDEC_ERR_NOT_IMPLEMENTED, having made no CUDA call at all - so this
+ * entry, like the GDeflate one above, also leaves the thread's pending CUDA
+ * error state untouched on a call it accepts. The symbol, the signature and
+ * every reject class above are frozen now and do not move when the kernel
+ * lands; only the answer to an accepted batch does. A symbol that was absent
+ * instead would make the freeze conditional on a build configuration, which
+ * is two contracts wearing one name. */
+cudec_status cudec_zstd_decompress_batch(const void* const* d_src_ptrs,
+                                         const size_t* d_src_sizes,
+                                         void* const* d_dst_ptrs,
+                                         const size_t* d_dst_capacities,
+                                         size_t chunk_count,
+                                         cudec_chunk_result* d_results,
+                                         cudec_stream_t stream);
+
 /* Decode a single LZ4 frame (the .lz4 container: magic, frame descriptor,
  * data blocks, end mark, optional checksums) from host memory into host
  * memory, using the GPU batch decoder internally. Synchronous.
