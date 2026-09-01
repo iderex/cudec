@@ -141,30 +141,53 @@ struct ZstdExecPlan {
     uint64_t literals_used;
 };
 
-/* The prefix sum over (Literal_Length + Match_Length), block-relative.
+/* Where a prefix sum taken a tile at a time has got to.
  *
- * `out_destinations` receives `sequence_count + 1` entries: entry `i` is where
- * sequence `i` writes its literals, and the last entry is where the leftover
- * literals begin. The one-past-the-end entry is not a convenience - it is what
- * the execution compares each sequence's own arithmetic against, and it is
- * what tells the tail where it starts without a second sum.
+ * WHY THE SUM IS RESUMABLE AT ALL. `docs/MASTERPLAN.md` section 14.9 costs the
+ * whole-block intermediates against the shared memory a fused kernel has - at
+ * 43690 sequences a block may declare, the destinations alone are over 300 KiB
+ * - and produces them 128 at a time instead. Carrying the two running
+ * quantities is what lets the sum stop and continue; the whole-block form
+ * below is written on top of this one rather than beside it.
+ *
+ * THE CEILING IS COMPARED AGAINST THE RUNNING TOTAL AND NEVER AGAINST A
+ * TILE'S OWN. Both fields are the block's, not the tile's, so a block that
+ * exceeds its maximum across a tile boundary is refused at the sequence that
+ * passes it. That is the same comparison the whole-block form makes, moved,
+ * and not a weaker one. */
+struct ZstdExecCarry {
+    /* Block-relative destination of the next sequence: the sum of every
+     * (Literal_Length + Match_Length) before it. */
+    uint64_t at;
+    /* Literal bytes the sequences so far consume. */
+    uint64_t literals_used;
+};
+
+/* One tile of the prefix sum over (Literal_Length + Match_Length),
+ * block-relative.
+ *
+ * `out_destinations` receives one entry per sequence of this tile - entry `i`
+ * is where sequence `i` writes its literals - and never the one-past-the-end
+ * entry, which is `ZstdExecPrefixSumFinish`'s and exists once per block.
+ *
+ * `out_literal_cursors`, when given, receives each sequence's own literal
+ * cursor. A whole-block execution carries that in a loop variable and does not
+ * need it; a fan-out across lanes has no loop to carry it in, and section
+ * 14.9's tile record is where it lives. Optional rather than always written,
+ * because the caller that has a loop should not pay an array for it.
  *
  * `block_maximum` is Block_Maximum_Size for this frame (RFC 8878 section
  * 3.1.1.2.4), the ceiling a compressed block's regenerated size may not pass.
  * It is bounded here, before any copy, rather than discovered by a destination
  * that overflows: the copies are independent of each other and one of them
  * running past the end is not something the others would notice. */
-CUDEC_HOST_DEVICE inline cudec_status ZstdExecPrefixSum(
+CUDEC_HOST_DEVICE inline cudec_status ZstdExecPrefixSumTile(
     const ZstdSequence* sequences, uint32_t sequence_count,
-    uint64_t literals_size, uint64_t block_maximum,
-    uint64_t* out_destinations, uint32_t destinations_capacity,
-    ZstdExecPlan* out_plan, ZstdExecReject* reject) {
+    uint64_t literals_size, uint64_t block_maximum, ZstdExecCarry* carry,
+    uint64_t* out_destinations, uint64_t* out_literal_cursors,
+    uint32_t destinations_capacity, ZstdExecReject* reject) {
     if (reject != 0) {
         *reject = kZstdExecRejectNone;
-    }
-    if (out_plan != 0) {
-        out_plan->block_size = 0;
-        out_plan->literals_used = 0;
     }
     /* THE CEILING IS BOUNDED BEFORE IT IS USED, AND THAT IS WHAT MAKES EVERY
      * SUM BELOW SAFE RATHER THAN LUCKY. Both of these are the caller's own
@@ -176,21 +199,28 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdExecPrefixSum(
      * file can wrap and no reject rung is needed for one. A rung for an
      * overflow that 32-bit length fields cannot reach would be a guard no
      * negative could ever red, which is worse than no guard: it reads as
-     * coverage. */
-    if (out_destinations == 0 || out_plan == 0 ||
-        (sequences == 0 && sequence_count != 0) ||
-        destinations_capacity < 1 ||
-        destinations_capacity - 1 < sequence_count ||
+     * coverage.
+     *
+     * The carry is bounded on the way in for the same reason. It arrives from
+     * whatever ran the previous tile, so believing it would put every bound
+     * below behind a number this call did not compute. */
+    if (carry == 0 || (sequences == 0 && sequence_count != 0) ||
+        (out_destinations == 0 && sequence_count != 0) ||
+        destinations_capacity < sequence_count ||
         block_maximum > kZstdBlockSizeCeiling ||
-        literals_size > kZstdBlockSizeCeiling) {
+        literals_size > kZstdBlockSizeCeiling || carry->at > block_maximum ||
+        carry->literals_used > literals_size) {
         return ZstdExecRefuse(kZstdExecRejectBadRequest,
                               CUDEC_ERR_INVALID_ARGUMENT, reject);
     }
 
-    uint64_t at = 0;
-    uint64_t literals_used = 0;
+    uint64_t at = carry->at;
+    uint64_t literals_used = carry->literals_used;
     for (uint32_t index = 0; index < sequence_count; index++) {
         out_destinations[index] = at;
+        if (out_literal_cursors != 0) {
+            out_literal_cursors[index] = literals_used;
+        }
         const uint64_t literals_length = sequences[index].literals_length;
         const uint64_t match_length = sequences[index].match_length;
         /* Checked as a subtraction against what is left of the ceiling, which
@@ -209,16 +239,163 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdExecPrefixSum(
         }
         literals_used += literals_length;
     }
-    out_destinations[sequence_count] = at;
+    /* Advanced only on success: a carry left half-way through a refused tile
+     * is a running total nobody may continue from. */
+    carry->at = at;
+    carry->literals_used = literals_used;
+    return CUDEC_OK;
+}
 
-    const uint64_t tail = literals_size - literals_used;
+/* Closes a block's prefix sum: the one-past-the-end destination, the leftover
+ * literals, and the plan the execution is held to.
+ *
+ * `out_last_destination` is where the tail begins. It is what the execution
+ * compares each sequence's own arithmetic against, and it is what tells the
+ * tail where it starts without a second sum. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdExecPrefixSumFinish(
+    const ZstdExecCarry* carry, uint64_t literals_size, uint64_t block_maximum,
+    uint64_t* out_last_destination, ZstdExecPlan* out_plan,
+    ZstdExecReject* reject) {
+    if (reject != 0) {
+        *reject = kZstdExecRejectNone;
+    }
+    if (out_plan != 0) {
+        out_plan->block_size = 0;
+        out_plan->literals_used = 0;
+    }
+    if (carry == 0 || out_plan == 0 || out_last_destination == 0 ||
+        block_maximum > kZstdBlockSizeCeiling ||
+        literals_size > kZstdBlockSizeCeiling || carry->at > block_maximum ||
+        carry->literals_used > literals_size) {
+        return ZstdExecRefuse(kZstdExecRejectBadRequest,
+                              CUDEC_ERR_INVALID_ARGUMENT, reject);
+    }
+
+    const uint64_t at = carry->at;
+    *out_last_destination = at;
+    const uint64_t tail = literals_size - carry->literals_used;
     if (tail > block_maximum - at) {
         return ZstdExecRefuse(kZstdExecRejectBlockTooLarge,
                               CUDEC_ERR_CORRUPT_INPUT, reject);
     }
-    const uint64_t block_size = at + tail;
-    out_plan->block_size = block_size;
-    out_plan->literals_used = literals_used;
+    out_plan->block_size = at + tail;
+    out_plan->literals_used = carry->literals_used;
+    return CUDEC_OK;
+}
+
+/* The whole block's prefix sum in one call: one tile the size of the block,
+ * then the close.
+ *
+ * `out_destinations` receives `sequence_count + 1` entries: entry `i` is where
+ * sequence `i` writes its literals, and the last entry is where the leftover
+ * literals begin. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdExecPrefixSum(
+    const ZstdSequence* sequences, uint32_t sequence_count,
+    uint64_t literals_size, uint64_t block_maximum,
+    uint64_t* out_destinations, uint32_t destinations_capacity,
+    ZstdExecPlan* out_plan, ZstdExecReject* reject) {
+    if (reject != 0) {
+        *reject = kZstdExecRejectNone;
+    }
+    if (out_plan != 0) {
+        out_plan->block_size = 0;
+        out_plan->literals_used = 0;
+    }
+    /* The one-past-the-end entry is this form's own, so the room for it is
+     * bounded here; the tile below is told about its own entries only. */
+    if (out_destinations == 0 || out_plan == 0 || destinations_capacity < 1 ||
+        destinations_capacity - 1 < sequence_count) {
+        return ZstdExecRefuse(kZstdExecRejectBadRequest,
+                              CUDEC_ERR_INVALID_ARGUMENT, reject);
+    }
+    ZstdExecCarry carry;
+    carry.at = 0;
+    carry.literals_used = 0;
+    const cudec_status summed = ZstdExecPrefixSumTile(
+        sequences, sequence_count, literals_size, block_maximum, &carry,
+        out_destinations, 0, destinations_capacity - 1, reject);
+    if (summed != CUDEC_OK) {
+        return summed;
+    }
+    return ZstdExecPrefixSumFinish(&carry, literals_size, block_maximum,
+                                   &out_destinations[sequence_count], out_plan,
+                                   reject);
+}
+
+/* Executes one sequence: its literals, then its match, into the frame's
+ * output.
+ *
+ * WHY THE BODY IS ITS OWN FUNCTION. On the device the sequences of a tile run
+ * one per lane, and a loop body reached only from a whole-block loop would
+ * have to be spelled a second time to get there. The two offset bounds and the
+ * plan-consistency check are the last things in this format that should
+ * acquire a second spelling, so the body moves and both callers reach it.
+ *
+ * Everything a lane needs arrives by value: its destination, its successor's,
+ * its own literal cursor - which the tiled prefix sum supplies where there is
+ * no loop to carry one - and the block size the plan fixed. `base` is where
+ * this block starts in the frame's output, so the offset bounds below are the
+ * frame's and never the block's. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdExecuteSequence(
+    const ZstdSequence* sequence, uint64_t destination,
+    uint64_t next_destination, uint64_t offset, const unsigned char* literals,
+    uint64_t literals_size, uint64_t literal_at, uint64_t block_size,
+    uint64_t window_size, unsigned char* dst, uint64_t base,
+    ZstdExecReject* reject) {
+    if (reject != 0) {
+        *reject = kZstdExecRejectNone;
+    }
+    if (sequence == 0 || dst == 0 || (literals == 0 && literals_size != 0) ||
+        literal_at > literals_size) {
+        return ZstdExecRefuse(kZstdExecRejectBadRequest,
+                              CUDEC_ERR_INVALID_ARGUMENT, reject);
+    }
+
+    const uint64_t literals_length = sequence->literals_length;
+    const uint64_t match_length = sequence->match_length;
+    const uint64_t at = destination;
+    /* The array is re-derived rather than believed: this sequence's own
+     * lengths have to carry the destination to the next one's, and the
+     * last one's to where the tail begins. A scan that dropped a sequence,
+     * doubled one, or ran in the wrong order fails here rather than
+     * writing over a neighbour's bytes. */
+    if (at > block_size || literals_length + match_length > block_size - at ||
+        at + literals_length + match_length != next_destination) {
+        return ZstdExecRefuse(kZstdExecRejectPlanInconsistent,
+                              CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    if (literals_length > literals_size - literal_at) {
+        return ZstdExecRefuse(kZstdExecRejectLiteralsExhausted,
+                              CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+
+    uint64_t to = base + at;
+    for (uint64_t i = 0; i < literals_length; i++) {
+        dst[to + i] = literals[literal_at + i];
+    }
+    to += literals_length;
+
+    if (offset == 0) {
+        return ZstdExecRefuse(kZstdExecRejectOffsetZero,
+                              CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    if (offset > window_size) {
+        return ZstdExecRefuse(kZstdExecRejectOffsetPastWindow,
+                              CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    /* `to` is where this match starts, so the bytes produced before it are
+     * everything the frame holds up to that point - the earlier blocks,
+     * this block's earlier sequences, and this sequence's own literals.
+     * Comparing against the block's own start instead would refuse the
+     * cross-block match the format allows. */
+    if (offset > to) {
+        return ZstdExecRefuse(kZstdExecRejectOffsetBeforeOutput,
+                              CUDEC_ERR_CORRUPT_INPUT, reject);
+    }
+    const uint64_t from = to - offset;
+    for (uint64_t i = 0; i < match_length; i++) {
+        dst[to + i] = dst[from + i];
+    }
     return CUDEC_OK;
 }
 
@@ -262,54 +439,14 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdExecuteBlock(
 
     uint64_t literal_at = 0;
     for (uint32_t index = 0; index < sequence_count; index++) {
-        const uint64_t literals_length = sequences[index].literals_length;
-        const uint64_t match_length = sequences[index].match_length;
-        const uint64_t at = destinations[index];
-        /* The array is re-derived rather than believed: this sequence's own
-         * lengths have to carry the destination to the next one's, and the
-         * last one's to where the tail begins. A scan that dropped a sequence,
-         * doubled one, or ran in the wrong order fails here rather than
-         * writing over a neighbour's bytes. */
-        if (at > plan->block_size ||
-            literals_length + match_length > plan->block_size - at ||
-            at + literals_length + match_length != destinations[index + 1]) {
-            return ZstdExecRefuse(kZstdExecRejectPlanInconsistent,
-                                  CUDEC_ERR_CORRUPT_INPUT, reject);
+        const cudec_status status = ZstdExecuteSequence(
+            &sequences[index], destinations[index], destinations[index + 1],
+            offsets[index], literals, literals_size, literal_at,
+            plan->block_size, window_size, dst, base, reject);
+        if (status != CUDEC_OK) {
+            return status;
         }
-        if (literals_length > literals_size - literal_at) {
-            return ZstdExecRefuse(kZstdExecRejectLiteralsExhausted,
-                                  CUDEC_ERR_CORRUPT_INPUT, reject);
-        }
-
-        uint64_t to = base + at;
-        for (uint64_t i = 0; i < literals_length; i++) {
-            dst[to + i] = literals[literal_at + i];
-        }
-        literal_at += literals_length;
-        to += literals_length;
-
-        const uint64_t offset = offsets[index];
-        if (offset == 0) {
-            return ZstdExecRefuse(kZstdExecRejectOffsetZero,
-                                  CUDEC_ERR_CORRUPT_INPUT, reject);
-        }
-        if (offset > window_size) {
-            return ZstdExecRefuse(kZstdExecRejectOffsetPastWindow,
-                                  CUDEC_ERR_CORRUPT_INPUT, reject);
-        }
-        /* `to` is where this match starts, so the bytes produced before it are
-         * everything the frame holds up to that point - the earlier blocks,
-         * this block's earlier sequences, and this sequence's own literals.
-         * Comparing against the block's own start instead would refuse the
-         * cross-block match the format allows. */
-        if (offset > to) {
-            return ZstdExecRefuse(kZstdExecRejectOffsetBeforeOutput,
-                                  CUDEC_ERR_CORRUPT_INPUT, reject);
-        }
-        const uint64_t from = to - offset;
-        for (uint64_t i = 0; i < match_length; i++) {
-            dst[to + i] = dst[from + i];
-        }
+        literal_at += sequences[index].literals_length;
     }
 
     /* Where the tail begins, and the last thing the plan is held to.

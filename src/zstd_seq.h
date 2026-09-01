@@ -551,30 +551,56 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdSeqUpdateState(
     return CUDEC_OK;
 }
 
-/* The three-state interleaved loop over one backward bitstream.
+/* A sequence decode in progress: everything the three-state loop has to carry
+ * from one tile of sequences to the next.
  *
- * Three orders, all the format's and no two of them the same: the states are
- * initialised literals-length, offset, match-length; the extra bits are read
- * offset, match-length, literals-length; and the states are updated
- * literals-length, match-length, offset. An implementation that gets any one
- * of them wrong still decodes the first field of the first sequence
- * correctly, which is why the corpus sweep asserts exact consumption rather
- * than only the count.
+ * WHY THE LOOP IS RESUMABLE AT ALL. A block may declare Block_Maximum_Size / 3
+ * sequences, which is 43690 for a 128 KiB block, and the whole-set form below
+ * fills an array of that many. `docs/MASTERPLAN.md` section 14.9 costs that
+ * against the shared memory a fused kernel has and produces sequences 128 at a
+ * time instead, so the loop needs a form whose reader and three states survive
+ * the call. The whole-set form is written on top of this one rather than
+ * beside it: a second copy of the three orders below is the one duplication
+ * this file cannot afford.
+ *
+ * THE TABLES ARE HELD RATHER THAN RE-PASSED, AND THAT IS NOT A TRUST
+ * DECISION. Their capacities are bounded once, when the decode starts, which
+ * is exactly when the whole-set form bounds them; every cell read afterwards
+ * is bounded by `table_size` at the read, which is where it always was. */
+struct ZstdSeqCursor {
+    ZstdBitReader reader;
+    const ZstdSeqTable* litlen;
+    const ZstdSeqTable* offset;
+    const ZstdSeqTable* matchlen;
+    ZstdFseState litlen_state;
+    ZstdFseState offset_state;
+    ZstdFseState matchlen_state;
+    /* The block's declared count, and how many of them have been emitted. */
+    uint32_t total;
+    uint32_t emitted;
+    /* Set by the tile that emits the last sequence, once the bitstream has
+     * been held to ending exactly there. A cursor is only spent when this is
+     * true; a decode that stopped early stopped on a refusal. */
+    bool finished;
+};
+
+/* Starts a sequence decode: validates what the whole block's decode rests on,
+ * reads the start marker, and initialises the three states.
  *
  * `src`/`size` are the bitstream alone: the section header and the table
  * descriptions have already been stepped over by the caller. */
-CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeSequences(
+CUDEC_HOST_DEVICE inline cudec_status ZstdSeqBegin(
     const unsigned char* src, uint64_t size, uint32_t sequence_count,
     const ZstdSeqTable* litlen, const ZstdSeqTable* offset,
-    const ZstdSeqTable* matchlen, ZstdSequence* out, uint32_t out_capacity,
+    const ZstdSeqTable* matchlen, ZstdSeqCursor* cursor,
     ZstdSeqReject* reject) {
     if (reject != 0) {
         *reject = kZstdSeqRejectNone;
     }
-    if (src == 0 || litlen == 0 || offset == 0 || matchlen == 0 || out == 0 ||
-        sequence_count == 0 || out_capacity < sequence_count ||
-        litlen->cells == 0 || offset->cells == 0 || matchlen->cells == 0 ||
-        !litlen->present || !offset->present || !matchlen->present) {
+    if (src == 0 || litlen == 0 || offset == 0 || matchlen == 0 ||
+        cursor == 0 || sequence_count == 0 || litlen->cells == 0 ||
+        offset->cells == 0 || matchlen->cells == 0 || !litlen->present ||
+        !offset->present || !matchlen->present) {
         return ZstdSeqRefuse(kZstdSeqRejectBadRequest,
                              CUDEC_ERR_INVALID_ARGUMENT, reject);
     }
@@ -593,42 +619,83 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeSequences(
         return ZstdSeqRefuse(kZstdSeqRejectBitstreamMissing,
                              CUDEC_ERR_CORRUPT_INPUT, reject);
     }
-    ZstdBitReader reader{src, size};
-    if (reader.Start() != CUDEC_OK) {
+
+    cursor->reader = ZstdBitReader{src, size};
+    cursor->litlen = litlen;
+    cursor->offset = offset;
+    cursor->matchlen = matchlen;
+    cursor->total = sequence_count;
+    cursor->emitted = 0;
+    cursor->finished = false;
+    if (cursor->reader.Start() != CUDEC_OK) {
         return ZstdSeqRefuse(kZstdSeqRejectBitstreamMissing,
                              CUDEC_ERR_CORRUPT_INPUT, reject);
     }
 
-    ZstdFseState litlen_state;
-    ZstdFseState offset_state;
-    ZstdFseState matchlen_state;
     ZstdFseReject fse_reject = kZstdFseRejectNone;
-    if (ZstdFseInitState(&reader, litlen->accuracy_log, &litlen_state,
-                         &fse_reject) != CUDEC_OK ||
-        ZstdFseInitState(&reader, offset->accuracy_log, &offset_state,
-                         &fse_reject) != CUDEC_OK ||
-        ZstdFseInitState(&reader, matchlen->accuracy_log, &matchlen_state,
-                         &fse_reject) != CUDEC_OK) {
+    if (ZstdFseInitState(&cursor->reader, litlen->accuracy_log,
+                         &cursor->litlen_state, &fse_reject) != CUDEC_OK ||
+        ZstdFseInitState(&cursor->reader, offset->accuracy_log,
+                         &cursor->offset_state, &fse_reject) != CUDEC_OK ||
+        ZstdFseInitState(&cursor->reader, matchlen->accuracy_log,
+                         &cursor->matchlen_state, &fse_reject) != CUDEC_OK) {
         return ZstdSeqRefuse(kZstdSeqRejectStateInitTruncated,
                              CUDEC_ERR_CORRUPT_INPUT, reject);
     }
+    return CUDEC_OK;
+}
 
-    for (uint32_t index = 0; index < sequence_count; index++) {
+/* Decodes the next `want` sequences of a started decode, or however many are
+ * left if that is fewer.
+ *
+ * Three orders, all the format's and no two of them the same: the states are
+ * initialised literals-length, offset, match-length; the extra bits are read
+ * offset, match-length, literals-length; and the states are updated
+ * literals-length, match-length, offset. An implementation that gets any one
+ * of them wrong still decodes the first field of the first sequence
+ * correctly, which is why the corpus sweep asserts exact consumption rather
+ * than only the count.
+ *
+ * THE END CHECK BELONGS TO THE TILE THAT EMITS THE LAST SEQUENCE and not to
+ * whoever calls last. The stream must end exactly where the final sequence
+ * leaves it, so the check runs the moment `emitted` reaches `total` - a caller
+ * that stops there and never calls again has still had the stream held to its
+ * count. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdSeqDecodeTile(
+    ZstdSeqCursor* cursor, ZstdSequence* out, uint32_t out_capacity,
+    uint32_t want, uint32_t* out_count, ZstdSeqReject* reject) {
+    if (reject != 0) {
+        *reject = kZstdSeqRejectNone;
+    }
+    if (out_count != 0) {
+        *out_count = 0;
+    }
+    if (cursor == 0 || out == 0 || out_count == 0 || want == 0 ||
+        out_capacity < want || cursor->litlen == 0 || cursor->offset == 0 ||
+        cursor->matchlen == 0 || cursor->finished ||
+        cursor->emitted >= cursor->total) {
+        return ZstdSeqRefuse(kZstdSeqRejectBadRequest,
+                             CUDEC_ERR_INVALID_ARGUMENT, reject);
+    }
+
+    const uint32_t remaining = cursor->total - cursor->emitted;
+    const uint32_t count = want < remaining ? want : remaining;
+    for (uint32_t index = 0; index < count; index++) {
         unsigned litlen_code = 0;
         unsigned offset_code = 0;
         unsigned matchlen_code = 0;
-        cudec_status status =
-            ZstdSeqPeekSymbol(litlen, &litlen_state, &litlen_code, reject);
+        cudec_status status = ZstdSeqPeekSymbol(
+            cursor->litlen, &cursor->litlen_state, &litlen_code, reject);
         if (status != CUDEC_OK) {
             return status;
         }
-        status = ZstdSeqPeekSymbol(offset, &offset_state, &offset_code,
-                                   reject);
+        status = ZstdSeqPeekSymbol(cursor->offset, &cursor->offset_state,
+                                   &offset_code, reject);
         if (status != CUDEC_OK) {
             return status;
         }
-        status = ZstdSeqPeekSymbol(matchlen, &matchlen_state, &matchlen_code,
-                                   reject);
+        status = ZstdSeqPeekSymbol(cursor->matchlen, &cursor->matchlen_state,
+                                   &matchlen_code, reject);
         if (status != CUDEC_OK) {
             return status;
         }
@@ -646,11 +713,11 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeSequences(
         uint64_t offset_extra = 0;
         uint64_t matchlen_extra = 0;
         uint64_t litlen_extra = 0;
-        if (reader.ReadBits(offset_code, &offset_extra) != CUDEC_OK ||
-            reader.ReadBits(ZstdSeqMatchLenExtraBits(matchlen_code),
-                            &matchlen_extra) != CUDEC_OK ||
-            reader.ReadBits(ZstdSeqLitLenExtraBits(litlen_code),
-                            &litlen_extra) != CUDEC_OK) {
+        if (cursor->reader.ReadBits(offset_code, &offset_extra) != CUDEC_OK ||
+            cursor->reader.ReadBits(ZstdSeqMatchLenExtraBits(matchlen_code),
+                                    &matchlen_extra) != CUDEC_OK ||
+            cursor->reader.ReadBits(ZstdSeqLitLenExtraBits(litlen_code),
+                                    &litlen_extra) != CUDEC_OK) {
             return ZstdSeqRefuse(kZstdSeqRejectSequenceTruncated,
                                  CUDEC_ERR_CORRUPT_INPUT, reject);
         }
@@ -660,32 +727,68 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeSequences(
                                   static_cast<uint32_t>(matchlen_extra);
         out[index].literals_length = ZstdSeqLitLenBaseline(litlen_code) +
                                      static_cast<uint32_t>(litlen_extra);
+        cursor->emitted++;
 
         /* The last sequence consumes its states without updating them, which
          * is what makes the stream end exactly here. */
-        if (index + 1 == sequence_count) {
+        if (cursor->emitted == cursor->total) {
             continue;
         }
-        status = ZstdSeqUpdateState(&reader, litlen, &litlen_state, reject);
+        status = ZstdSeqUpdateState(&cursor->reader, cursor->litlen,
+                                    &cursor->litlen_state, reject);
         if (status != CUDEC_OK) {
             return status;
         }
-        status = ZstdSeqUpdateState(&reader, matchlen, &matchlen_state,
-                                    reject);
+        status = ZstdSeqUpdateState(&cursor->reader, cursor->matchlen,
+                                    &cursor->matchlen_state, reject);
         if (status != CUDEC_OK) {
             return status;
         }
-        status = ZstdSeqUpdateState(&reader, offset, &offset_state, reject);
+        status = ZstdSeqUpdateState(&cursor->reader, cursor->offset,
+                                    &cursor->offset_state, reject);
         if (status != CUDEC_OK) {
             return status;
         }
     }
 
-    if (!reader.AtEnd()) {
-        return ZstdSeqRefuse(kZstdSeqRejectBitstreamNotConsumed,
-                             CUDEC_ERR_CORRUPT_INPUT, reject);
+    if (cursor->emitted == cursor->total) {
+        if (!cursor->reader.AtEnd()) {
+            return ZstdSeqRefuse(kZstdSeqRejectBitstreamNotConsumed,
+                                 CUDEC_ERR_CORRUPT_INPUT, reject);
+        }
+        cursor->finished = true;
     }
+    *out_count = count;
     return CUDEC_OK;
+}
+
+/* The whole block's sequences in one call: the shape the host twins and the
+ * frame decoder use, and one tile the size of the block. */
+CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeSequences(
+    const unsigned char* src, uint64_t size, uint32_t sequence_count,
+    const ZstdSeqTable* litlen, const ZstdSeqTable* offset,
+    const ZstdSeqTable* matchlen, ZstdSequence* out, uint32_t out_capacity,
+    ZstdSeqReject* reject) {
+    if (reject != 0) {
+        *reject = kZstdSeqRejectNone;
+    }
+    /* Bounded here as well as in the tile, because the tile is handed `want`
+     * rather than the block's count: a capacity short of the whole block is a
+     * caller bug this form has always refused, and refusing it before the
+     * bitstream is touched keeps that answer independent of the stream. */
+    if (out == 0 || sequence_count == 0 || out_capacity < sequence_count) {
+        return ZstdSeqRefuse(kZstdSeqRejectBadRequest,
+                             CUDEC_ERR_INVALID_ARGUMENT, reject);
+    }
+    ZstdSeqCursor cursor;
+    const cudec_status started = ZstdSeqBegin(
+        src, size, sequence_count, litlen, offset, matchlen, &cursor, reject);
+    if (started != CUDEC_OK) {
+        return started;
+    }
+    uint32_t decoded = 0;
+    return ZstdSeqDecodeTile(&cursor, out, out_capacity, sequence_count,
+                             &decoded, reject);
 }
 
 }  // namespace cudec_detail
