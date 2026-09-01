@@ -210,6 +210,17 @@ target_include_directories(gdeflate_block_twin
 cudec_add_test(gdeflate_ladder_lock SOURCES gdeflate_ladder_lock.cpp)
 target_include_directories(gdeflate_ladder_lock
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The lock over the declared strictness departures (issue #183). The ladder
+# lock above asks which rung this decoder takes; this one asks whether the
+# rungs the fuzz target is allowed to stay silent about are real. It needs the
+# reference for that - a departure is a page libdeflate decodes and this
+# decoder refuses - so unlike its neighbour it links gdeflate_oracle, for the
+# reason oracle_gdeflate gives above, and it reaches src/ for the predicate and
+# the three headers under test. GPU-less: both decoders here are host code.
+cudec_add_test(gdeflate_departure_lock SOURCES gdeflate_departure_lock.cpp LIBS
+               gdeflate_oracle)
+target_include_directories(gdeflate_departure_lock
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.

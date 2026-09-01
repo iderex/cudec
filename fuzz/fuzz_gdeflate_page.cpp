@@ -36,25 +36,36 @@
  * bound is measured as well as argued: sized by the lane count instead, the
  * target segfaults inside the reference within a few thousand execs.
  *
- * WHICH DIRECTION IS ASSERTED, AND WHICH IS NOT. The fail-open direction
- * always traps: the twin accepting a stream the reference refuses, or the two
- * accepting and disagreeing on the bytes or on the size. The reverse - the
- * twin refusing what the reference accepts - is NOT trapped, and that is a
- * deliberate weakening rather than an omission, because src/ is stricter than
- * the reference in three places that each say so at their own site:
+ * BOTH DIRECTIONS ARE ASSERTED, AND THE REVERSE ONE IS KEYED BY RUNG. The
+ * fail-open direction always traps: the twin accepting a stream the reference
+ * refuses, or the two accepting and disagreeing on the bytes or on the size.
+ * The reverse - the twin refusing a page the reference decodes - traps as
+ * well, unless the rung the twin refused on is one src/gdeflate_schedule.h
+ * declares a strictness departure, which today is three of the twenty-two.
  *
- *   - an empty code is refused on use, where the reference resolves it to a
- *     synthetic symbol the stream never encoded (src/gdeflate_tables.h);
- *   - a code-length repeat run reaching past HLIT + HDIST is refused, where
- *     the reference absorbs it into 137 slack entries it then never reads
- *     (src/gdeflate_tables.h);
- *   - a refill past the last word of the page is refused, which is the
- *     unchecked read above (src/gdeflate_schedule.h).
+ * THIS DIRECTION WAS UNTRAPPED UNTIL THE LADDER EXISTED, AND THE REASON IS
+ * WORTH KEEPING. The decoder used to report only that it had refused, so a
+ * deliberate departure and an accidental over-strictness arrived here as the
+ * same event and no assertion could separate them; trapping on the pair would
+ * have made this target report its own design, three times a thousand execs.
+ * The reject ladder is what changed that - a refusal now names one rung - so
+ * the exemption is an enumerated list of three arguments rather than a whole
+ * direction left unwatched.
  *
- * All three are the fail-CLOSED direction, all three are reachable from
- * fuzzer bytes constantly, and trapping on them would make this target report
- * its own design. What watches that half instead is the byte parity on the
- * pages both sides accept, and the sanitizers, which have no opinion about
+ * WHY IT IS WORTH TRAPPING FOR THIS FORMAT IN PARTICULAR. The fail-open
+ * direction catches a decoder that accepts what it should refuse, which is the
+ * security direction and is rightly the one that landed first. It says nothing
+ * about a decoder that refuses what it should accept, and with no checksum
+ * anywhere in this format that failure reaches the caller as data the
+ * reference decompresses and cudec calls corrupt, with nothing to appeal to.
+ *
+ * WHAT THE EXEMPTION COSTS, SAID RATHER THAN IMPLIED. Three rungs are silent
+ * here, so an over-strictness that lands on one of those three is not
+ * distinguishable by this target from the departure that rung was declared
+ * for. What holds them is tests/gdeflate_departure_lock.cpp, which requires a
+ * page the reference accepts for every declared rung, so a list grown to
+ * silence a trap reds a test instead. The pages both sides accept are still
+ * watched by the byte parity below, and the sanitizers have no opinion about
  * which decoder is stricter.
  *
  * THE PAGE COUNT AND THE CAPACITY COME FROM THE INPUT, and both sides receive
@@ -79,6 +90,8 @@ namespace {
 
 using cudec_detail::GDeflateDecodePage;
 using cudec_detail::GDeflatePageState;
+using cudec_detail::GDeflateReject;
+using cudec_detail::GDeflateRejectIsDeclaredDeparture;
 using cudec_detail::kGDeflateNumStreams;
 
 /* Bounded so libFuzzer explores the rounds rather than the allocator. Four
@@ -228,6 +241,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     std::memset(twin_out.get(), 0, capacity);
     size_t twin_size = 0;
     bool twin_ok = true;
+    /* Which rung refused, for the reverse-direction check below. The loop
+     * stops at the first page that refuses, so this is that page's rung and
+     * never a later one's. */
+    GDeflateReject twin_reject = cudec_detail::kGDeflateRejectNone;
     for (uint32_t i = 0; i < npages && twin_ok; i++) {
         GDeflatePageState st;
         uint64_t produced = 0;
@@ -241,6 +258,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
                 Trap("the page decode refused without failing the schedule",
                      size);
             }
+            twin_reject = st.s.reject;
             twin_ok = false;
             break;
         }
@@ -267,11 +285,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 #endif
 
     /* The fail-open direction. A stream the reference calls corrupt that this
-     * decoder accepts is the finding this target exists for, and it is the
-     * only direction asserted - the file header says which reverse cases are
-     * this decoder being deliberately stricter and why they are not trapped. */
+     * decoder accepts is the finding this target exists for. */
     if (twin_ok && !oracle_ok) {
         Trap("the twin accepted a stream the reference refused", size);
+    }
+    /* The reverse direction, keyed by rung. The message carries the rung
+     * rather than only the fact, because the first question asked of a finding
+     * here is which refusal fired - a rung that is nearly a declared departure
+     * is a different repair from one that is nowhere near it. */
+    if (!twin_ok && oracle_ok &&
+        !GDeflateRejectIsDeclaredDeparture(twin_reject)) {
+        char what[128];
+        std::snprintf(what, sizeof what,
+                      "the twin refused a stream the reference decoded, on "
+                      "undeclared rung %d",
+                      static_cast<int>(twin_reject));
+        Trap(what, size);
     }
     if (!twin_ok || !oracle_ok) {
         return 0;

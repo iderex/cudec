@@ -171,6 +171,49 @@ static_assert(kGDeflateRejectBlockFirst == kGDeflateRejectTablesLast + 1,
 static_assert(kGDeflateRejectCount == kGDeflateRejectBlockLast + 1,
               "the block section must be the last one");
 
+/* THE DECLARED STRICTNESS DEPARTURES (issue #183). Three rungs refuse a page
+ * that libdeflate's GDeflate decompressor decodes, and each one is a decision
+ * argued at its own refusal site rather than an accident:
+ *
+ *   - kGDeflateRejectRefillPastEnd, at GDeflateEnsure below: the reference
+ *     reads a word past the last one the page holds, which the format's
+ *     watermark discipline makes safe on a well-formed page and nothing makes
+ *     safe on a hostile one.
+ *   - kGDeflateRejectEmptyTableUsed, in src/gdeflate_tables.h: the reference
+ *     resolves a use of an empty code to a synthetic symbol the stream never
+ *     encoded.
+ *   - kGDeflateRejectRepeatRunPastAlphabet, in src/gdeflate_tables.h: the
+ *     reference absorbs a code-length repeat run that overruns HLIT + HDIST
+ *     into slack entries it then never reads.
+ *
+ * WHY THE LIST IS A PREDICATE AND NOT A SENTENCE IN A COMMENT. For a format
+ * with no checksum anywhere, over-strictness is not a lesser cousin of
+ * fail-open: a stream the reference decompresses and this decoder calls
+ * corrupt is data the caller cannot recover and cannot appeal, because there
+ * is no checksum to say which of the two decoders is right. A twin that is
+ * never measured in this direction drifts stricter one refusal at a time, and
+ * every step of that drift reads as a bug fix. So the differential target
+ * traps the reverse direction and consults this predicate for the exemption,
+ * which makes a fourth departure a thing somebody writes down rather than a
+ * thing a later reader discovers by finding data that will not decompress.
+ *
+ * WHAT HOLDS THE LIST TO REALITY IS tests/gdeflate_departure_lock.cpp, which
+ * requires a page the reference accepts and this decoder refuses on that rung
+ * for every branch named here. A rung added to this predicate to silence a
+ * trap therefore fails a test rather than buying silence, and a departure that
+ * stops being one fails it too. */
+CUDEC_HOST_DEVICE inline bool GDeflateRejectIsDeclaredDeparture(
+    GDeflateReject branch) {
+    switch (branch) {
+        case kGDeflateRejectRefillPastEnd:
+        case kGDeflateRejectEmptyTableUsed:
+        case kGDeflateRejectRepeatRunPastAlphabet:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* The 32 lane bit buffers, the current lane, and the one shared word cursor.
  * The failure flag is sticky: once set, every operation is a no-op, so a
  * caller that checks it once at the end reads the same verdict as one that
