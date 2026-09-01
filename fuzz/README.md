@@ -30,7 +30,7 @@ accepts, the reference must accept the same bytes and produce the identical
 output and size. The opposite direction is asserted only where a target can
 show the two sides were given the same question to answer, because a parser
 that is stricter than its reference is usually the fail-closed contract
-working, not a defect. Three targets can. `fuzz_zstd_fse` hands the
+working, not a defect. Four targets can. `fuzz_zstd_fse` hands the
 reference the alphabet and accuracy-log ceilings the unit under test was given,
 over a padded copy that keeps the reference's own end-of-buffer handling out of
 the comparison, and holds both sides to each other from there.
@@ -51,6 +51,21 @@ from the bytes rather than from the verdict, and it is pinned as a negative in
 hole nothing covers. A skippable frame was the second until the walk stopped
 calling it corrupt (#379); it is now refused as `UNSUPPORTED`, which this
 target's stricter-direction check never sees.
+
+`fuzz_gdeflate_page` is the fourth, and it identifies a strictness from the
+RUNG rather than from the bytes, which is the difference the reject ladder
+(#183) bought. Both sides are handed the same page and the same capacity, so
+the questions match; a refusal names one of the twenty-two branches of
+`enum GDeflateReject`, and the target traps unless
+`GDeflateRejectIsDeclaredDeparture` in `src/gdeflate_schedule.h` declares that
+branch. Three are declared - the read past the last word of the page, the use
+of an empty code, and the code-length repeat run that overruns HLIT + HDIST -
+and each is argued at its own refusal site. The exemption is held by
+`tests/gdeflate_departure_lock.cpp`, which requires a page the reference
+decodes for every declared branch, so a list grown to silence a trap reds a
+test instead. Over-strictness matters more here than for the other three:
+GDeflate carries no checksum anywhere, so a stream the reference decompresses
+and cudec calls corrupt reaches the caller with nothing to appeal to.
 
 `fuzz_zstd_decode` is the only target that enters more than one unit, and the
 two things it can say follow from that. It runs the same host driver the CPU
