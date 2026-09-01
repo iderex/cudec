@@ -68,8 +68,20 @@ int main() {
                                             results, nullptr) ==
             CUDEC_ERR_NOT_IMPLEMENTED);
 
+    /* The Zstd entry, the same opposite assertion and for the same reason
+     * (issue #427). Written out rather than folded into a loop over the two
+     * not-implemented entries: what this file is for is the point where two
+     * entries stop being the same code, and a loop would assume they are. */
+    REQUIRE(cudec_zstd_decompress_batch(nullptr, sizes, dsts, caps, 1, results,
+                                        nullptr) ==
+            CUDEC_ERR_INVALID_ARGUMENT);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 1, results,
+                                        nullptr) == CUDEC_ERR_NOT_IMPLEMENTED);
+    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 1, results,
+                                        nullptr) == CUDEC_ERR_NOT_IMPLEMENTED);
+
     std::printf("PASS: with zero visible devices the two kernel-backed batch "
-                "entries report CUDEC_ERR_CUDA and the GDeflate entry "
-                "reports CUDEC_ERR_NOT_IMPLEMENTED\n");
+                "entries report CUDEC_ERR_CUDA and the GDeflate and Zstd "
+                "entries report CUDEC_ERR_NOT_IMPLEMENTED\n");
     return 0;
 }
