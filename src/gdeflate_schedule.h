@@ -101,6 +101,76 @@ static_assert(sizeof(uint64_t) * 8 == kGDeflateLaneBufferBits,
  * than bad input. */
 constexpr uint32_t kGDeflateMaxPopBits = kGDeflateLowWatermarkBits;
 
+/* THE REJECT LADDER (issue #183). Every refusal in these three headers names
+ * one branch of this enumeration, and each branch is named by exactly one
+ * site, so the ladder's branch set is DERIVED from the code rather than
+ * restated beside it. tests/CMakeLists.txt refuses a build where that stops
+ * being true, and the twins hold the run-time half: a negative has to reach
+ * every branch that any page can reach, and a branch declared unreachable has
+ * to stay unreached. Adding a rung therefore costs a branch here and a
+ * negative there, and a rung that reuses a neighbour's branch to avoid both is
+ * what the exactly-one count refuses.
+ *
+ * ONE ENUMERATION FOR THREE HEADERS, because one sticky field carries it: a
+ * page decode fails once, in whichever of the three the defect was found, and
+ * a caller reading the verdict should not have to ask which layer to ask.
+ * The sections below are the layers, and the sentinels between them are what
+ * lets each twin assert coverage over its own header rather than over all
+ * three. A sentinel carries an explicit value; a branch never does, which is
+ * how the configure-time lock tells them apart without a list to maintain. */
+enum GDeflateReject {
+    kGDeflateRejectNone = 0,
+
+    /* src/gdeflate_schedule.h - the bit cursor. */
+    kGDeflateRejectPagePartialWord,
+    kGDeflateRejectPageBelowPrimingRound,
+    kGDeflateRejectRefillPastEnd,
+    kGDeflateRejectRemovePastLane,
+    kGDeflateRejectPopWidthPastFormat,
+    kGDeflateRejectPopPastLane,
+    kGDeflateRejectScheduleFirst = kGDeflateRejectPagePartialWord,
+    kGDeflateRejectScheduleLast = kGDeflateRejectPopPastLane,
+
+    /* src/gdeflate_tables.h - table construction and symbol decode. */
+    kGDeflateRejectTablePastCapacity,
+    kGDeflateRejectTableLengthPastMax,
+    kGDeflateRejectTableOverSubscribed,
+    kGDeflateRejectTableIncomplete,
+    kGDeflateRejectEmptyTableUsed,
+    kGDeflateRejectCodewordNotInCode,
+    kGDeflateRejectRepeatNothingBefore,
+    kGDeflateRejectRepeatRunPastAlphabet,
+    kGDeflateRejectTablesFirst = kGDeflateRejectTablePastCapacity,
+    kGDeflateRejectTablesLast = kGDeflateRejectRepeatRunPastAlphabet,
+
+    /* src/gdeflate_block.h - the block loop. */
+    kGDeflateRejectBlockTypeReserved,
+    kGDeflateRejectStoredPastCap,
+    kGDeflateRejectStoredPastPage,
+    kGDeflateRejectLiteralPastCap,
+    kGDeflateRejectMatchPastCap,
+    kGDeflateRejectMatchBeforeOutput,
+    kGDeflateRejectRoundFuelExhausted,
+    kGDeflateRejectNoFinalBlock,
+    kGDeflateRejectBlockFirst = kGDeflateRejectBlockTypeReserved,
+    kGDeflateRejectBlockLast = kGDeflateRejectNoFinalBlock,
+
+    kGDeflateRejectCount
+};
+
+/* The sections have to stay contiguous and in this order, because each twin
+ * walks its own First..Last range. A branch inserted into the wrong section
+ * would be asserted by the wrong twin, which is a coverage hole that reads as
+ * coverage. */
+static_assert(kGDeflateRejectScheduleFirst == kGDeflateRejectNone + 1,
+              "the schedule section must start immediately after None");
+static_assert(kGDeflateRejectTablesFirst == kGDeflateRejectScheduleLast + 1,
+              "the table section must follow the schedule section");
+static_assert(kGDeflateRejectBlockFirst == kGDeflateRejectTablesLast + 1,
+              "the block section must follow the table section");
+static_assert(kGDeflateRejectCount == kGDeflateRejectBlockLast + 1,
+              "the block section must be the last one");
+
 /* The 32 lane bit buffers, the current lane, and the one shared word cursor.
  * The failure flag is sticky: once set, every operation is a no-op, so a
  * caller that checks it once at the end reads the same verdict as one that
@@ -112,7 +182,62 @@ struct GDeflateSchedule {
     uint64_t cursor;
     uint64_t word_count;
     bool failed;
+    /* Which rung refused, and it is the reason the flag alone is not enough:
+     * a caller that only knows the page failed cannot tell a page that ran off
+     * its own end from one whose code lengths are not a code, and neither can
+     * a test asserting that its negative reached the branch it was written
+     * for. Set only through the choke point below. */
+    GDeflateReject reject;
 };
+
+/* THE ONE PLACE A REFUSAL IS RECORDED, for the reason SnappyRefuse is one in
+ * src/snappy_block.h: a refusal that never passes through here names no rung,
+ * so it is invisible to the configure-time count and to the twins' coverage
+ * alike, and adding one would be the one change that could grow the ladder
+ * with both halves of the lock still green. It answers false so that a bool
+ * caller can `return GDeflateRefuse(...)` and a void one can call it and
+ * return.
+ *
+ * FIRST REFUSAL WINS. The flag is sticky and every operation is a no-op once
+ * it is set, so a later call could only overwrite the branch with a
+ * consequence of the first one. */
+CUDEC_HOST_DEVICE inline bool GDeflateRefuse(GDeflateSchedule& s,
+                                             GDeflateReject branch) {
+    if (!s.failed) {
+        s.failed = true;
+        s.reject = branch;
+    }
+    return false;
+}
+
+/* Re-raise a refusal a nested ladder already named. Table construction runs
+ * without a schedule - it is called on a length vector and nothing else - so
+ * it names its rung into a caller-supplied slot, and the caller that owns the
+ * schedule raises it here. Kept as its own verb rather than as a GDeflateRefuse
+ * call with a variable argument, because the configure-time lock reads the
+ * branch off the call site: a site passing a variable would have to be
+ * exempted from that read, and an exemption spelled the same way as the rule
+ * is how the rule stops being read. */
+CUDEC_HOST_DEVICE inline bool GDeflateRefuseAs(GDeflateSchedule& s,
+                                               GDeflateReject already_named) {
+    if (!s.failed) {
+        s.failed = true;
+        s.reject = already_named;
+    }
+    return false;
+}
+
+/* The same choke point for a ladder with no schedule to record into. `slot`
+ * is the caller's, and a null one is a caller that does not want the reason -
+ * the refusal still happens, which is what makes this safe to call from a
+ * table build that a test drives directly. */
+CUDEC_HOST_DEVICE inline bool GDeflateTableRefuse(GDeflateReject* slot,
+                                                  GDeflateReject branch) {
+    if (slot != nullptr) {
+        *slot = branch;
+    }
+    return false;
+}
 
 /* Little-endian, byte by byte, for the reason every other parser in this tree
  * reads its integers this way: the page is a byte buffer with no alignment
@@ -141,7 +266,7 @@ CUDEC_HOST_DEVICE inline void GDeflateEnsure(GDeflateSchedule& s,
          * cannot reach here, so this is a refusal and not a tail case: a
          * decoder that carried on with a short buffer would be reading the
          * lane's stale bits as if the stream had supplied them. */
-        s.failed = true;
+        GDeflateRefuse(s, kGDeflateRejectRefillPastEnd);
         return;
     }
     s.bitbuf[s.idx] |= static_cast<uint64_t>(GDeflateWordAt(page, s.cursor))
@@ -188,20 +313,19 @@ CUDEC_HOST_DEVICE inline bool GDeflateInit(GDeflateSchedule& s,
     s.idx = 0;
     s.cursor = 0;
     s.failed = false;
+    s.reject = kGDeflateRejectNone;
     s.word_count = page_bytes / 4u;
     /* Whole words only. A trailing partial word is not a word this schedule
      * could hand a lane, and rounding down would leave those bytes reachable
      * by nothing while the page still claimed them. */
     if (page_bytes % 4u != 0u) {
-        s.failed = true;
-        return false;
+        return GDeflateRefuse(s, kGDeflateRejectPagePartialWord);
     }
     if (s.word_count < kGDeflateNumStreams) {
         /* Draft section 5.3: the first round always loads 32 consecutive
          * words, so a stream below 128 bytes cannot be valid. Refused here
          * rather than discovered part-way through the priming round. */
-        s.failed = true;
-        return false;
+        return GDeflateRefuse(s, kGDeflateRejectPageBelowPrimingRound);
     }
     for (uint32_t n = 0; n < kGDeflateNumStreams; ++n) {
         GDeflateAdvance(s, page);
@@ -232,7 +356,7 @@ CUDEC_HOST_DEVICE inline void GDeflateRemove(GDeflateSchedule& s, uint32_t n) {
         return;
     }
     if (n > s.bitsleft[s.idx]) {
-        s.failed = true;
+        GDeflateRefuse(s, kGDeflateRejectRemovePastLane);
         return;
     }
     s.bitbuf[s.idx] >>= n;
@@ -246,8 +370,18 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflatePop(GDeflateSchedule& s, uint32_t n) {
     if (s.failed) {
         return 0;
     }
-    if (n > kGDeflateMaxPopBits || n > s.bitsleft[s.idx]) {
-        s.failed = true;
+    /* Two refusals rather than one condition, because they are different
+     * failures and the ladder is what says so: a width past the format's
+     * widest field is a caller asking for something no page encodes, while a
+     * lane that cannot serve a legal width is a page that ran out of bits
+     * where the schedule says it should not have. A single rung would let a
+     * negative for either satisfy the other. */
+    if (n > kGDeflateMaxPopBits) {
+        GDeflateRefuse(s, kGDeflateRejectPopWidthPastFormat);
+        return 0;
+    }
+    if (n > s.bitsleft[s.idx]) {
+        GDeflateRefuse(s, kGDeflateRejectPopPastLane);
         return 0;
     }
     const uint32_t value = GDeflatePeek(s, n);
