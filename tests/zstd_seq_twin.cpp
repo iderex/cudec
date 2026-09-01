@@ -121,7 +121,120 @@ struct SectionResult {
     cudec_detail::ZstdSeqReject rung = cudec_detail::kZstdSeqRejectNone;
     cudec_detail::ZstdSeqSectionHeader header;
     std::vector<cudec_detail::ZstdSequence> sequences;
+    /* Empty when the tiled loop agreed with the whole-block one at every tile
+     * size on this section; what diverged otherwise. */
+    std::string tiled_mismatch;
 };
+
+/* ------------------------------------------------------- the tiled form */
+
+/* The tile sizes the resumable loop is driven at. One is the pathological
+ * shape - every sequence its own call, so every boundary in the block is a
+ * call boundary - 128 is what `docs/MASTERPLAN.md` section 14.10 budgets
+ * shared memory for, and the sizes between are the ones where a tile ends
+ * part-way through a block rather than on it. */
+const uint32_t kSeqTileSizes[] = {1, 2, 3, 7, 128};
+
+/* What one tiled decode ended as. */
+struct TiledSequences {
+    cudec_status status = CUDEC_OK;
+    cudec_detail::ZstdSeqReject rung = cudec_detail::kZstdSeqRejectNone;
+    bool finished = false;
+    std::vector<cudec_detail::ZstdSequence> sequences;
+};
+
+/* Drives ZstdSeqBegin and ZstdSeqDecodeTile to the end of a block's
+ * sequences, in the shape a fused kernel runs them. */
+TiledSequences DecodeSequencesTiled(
+    const unsigned char* src, uint64_t size, uint32_t sequence_count,
+    const cudec_detail::ZstdSeqTable* litlen,
+    const cudec_detail::ZstdSeqTable* offset,
+    const cudec_detail::ZstdSeqTable* matchlen, uint32_t tile) {
+    TiledSequences out;
+    out.sequences.assign(sequence_count, cudec_detail::ZstdSequence{0, 0, 0});
+    cudec_detail::ZstdSeqCursor cursor;
+    out.status = cudec_detail::ZstdSeqBegin(src, size, sequence_count, litlen,
+                                            offset, matchlen, &cursor,
+                                            &out.rung);
+    if (out.status != CUDEC_OK) {
+        return out;
+    }
+    /* Bounded by the count rather than by the cursor's own answer: a tile that
+     * reported no progress would otherwise spin here, and a test that hangs
+     * says less than one that fails. */
+    uint32_t at = 0;
+    for (uint32_t call = 0; call <= sequence_count && at < sequence_count;
+         call++) {
+        const uint32_t want =
+            tile < sequence_count - at ? tile : sequence_count - at;
+        uint32_t got = 0;
+        out.status = cudec_detail::ZstdSeqDecodeTile(
+            &cursor, out.sequences.data() + at, want, want, &got, &out.rung);
+        if (out.status != CUDEC_OK) {
+            return out;
+        }
+        at += got;
+    }
+    out.finished = cursor.finished;
+    return out;
+}
+
+/* The tiled loop held to the whole-block one, at every tile size, on the same
+ * bytes. Returns an empty string when they agree; what it returns otherwise is
+ * what the row prints. */
+std::string TiledSequenceDivergence(
+    const unsigned char* src, uint64_t size, uint32_t sequence_count,
+    const cudec_detail::ZstdSeqTable* litlen,
+    const cudec_detail::ZstdSeqTable* offset,
+    const cudec_detail::ZstdSeqTable* matchlen, cudec_status whole_status,
+    cudec_detail::ZstdSeqReject whole_rung,
+    const std::vector<cudec_detail::ZstdSequence>& whole) {
+    char detail[256];
+    for (size_t t = 0; t < sizeof(kSeqTileSizes) / sizeof(kSeqTileSizes[0]);
+         t++) {
+        const uint32_t tile = kSeqTileSizes[t];
+        const TiledSequences tiled = DecodeSequencesTiled(
+            src, size, sequence_count, litlen, offset, matchlen, tile);
+        if (tiled.status != whole_status || tiled.rung != whole_rung) {
+            std::snprintf(detail, sizeof(detail),
+                          "tile %u: status %d rung %d, whole-block %d/%d",
+                          tile, static_cast<int>(tiled.status),
+                          static_cast<int>(tiled.rung),
+                          static_cast<int>(whole_status),
+                          static_cast<int>(whole_rung));
+            return detail;
+        }
+        if (whole_status != CUDEC_OK) {
+            continue;
+        }
+        /* A decode that produced every sequence and never held the stream to
+         * ending there has skipped the one check the tiled form moved. */
+        if (!tiled.finished) {
+            std::snprintf(detail, sizeof(detail),
+                          "tile %u: accepted without finishing", tile);
+            return detail;
+        }
+        for (size_t s = 0; s < whole.size(); s++) {
+            if (tiled.sequences[s].literals_length ==
+                    whole[s].literals_length &&
+                tiled.sequences[s].match_length == whole[s].match_length &&
+                tiled.sequences[s].offset_value == whole[s].offset_value) {
+                continue;
+            }
+            std::snprintf(
+                detail, sizeof(detail),
+                "tile %u: sequence %zu is %u/%u/%llu, whole-block %u/%u/%llu",
+                tile, s, tiled.sequences[s].literals_length,
+                tiled.sequences[s].match_length,
+                static_cast<unsigned long long>(
+                    tiled.sequences[s].offset_value),
+                whole[s].literals_length, whole[s].match_length,
+                static_cast<unsigned long long>(whole[s].offset_value));
+            return detail;
+        }
+    }
+    return std::string();
+}
 
 /* Header, three table descriptions, bitstream - the whole section, in the
  * order the format writes them. This is the caller the block loop will be, and
@@ -173,6 +286,14 @@ SectionResult DecodeSection(const unsigned char* section, size_t size,
         &tables->litlen, &tables->offset, &tables->matchlen,
         result.sequences.data(),
         static_cast<uint32_t>(result.sequences.size()), &result.rung);
+    /* Every section this caller decodes goes through both forms. A row that
+     * only ever ran the whole-block one would let the resumable loop rot
+     * behind it, which is the one way this extraction can go quiet with the
+     * suite still green. */
+    result.tiled_mismatch = TiledSequenceDivergence(
+        section + position, size - position, result.header.sequence_count,
+        &tables->litlen, &tables->offset, &tables->matchlen, result.status,
+        result.rung, result.sequences);
     return result;
 }
 
@@ -332,6 +453,8 @@ int main() {
         const SectionResult result = DecodeSection(
             section.data(), section.size(), kAcceptedContentSize, &tables);
         REQUIRE(result.status == CUDEC_OK);
+        REQUIRE_CTX(result.tiled_mismatch.empty(), "%s",
+                    result.tiled_mismatch.c_str());
         REQUIRE(result.header.sequence_count == 1);
         REQUIRE(result.header.litlen_mode == cudec_detail::kZstdSeqModeRle);
         REQUIRE(result.header.offset_mode == cudec_detail::kZstdSeqModeRle);
@@ -527,6 +650,18 @@ int main() {
         REQUIRE(decoded[1].literals_length == 4);
         REQUIRE(decoded[1].match_length == 36);
         REQUIRE(decoded[1].offset_value == 13);
+
+        /* The same bit string through the resumable loop. This is the row
+         * where a tile boundary lands between the two sequences, so a reader
+         * or a state that did not survive the call moves the second tuple and
+         * nothing else. */
+        const std::vector<cudec_detail::ZstdSequence> whole(decoded,
+                                                            decoded + 2);
+        const std::string mismatch = TiledSequenceDivergence(
+            stream.data(), stream.size(), 2, &tables.litlen, &tables.offset,
+            &tables.matchlen, CUDEC_OK, cudec_detail::kZstdSeqRejectNone,
+            whole);
+        REQUIRE_CTX(mismatch.empty(), "%s", mismatch.c_str());
     }
 
     /* ---- Step 5: the corpus sweep. Every compressed block of every fixture
@@ -653,6 +788,18 @@ int main() {
                                 "%s: sequence %zu", where, s);
                     REQUIRE_CTX(sequences[s].offset_value >= 1, "%s", where);
                 }
+
+                /* The same bitstream through the resumable loop, at every
+                 * tile size. These are real compressor output, so they are
+                 * where a tile boundary meets a state update the hand-built
+                 * sections above cannot reach. */
+                const std::string mismatch = TiledSequenceDivergence(
+                    fixture.compressed.data() + position,
+                    block.block_end - position, block.sequence_count,
+                    &tables.litlen, &tables.offset, &tables.matchlen,
+                    CUDEC_OK, cudec_detail::kZstdSeqRejectNone, sequences);
+                REQUIRE_CTX(mismatch.empty(), "%s: %s", where,
+                            mismatch.c_str());
             }
         }
         /* A sweep that found nothing passes every assertion above, which is
@@ -736,6 +883,8 @@ int main() {
                         "%s: refused through rung %d, want %d", negative.name,
                         static_cast<int>(result.rung),
                         static_cast<int>(negative.rung));
+            REQUIRE_CTX(result.tiled_mismatch.empty(), "%s: %s",
+                        negative.name, result.tiled_mismatch.c_str());
             CoverRung(result.rung);
             if (!negative.frame_is_real) {
                 continue;
@@ -903,6 +1052,90 @@ int main() {
             REQUIRE(rung == cudec_detail::kZstdSeqRejectStateOutOfTable);
             CoverRung(rung);
         }
+    }
+
+    /* ---- Step 7: the resumable loop's own refusals. Every one of these is a
+     * caller bug rather than a stream, and every one of them is what a kernel
+     * driving the loop by hand can get wrong: the whole-block form cannot
+     * reach any of them, because it makes exactly one call with the block's
+     * own count. */
+    {
+        SeqTables tables;
+        for (unsigned cell = 0; cell < 4; cell++) {
+            tables.litlen_cells[cell] = {0, 0, 0};
+            tables.offset_cells[cell] = {0, 0, 0};
+            tables.matchlen_cells[cell] = {0, 0, 0};
+        }
+        tables.litlen_cells[0] = {1, 0, 1};
+        tables.litlen_cells[2] = {0, 4, 0};
+        tables.offset_cells[1] = {0, 2, 2};
+        tables.offset_cells[2] = {0, 3, 0};
+        tables.matchlen_cells[2] = {0, 0, 3};
+        tables.matchlen_cells[3] = {0, 32, 0};
+        tables.litlen.table_size = 4;
+        tables.litlen.accuracy_log = 2;
+        tables.litlen.present = true;
+        tables.offset.table_size = 4;
+        tables.offset.accuracy_log = 2;
+        tables.offset.present = true;
+        tables.matchlen.table_size = 4;
+        tables.matchlen.accuracy_log = 2;
+        tables.matchlen.present = true;
+        const Bytes stream{0xEB, 0x6E, 0x04};
+
+        /* A count of zero has no first sequence to start on, so there is no
+         * cursor to hand back rather than one that yields nothing. */
+        {
+            cudec_detail::ZstdSeqCursor cursor;
+            cudec_detail::ZstdSeqReject rung = cudec_detail::kZstdSeqRejectNone;
+            REQUIRE(cudec_detail::ZstdSeqBegin(
+                        stream.data(), stream.size(), 0, &tables.litlen,
+                        &tables.offset, &tables.matchlen, &cursor,
+                        &rung) != CUDEC_OK);
+            REQUIRE(rung == cudec_detail::kZstdSeqRejectBadRequest);
+            CoverRung(rung);
+        }
+
+        cudec_detail::ZstdSeqCursor cursor;
+        cudec_detail::ZstdSeqReject rung = cudec_detail::kZstdSeqRejectNone;
+        REQUIRE(cudec_detail::ZstdSeqBegin(stream.data(), stream.size(), 2,
+                                           &tables.litlen, &tables.offset,
+                                           &tables.matchlen, &cursor,
+                                           &rung) == CUDEC_OK);
+        cudec_detail::ZstdSequence decoded[2];
+        uint32_t got = 0;
+
+        /* A tile of nothing. Refused rather than answered with zero: a caller
+         * looping until the cursor finishes would never leave the loop. */
+        REQUIRE(cudec_detail::ZstdSeqDecodeTile(&cursor, decoded, 2, 0, &got,
+                                                &rung) != CUDEC_OK);
+        REQUIRE(rung == cudec_detail::kZstdSeqRejectBadRequest);
+        CoverRung(rung);
+
+        /* Room for one sequence and a tile of two. The write would land one
+         * past the caller's array, which is the mistake a tile size that does
+         * not divide the block invites. */
+        REQUIRE(cudec_detail::ZstdSeqDecodeTile(&cursor, decoded, 1, 2, &got,
+                                                &rung) != CUDEC_OK);
+        REQUIRE(rung == cudec_detail::kZstdSeqRejectBadRequest);
+        CoverRung(rung);
+
+        /* Neither refusal moved the cursor: the two sequences are still
+         * there to decode, so a refused tile costs the block nothing. */
+        REQUIRE(cudec_detail::ZstdSeqDecodeTile(&cursor, decoded, 2, 2, &got,
+                                                &rung) == CUDEC_OK);
+        REQUIRE(got == 2);
+        REQUIRE(cursor.finished);
+        REQUIRE(decoded[0].literals_length == 0);
+        REQUIRE(decoded[1].literals_length == 4);
+
+        /* One more call on a spent cursor. The stream has already been held
+         * to ending where it does, and reading past that is what the end
+         * check exists to refuse. */
+        REQUIRE(cudec_detail::ZstdSeqDecodeTile(&cursor, decoded, 2, 1, &got,
+                                                &rung) != CUDEC_OK);
+        REQUIRE(rung == cudec_detail::kZstdSeqRejectBadRequest);
+        CoverRung(rung);
     }
 
     for (int declared = cudec_detail::kZstdSeqRejectNone + 1;

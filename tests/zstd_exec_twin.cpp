@@ -86,6 +86,9 @@ struct Outcome {
     uint64_t literals_used = 0;
     uint64_t produced = 0;
     std::vector<uint64_t> destinations;
+    /* Empty when the tiled halves agreed with this row at every tile size;
+     * what diverged otherwise. Filled on every row, positive and negative. */
+    std::string tiled_mismatch;
 };
 
 /* The window a row means when it does not care about the window bound. Larger
@@ -93,10 +96,11 @@ struct Outcome {
  * rung. */
 constexpr uint64_t kWideWindow = 1ull << 20;
 
-Outcome Execute(const std::vector<ZstdSequence>& sequences,
-                const std::vector<uint64_t>& offsets, const Bytes& literals,
-                uint64_t block_maximum, uint64_t window_size, Bytes* dst,
-                uint64_t produced) {
+/* The whole-block halves, in the shape every caller in the tree uses. */
+Outcome ExecuteWhole(const std::vector<ZstdSequence>& sequences,
+                     const std::vector<uint64_t>& offsets,
+                     const Bytes& literals, uint64_t block_maximum,
+                     uint64_t window_size, Bytes* dst, uint64_t produced) {
     Outcome out;
     out.produced = produced;
     out.destinations.assign(sequences.size() + 1, 0);
@@ -120,6 +124,201 @@ Outcome Execute(const std::vector<ZstdSequence>& sequences,
         offsets.empty() ? 0 : offsets.data(),
         literals.empty() ? 0 : literals.data(), literals.size(), &plan,
         window_size, dst->data(), dst->size(), &out.produced, &out.rung);
+    return out;
+}
+
+/* ------------------------------------------------------- the tiled form */
+
+/* The tile sizes the resumable form is driven at. One is the pathological
+ * shape - every call carrying a single sequence, so every boundary in the
+ * block is a call boundary - 128 is what `docs/MASTERPLAN.md` section 14.10
+ * budgets shared memory for, and the sizes between are the ones where a tile
+ * ends part-way through a block rather than on it. */
+const uint32_t kTileSizes[] = {1, 2, 3, 7, 128};
+
+/* One block put through the tiled halves, in the shape a fused kernel runs
+ * them: the sum a tile at a time carrying its two running quantities, then one
+ * call per sequence taking the literal cursor that sum produced.
+ *
+ * THE TWO BLOCK-LEVEL STEPS ARE SPELLED HERE RATHER THAN CALLED, and that is
+ * what makes this a model instead of a second caller. `ZstdExecuteBlock`'s
+ * destination bound and its tail equation belong to the whole-block form; a
+ * kernel has its own place to put them, and writing them out here is what lets
+ * a divergence between the two spellings show up as a failure rather than as
+ * two functions agreeing because they are one function. */
+struct TiledOutcome {
+    cudec_status status = CUDEC_OK;
+    ZstdExecReject rung = kZstdExecRejectNone;
+    uint64_t produced = 0;
+    ZstdExecPlan plan = {0, 0};
+    std::vector<uint64_t> destinations;
+};
+
+TiledOutcome ExecuteTiled(const std::vector<ZstdSequence>& sequences,
+                          const std::vector<uint64_t>& offsets,
+                          const Bytes& literals, uint64_t block_maximum,
+                          uint64_t window_size, Bytes* dst, uint64_t produced,
+                          uint32_t tile) {
+    TiledOutcome out;
+    out.produced = produced;
+    const uint32_t count = static_cast<uint32_t>(sequences.size());
+    out.destinations.assign(count + 1, 0);
+    std::vector<uint64_t> cursors(static_cast<size_t>(count) + 1, 0);
+
+    cudec_detail::ZstdExecCarry carry;
+    carry.at = 0;
+    carry.literals_used = 0;
+    uint32_t at = 0;
+    while (at < count) {
+        const uint32_t want = tile < count - at ? tile : count - at;
+        out.status = cudec_detail::ZstdExecPrefixSumTile(
+            sequences.data() + at, want, literals.size(), block_maximum,
+            &carry, out.destinations.data() + at, cursors.data() + at, want,
+            &out.rung);
+        if (out.status != CUDEC_OK) {
+            return out;
+        }
+        at += want;
+    }
+    out.status = cudec_detail::ZstdExecPrefixSumFinish(
+        &carry, literals.size(), block_maximum, &out.destinations[count],
+        &out.plan, &out.rung);
+    if (out.status != CUDEC_OK) {
+        return out;
+    }
+
+    const uint64_t base = produced;
+    if (base > dst->size() || out.plan.block_size > dst->size() - base) {
+        out.status = CUDEC_ERR_OUTPUT_TOO_SMALL;
+        out.rung = kZstdExecRejectDestinationTooSmall;
+        return out;
+    }
+    for (uint32_t index = 0; index < count; index++) {
+        out.status = cudec_detail::ZstdExecuteSequence(
+            &sequences[index], out.destinations[index],
+            out.destinations[index + 1], offsets[index],
+            literals.empty() ? 0 : literals.data(), literals.size(),
+            cursors[index], out.plan.block_size, window_size, dst->data(),
+            base, &out.rung);
+        if (out.status != CUDEC_OK) {
+            return out;
+        }
+    }
+
+    const uint64_t tail_at = out.destinations[count];
+    if (tail_at > out.plan.block_size ||
+        literals.size() - out.plan.literals_used !=
+            out.plan.block_size - tail_at) {
+        out.status = CUDEC_ERR_CORRUPT_INPUT;
+        out.rung = kZstdExecRejectPlanInconsistent;
+        return out;
+    }
+    for (uint64_t i = out.plan.literals_used; i < literals.size(); i++) {
+        (*dst)[static_cast<size_t>(base + tail_at + i -
+                                   out.plan.literals_used)] = literals[i];
+    }
+    out.produced = base + out.plan.block_size;
+    return out;
+}
+
+/* The tiled halves held to the whole-block ones, at every tile size, on the
+ * same bytes. Returns an empty string when they agree; what it returns
+ * otherwise is what the row prints. */
+std::string TiledDivergence(const std::vector<ZstdSequence>& sequences,
+                            const std::vector<uint64_t>& offsets,
+                            const Bytes& literals, uint64_t block_maximum,
+                            uint64_t window_size, const Bytes& dst_before,
+                            const Bytes& dst_after, uint64_t produced,
+                            const Outcome& whole) {
+    char detail[256];
+    for (size_t t = 0; t < sizeof(kTileSizes) / sizeof(kTileSizes[0]); t++) {
+        const uint32_t tile = kTileSizes[t];
+        Bytes dst = dst_before;
+        const TiledOutcome tiled =
+            ExecuteTiled(sequences, offsets, literals, block_maximum,
+                         window_size, &dst, produced, tile);
+        if (tiled.status != whole.status || tiled.rung != whole.rung) {
+            std::snprintf(detail, sizeof(detail),
+                          "tile %u: status %d rung %d, whole-block %d/%d",
+                          tile, static_cast<int>(tiled.status),
+                          static_cast<int>(tiled.rung),
+                          static_cast<int>(whole.status),
+                          static_cast<int>(whole.rung));
+            return detail;
+        }
+        if (tiled.produced != whole.produced) {
+            std::snprintf(detail, sizeof(detail),
+                          "tile %u: produced %llu, whole-block %llu", tile,
+                          static_cast<unsigned long long>(tiled.produced),
+                          static_cast<unsigned long long>(whole.produced));
+            return detail;
+        }
+        /* The destinations are compared on every row, refused ones included:
+         * a tile that wrote an entry the whole-block sum did not, or stopped
+         * one short of it, is a boundary bug that the bytes of a legal block
+         * can still survive. */
+        for (size_t s = 0; s < whole.destinations.size(); s++) {
+            if (tiled.destinations[s] == whole.destinations[s]) {
+                continue;
+            }
+            std::snprintf(detail, sizeof(detail),
+                          "tile %u: destination %zu is %llu, whole-block %llu",
+                          tile, s,
+                          static_cast<unsigned long long>(tiled.destinations[s]),
+                          static_cast<unsigned long long>(
+                              whole.destinations[s]));
+            return detail;
+        }
+        if (whole.status == CUDEC_OK &&
+            (tiled.plan.block_size != whole.block_size ||
+             tiled.plan.literals_used != whole.literals_used)) {
+            std::snprintf(detail, sizeof(detail),
+                          "tile %u: plan %llu/%llu, whole-block %llu/%llu",
+                          tile,
+                          static_cast<unsigned long long>(
+                              tiled.plan.block_size),
+                          static_cast<unsigned long long>(
+                              tiled.plan.literals_used),
+                          static_cast<unsigned long long>(whole.block_size),
+                          static_cast<unsigned long long>(
+                              whole.literals_used));
+            return detail;
+        }
+        /* Byte for byte, on the refused rows too. A refusal partway through a
+         * block leaves whatever the sequences before it wrote, and the two
+         * forms have to leave the same bytes as well as the same status. */
+        if (dst.size() != dst_after.size()) {
+            std::snprintf(detail, sizeof(detail), "tile %u: buffer resized",
+                          tile);
+            return detail;
+        }
+        for (size_t i = 0; i < dst.size(); i++) {
+            if (dst[i] == dst_after[i]) {
+                continue;
+            }
+            std::snprintf(detail, sizeof(detail),
+                          "tile %u: byte %zu is %02x, whole-block %02x", tile,
+                          i, dst[i], dst_after[i]);
+            return detail;
+        }
+    }
+    return std::string();
+}
+
+/* Every row goes through both, on the same bytes, and carries what the two
+ * disagreed about. A row that only ever ran the whole-block form would let the
+ * tiled halves rot behind it, which is the one way this extraction can go
+ * quiet with the suite still green. */
+Outcome Execute(const std::vector<ZstdSequence>& sequences,
+                const std::vector<uint64_t>& offsets, const Bytes& literals,
+                uint64_t block_maximum, uint64_t window_size, Bytes* dst,
+                uint64_t produced) {
+    const Bytes before = *dst;
+    Outcome out = ExecuteWhole(sequences, offsets, literals, block_maximum,
+                               window_size, dst, produced);
+    out.tiled_mismatch =
+        TiledDivergence(sequences, offsets, literals, block_maximum,
+                        window_size, before, *dst, produced, out);
     return out;
 }
 
@@ -214,6 +413,8 @@ int Accepts(const char* name, const std::vector<ZstdSequence>& sequences,
      * before it on every block after. */
     REQUIRE_CTX(equal_bytes(dst.data(), prefix.data(), prefix.size()),
                 "%s: the earlier output moved", name);
+    REQUIRE_CTX(out.tiled_mismatch.empty(), "%s: %s", name,
+                out.tiled_mismatch.c_str());
     g_rows++;
     g_sequences += sequences.size();
     g_bytes += expected.size();
@@ -238,6 +439,8 @@ int Refuses(const char* name, const std::vector<ZstdSequence>& sequences,
      * present bytes it has no reason to believe. */
     REQUIRE_CTX(out.produced == produced, "%s: produced moved to %llu", name,
                 static_cast<unsigned long long>(out.produced));
+    REQUIRE_CTX(out.tiled_mismatch.empty(), "%s: %s", name,
+                out.tiled_mismatch.c_str());
     CoverRung(out.rung);
     g_rows++;
     return 0;
@@ -565,6 +768,77 @@ int Negatives() {
         CoverRung(rung);
         g_rows++;
     }
+
+    /* The tiled halves' own refusals. Every one is a caller bug rather than a
+     * stream, and none is reachable through the whole-block forms, which start
+     * their carry at zero and make one call: what they refuse is a kernel that
+     * continued from a running total it did not compute. */
+    {
+        const std::vector<ZstdSequence> sequences = {Seq(1, 1)};
+        const Bytes literals = Ascii("ab");
+        uint64_t destinations[2] = {0, 0};
+        cudec_detail::ZstdExecCarry carry;
+        ZstdExecReject rung = kZstdExecRejectNone;
+
+        /* A carry past the ceiling the sum is bounded by. Believing it would
+         * put every comparison below behind a number this call did not
+         * compute. */
+        carry.at = cudec_detail::kZstdBlockSizeCeiling + 1;
+        carry.literals_used = 0;
+        REQUIRE(cudec_detail::ZstdExecPrefixSumTile(
+                    sequences.data(), 1, literals.size(),
+                    cudec_detail::kZstdBlockSizeCeiling, &carry, destinations,
+                    0, 1, &rung) == CUDEC_ERR_INVALID_ARGUMENT);
+        REQUIRE(rung == kZstdExecRejectBadRequest);
+        CoverRung(rung);
+
+        /* A carry claiming more literal bytes than the section produced. The
+         * subtraction the tile makes against what is left would wrap. */
+        carry.at = 0;
+        carry.literals_used = literals.size() + 1;
+        REQUIRE(cudec_detail::ZstdExecPrefixSumTile(
+                    sequences.data(), 1, literals.size(),
+                    cudec_detail::kZstdBlockSizeCeiling, &carry, destinations,
+                    0, 1, &rung) == CUDEC_ERR_INVALID_ARGUMENT);
+        REQUIRE(rung == kZstdExecRejectBadRequest);
+        CoverRung(rung);
+
+        /* Room for fewer destinations than the tile carries sequences. */
+        carry.at = 0;
+        carry.literals_used = 0;
+        REQUIRE(cudec_detail::ZstdExecPrefixSumTile(
+                    sequences.data(), 1, literals.size(),
+                    cudec_detail::kZstdBlockSizeCeiling, &carry, destinations,
+                    0, 0, &rung) == CUDEC_ERR_INVALID_ARGUMENT);
+        REQUIRE(rung == kZstdExecRejectBadRequest);
+        CoverRung(rung);
+
+        /* The same bound on the close, which reads the carry a second time
+         * and is reached by whoever ran the last tile rather than the
+         * first. */
+        ZstdExecPlan plan;
+        uint64_t last = 0;
+        carry.at = 0;
+        carry.literals_used = literals.size() + 1;
+        REQUIRE(cudec_detail::ZstdExecPrefixSumFinish(
+                    &carry, literals.size(),
+                    cudec_detail::kZstdBlockSizeCeiling, &last, &plan,
+                    &rung) == CUDEC_ERR_INVALID_ARGUMENT);
+        REQUIRE(rung == kZstdExecRejectBadRequest);
+        CoverRung(rung);
+
+        /* A literal cursor past the literals it indexes. A lane gets its own
+         * from the tile record rather than from a loop, so this is the
+         * mistake a fan-out makes and a serial walk cannot. */
+        Bytes dst(64, 0);
+        REQUIRE(cudec_detail::ZstdExecuteSequence(
+                    &sequences[0], 0, 2, 1, literals.data(), literals.size(),
+                    literals.size() + 1, 2, kWideWindow, dst.data(), 0,
+                    &rung) == CUDEC_ERR_INVALID_ARGUMENT);
+        REQUIRE(rung == kZstdExecRejectBadRequest);
+        CoverRung(rung);
+        g_rows++;
+    }
     return 0;
 }
 
@@ -653,6 +927,8 @@ int Sweep() {
                     expected.size());
         REQUIRE_CTX(equal_bytes(dst.data(), expected.data(), expected.size()),
                     "run %d: bytes", run);
+        REQUIRE_CTX(out.tiled_mismatch.empty(), "run %d: %s", run,
+                    out.tiled_mismatch.c_str());
 
         /* The destinations the unit produced, checked against the model's own
          * cursor. A scan that is wrong in a way the bytes happen to survive -
