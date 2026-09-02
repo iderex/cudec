@@ -572,17 +572,18 @@ std::vector<unsigned char> MakeAssetlikeSource(size_t pages) {
     return out;
 }
 
-/* THE WORST-ROUNDS CORPUS (issue #226), and what it locks.
+/* THE WORST-CASE CORPORA (issues #226 and #430), and what they lock.
  *
- * WHY IT IS NOT COMPRESSED BY THE REFERENCE. Every other corpus in this file
- * is what the pinned compressor chose to emit; a compressor picks the code
- * that costs the FEWEST bits, which is the opposite of what this row is for.
- * The security-posture question is what a page an attacker fully controls can
- * force out of a decoder, so the page is emitted here and the reference is
- * kept as the authority on whether it is valid at all.
+ * WHY THEY ARE NOT COMPRESSED BY THE REFERENCE. Every other corpus in this
+ * file is what the pinned compressor chose to emit; a compressor picks the
+ * code that costs the FEWEST bits, which is the opposite of what these rows
+ * are for. The security-posture question is what a page an attacker fully
+ * controls can force out of a decoder, so the page is emitted here and the
+ * reference is kept as the authority on whether it is valid at all.
  *
  * WHAT THE SHAPE IS, against the four ingredients MASTERPLAN section 13.5
- * names. Three of them are here and the fourth is not:
+ * names. One generator builds all four, and the two rows it reports are the
+ * two ends of the last of them:
  *
  *  - CODE LENGTHS LONG ENOUGH THAT THE ROOT ACCELERATOR MISSES. Every symbol
  *    this page emits - literal, length and distance alike - sits at DEFLATE's
@@ -600,10 +601,15 @@ std::vector<unsigned char> MakeAssetlikeSource(size_t pages) {
  *    the deferred-copy machinery is exercised rather than skipped. Length
  *    symbol 285 is DEFLATE64's base 3 with SIXTEEN extra bits, which is the
  *    most expensive way the format has of asking for three bytes.
- *  - FREQUENT BLOCK HEADERS is the one that is NOT here. The page writer this
- *    generator rides on emits one final block per page; extending it to
- *    several is unbuilt, and this corpus claims nothing about that ingredient.
- *    Issue #430 holds it.
+ *  - FREQUENT BLOCK HEADERS, which is what separates the two rows.
+ *    `--worstrounds` (#226) puts one final dynamic block on a page and claims
+ *    nothing about this ingredient; `--worstheaders` (#430) cuts the same page
+ *    into one dynamic block per group of 32 matches - a header every 96
+ *    decoded bytes, which is the most this construction admits, since a block
+ *    carries whole groups. A header is bits that produce no output at all and
+ *    it rides lane 0 while the other 31 lanes do nothing, so the many-block
+ *    page is strictly the harder one: measured, 0.7026 refills per decoded
+ *    byte against 0.6152, on pages that decode to the same bytes.
  *
  * THE QUANTITY IS REFILLS PER DECODED BYTE, AND IT IS NOT THE ONE THE PLAN
  * FIRST NAMED. Section 13.5 fixed rounds per decoded byte. That quantity does
@@ -740,8 +746,9 @@ uint32_t WorstGroups() {
  * printed. */
 constexpr size_t kWorstRoundsPages = 512;
 
-/* The floor the corpus is required to clear, in refills per decoded byte, and
- * what sits under it.
+/* The floor the SINGLE-BLOCK corpus is required to clear, in refills per
+ * decoded byte, and what sits under it. The many-block row carries its own,
+ * beside its own digests, at kWorstHeadersRefillFloor below.
  *
  * A refill hands a lane 32 bits, so a page spending b bits per decoded byte
  * sits at b/32; a stored block spends 8 and lands at 0.250. This corpus
@@ -857,8 +864,31 @@ bool WorstDistSymFor(uint64_t out_pos, uint32_t* sym) {
     return false;
 }
 
-/* One page: an opening literal run, then `kWorstGroups` groups of 32 minimum
- * matches, then end-of-block.
+/* How many dynamic blocks the header row cuts a page into, DERIVED from the
+ * page's own shape rather than chosen: a block has to carry whole groups, or
+ * a lane would hold a reservation across a block boundary that the drain
+ * cannot retire, so one group is the smallest a block can be and the group
+ * count is therefore the most block headers a page of this construction can
+ * hold. The frequency is the maximum for the same reason the codewords are the
+ * maximum - this is the adversarial extreme of the ingredient, not a sample
+ * of it. */
+uint32_t WorstHeaderBlocks() { return WorstGroups(); }
+
+/* One page: an opening literal run, then `WorstGroups()` groups of 32 minimum
+ * matches, then end-of-block - cut into `blocks` dynamic blocks, each carrying
+ * whole groups and stating its own end.
+ *
+ * `blocks` IS THE ONE INGREDIENT THAT VARIES, and the two rows this file
+ * reports are the two ends of it: 1 is #226's single final block per page, and
+ * WorstHeaderBlocks() is #430's page of many. Everything else - the code
+ * vectors, the literal run, the group construction, the distance choice - is
+ * shared, because two generators would be two things to keep adversarial and
+ * only one of them would be read when the other drifted.
+ *
+ * A BLOCK BOUNDARY COSTS OUTPUT NOTHING AND COSTS BITS A HEADER, which is why
+ * cutting the page changes the density without changing the bytes: the source
+ * a page decodes to does not depend on `blocks` at all, and the two rows
+ * therefore differ in exactly the ingredient they are being compared on.
  *
  * THE GROUP SHAPE IS THE DECODER'S AND NOT A CHOICE. A body token at position
  * p rides lane p mod 32, and the distance a reserved match needs is read on
@@ -869,9 +899,9 @@ bool WorstDistSymFor(uint64_t out_pos, uint32_t* sym) {
  *
  * `page_index` seeds the literal run, so the pages of a corpus differ from one
  * another in their bytes as well as in their index. */
-bool BuildWorstRoundsPage(size_t page_index,
-                          std::vector<unsigned char>* original,
-                          std::vector<unsigned char>* page) {
+bool BuildWorstPage(size_t page_index, uint32_t blocks,
+                    std::vector<unsigned char>* original,
+                    std::vector<unsigned char>* page) {
     const std::vector<unsigned char> litlen_lens = WorstLitLenLengths();
     const std::vector<unsigned char> dist_lens = WorstDistLengths();
 
@@ -889,62 +919,108 @@ bool BuildWorstRoundsPage(size_t page_index,
 
     const uint32_t lead = WorstLeadBytes();
     const uint32_t groups = WorstGroups();
-    std::vector<cudec_test::BodyToken> body;
-    body.reserve(lead + 2u * groups * kWorstGroupMatches + 1u);
+    if (blocks == 0 || blocks > groups) {
+        std::fprintf(stderr,
+                     "a worst-case page of %u groups cannot be cut into %u "
+                     "blocks: a block carries whole groups, so one group is "
+                     "the smallest a block can be\n",
+                     groups, blocks);
+        return false;
+    }
     original->assign(kPageBytes, 0);
+
+    /* Every block states the same header. The vectors and the token stream are
+     * built once above and copied into each, so a page of many blocks pays the
+     * header's bits many times over - which is the cost this row exists to
+     * measure - without this generator holding two descriptions of one code. */
+    cudec_test::PageBlock proto;
+    proto.litlen_lens = litlen_lens;
+    proto.dist_lens = dist_lens;
+    proto.toks = toks;
+    std::memcpy(proto.precode_lens, precode_lens, sizeof(proto.precode_lens));
+    proto.num_explicit = num_explicit;
+
+    std::vector<cudec_test::PageBlock> page_blocks;
+    page_blocks.reserve(blocks);
 
     /* The opening run. A fixed LCG seeded by the page index, so every page of
      * a corpus is different bytes and every corpus is reproducible. */
     uint64_t state = 0x9E3779B97F4A7C15ull + page_index;
     uint64_t out_pos = 0;
-    for (uint32_t n = 0; n < lead; n++) {
-        state = state * 6364136223846793005ull + 1442695040888963407ull;
-        const uint32_t sym =
-            kWorstFirstDeepLiteral +
-            static_cast<uint32_t>((state >> 33) % kWorstDeepLiterals);
-        body.push_back(cudec_test::BodyToken{sym, false, 0, 0});
-        (*original)[out_pos] = static_cast<unsigned char>(sym);
-        out_pos++;
+    uint32_t groups_placed = 0;
+    for (uint32_t b = 0; b < blocks; b++) {
+        cudec_test::PageBlock blk = proto;
+        /* The groups spread as evenly as they divide, remainder to the front.
+         * Every block therefore holds at least one, which is what the bound
+         * above refused a `blocks` too large for. */
+        const uint32_t take =
+            groups / blocks + (b < groups % blocks ? 1u : 0u);
+        if (b == 0) {
+            blk.body.reserve(lead + 2u * take * kWorstGroupMatches + 1u);
+            for (uint32_t n = 0; n < lead; n++) {
+                state = state * 6364136223846793005ull +
+                        1442695040888963407ull;
+                const uint32_t sym =
+                    kWorstFirstDeepLiteral +
+                    static_cast<uint32_t>((state >> 33) % kWorstDeepLiterals);
+                blk.body.push_back(cudec_test::BodyToken{sym, false, 0, 0});
+                (*original)[out_pos] = static_cast<unsigned char>(sym);
+                out_pos++;
+            }
+        } else {
+            blk.body.reserve(2u * take * kWorstGroupMatches + 1u);
+        }
+
+        for (uint32_t g = 0; g < take; g++) {
+            uint64_t reserved[kWorstGroupMatches];
+            uint32_t dist_sym[kWorstGroupMatches];
+            for (uint32_t m = 0; m < kWorstGroupMatches; m++) {
+                if (!WorstDistSymFor(out_pos, &dist_sym[m])) {
+                    std::fprintf(stderr,
+                                 "no deep distance symbol reaches back over "
+                                 "%llu bytes of output\n",
+                                 static_cast<unsigned long long>(out_pos));
+                    return false;
+                }
+                reserved[m] = out_pos;
+                out_pos += kWorstMatchLen;
+                blk.body.push_back(cudec_test::BodyToken{
+                    kWorstLengthSym, false,
+                    cudec_detail::GDeflateLengthExtra(kWorstLengthIndex), 0});
+            }
+            for (uint32_t m = 0; m < kWorstGroupMatches; m++) {
+                const uint32_t s = dist_sym[m];
+                const uint64_t offset = cudec_detail::GDeflateDistBase(s);
+                /* Mirrors GDeflateDoCopy exactly, in the same order the
+                 * decoder retires the group, so the expected bytes are what a
+                 * decode produces rather than what this generator meant. */
+                for (uint32_t i = 0; i < kWorstMatchLen; i++) {
+                    (*original)[reserved[m] + i] =
+                        (*original)[reserved[m] - offset + i];
+                }
+                blk.body.push_back(cudec_test::BodyToken{
+                    s, true, cudec_detail::GDeflateDistExtra(s), 0});
+            }
+        }
+        groups_placed += take;
+        /* Every block states its own end. A group is 32 reservations followed
+         * by the 32 retirements that pay for them, so no lane holds a
+         * reservation across this boundary and the drain that follows it
+         * consumes nothing - which is what makes a block boundary placeable
+         * here at all. */
+        blk.body.push_back(
+            cudec_test::BodyToken{cudec_test::kEndOfBlock, false, 0, 0});
+        if (!WorstCodeIsMaximal(blk.body, litlen_lens, dist_lens)) {
+            return false;
+        }
+        page_blocks.push_back(std::move(blk));
     }
 
-    for (uint32_t g = 0; g < groups; g++) {
-        uint64_t reserved[kWorstGroupMatches];
-        uint32_t dist_sym[kWorstGroupMatches];
-        for (uint32_t m = 0; m < kWorstGroupMatches; m++) {
-            if (!WorstDistSymFor(out_pos, &dist_sym[m])) {
-                std::fprintf(stderr,
-                             "no deep distance symbol reaches back over %llu "
-                             "bytes of output\n",
-                             static_cast<unsigned long long>(out_pos));
-                return false;
-            }
-            reserved[m] = out_pos;
-            out_pos += kWorstMatchLen;
-            body.push_back(cudec_test::BodyToken{
-                kWorstLengthSym, false,
-                cudec_detail::GDeflateLengthExtra(kWorstLengthIndex), 0});
-        }
-        for (uint32_t m = 0; m < kWorstGroupMatches; m++) {
-            const uint32_t s = dist_sym[m];
-            const uint64_t offset = cudec_detail::GDeflateDistBase(s);
-            /* Mirrors GDeflateDoCopy exactly, in the same order the decoder
-             * retires the group, so the expected bytes are what a decode
-             * produces rather than what this generator meant. */
-            for (uint32_t i = 0; i < kWorstMatchLen; i++) {
-                (*original)[reserved[m] + i] =
-                    (*original)[reserved[m] - offset + i];
-            }
-            body.push_back(cudec_test::BodyToken{
-                s, true, cudec_detail::GDeflateDistExtra(s), 0});
-        }
-    }
-    body.push_back(
-        cudec_test::BodyToken{cudec_test::kEndOfBlock, false, 0, 0});
-
-    if (out_pos != kPageBytes) {
+    if (groups_placed != groups || out_pos != kPageBytes) {
         std::fprintf(stderr,
-                     "the worst-rounds page produces %llu bytes and the page "
-                     "is %zu\n",
+                     "the worst-case page places %u of %u groups and produces "
+                     "%llu bytes, and the page is %zu\n",
+                     groups_placed, groups,
                      static_cast<unsigned long long>(out_pos), kPageBytes);
         return false;
     }
@@ -957,11 +1033,7 @@ bool BuildWorstRoundsPage(size_t page_index,
                      "\n");
         return false;
     }
-    if (!WorstCodeIsMaximal(body, litlen_lens, dist_lens)) {
-        return false;
-    }
-    if (!cudec_test::EmitPageTokens(litlen_lens, dist_lens, toks, precode_lens,
-                                    num_explicit, body, page)) {
+    if (!cudec_test::EmitPageBlocks(page_blocks, page)) {
         std::fprintf(stderr, "the page writer refused page %zu\n", page_index);
         return false;
     }
@@ -978,12 +1050,12 @@ bool BuildWorstRoundsPage(size_t page_index,
 /* The whole corpus, plus the source it is required to decode back to. The
  * source is assembled here rather than handed in, because these pages are not
  * a cut of anything - the bytes exist because the page says them. */
-bool BuildWorstRoundsCorpus(size_t pages, std::vector<unsigned char>* source,
-                            Corpus* corpus) {
+bool BuildWorstCorpus(size_t pages, uint32_t blocks,
+                      std::vector<unsigned char>* source, Corpus* corpus) {
     for (size_t i = 0; i < pages; i++) {
         std::vector<unsigned char> original;
         std::vector<unsigned char> page;
-        if (!BuildWorstRoundsPage(i, &original, &page)) {
+        if (!BuildWorstPage(i, blocks, &original, &page)) {
             return false;
         }
         source->insert(source->end(), original.begin(), original.end());
@@ -1009,6 +1081,18 @@ struct RefillDensity {
      * that clears a floor can hold a page set where most pages are trivial. */
     double worst_page = 0.0;
     uint64_t copies = 0;
+    /* How many blocks the pages turned out to hold, and how many of those were
+     * dynamic. READ OUT OF THE DECODE (GDeflatePageState::blocks and its
+     * per-type census) rather than out of the construction, because a block
+     * boundary inside a page is not findable by scanning and only a decode
+     * that walked to a block can count it (issue #206). The extremes rather
+     * than a mean: a corpus whose pages disagree about their block count is
+     * the thing a mean would hide, and the headers row below refuses on
+     * exactly that. */
+    uint32_t min_blocks = 0;
+    uint32_t max_blocks = 0;
+    uint64_t blocks = 0;
+    uint64_t dynamic_blocks = 0;
 };
 
 double PerDecodedByte(const RefillDensity& d) {
@@ -1078,6 +1162,15 @@ bool MeasureRefillDensity(const std::vector<unsigned char>& source,
         if (i == 0 || page_density < density->worst_page) {
             density->worst_page = page_density;
         }
+        if (i == 0 || st.blocks < density->min_blocks) {
+            density->min_blocks = st.blocks;
+        }
+        if (i == 0 || st.blocks > density->max_blocks) {
+            density->max_blocks = st.blocks;
+        }
+        density->blocks += st.blocks;
+        density->dynamic_blocks +=
+            st.type_blocks[cudec_detail::kGDeflateBlockDynamic];
         /* EVERY EMITTED WORD IS CONSUMED, and this is where that stops
          * being a sentence. The page carries the writer's declared zero tail
          * past the words it handed out; the cursor says how far a mirror of
@@ -1124,18 +1217,42 @@ bool MeasureRefillDensity(const std::vector<unsigned char>& source,
  * the easiest page this generator can build: with one page of the 512 built
  * all-literal, the run prints a mean of 0.6149 - above the floor - beside a
  * worst page of 0.4697. */
-bool CheckRefillFloor(const RefillDensity& density) {
-    if (density.worst_page >= kWorstRefillFloor) {
+bool CheckRefillFloor(const char* name, const RefillDensity& density,
+                      double floor) {
+    if (density.worst_page >= floor) {
         return true;
     }
     std::fprintf(stderr,
-                 "the worst page of the worst-rounds corpus forces %.4f "
+                 "the worst page of the %s corpus forces %.4f "
                  "refills per decoded byte, under the %.4f floor this corpus "
                  "exists to hold (the corpus mean is %.4f): it is still a "
                  "valid page set and it is no longer the adversarial one the "
                  "report names\n",
-                 density.worst_page, kWorstRefillFloor,
-                 PerDecodedByte(density));
+                 name, density.worst_page, floor, PerDecodedByte(density));
+    return false;
+}
+
+/* THE BLOCK-COUNT CLAIM, AS A REFUSAL, and it is the headers row's equivalent
+ * of WorstCodeIsMaximal above. That row's whole reason to exist is that its
+ * pages carry many dynamic block headers, and the refill floor cannot carry
+ * that sentence on its own: a header is a few hundred bits against a page of
+ * half a million, so a generator that collapsed back to one block per page
+ * loses a tenth of the density rather than most of it, and a floor low enough
+ * to be robust would not notice. This reads the count out of the decode's own
+ * census and requires EVERY page to hold exactly what the construction says,
+ * so a corpus that stopped emitting the ingredient is named by what it stopped
+ * being rather than by a number that drifted. */
+bool CheckBlocksPerPage(const char* name, const RefillDensity& density,
+                        uint32_t want) {
+    if (density.min_blocks == want && density.max_blocks == want) {
+        return true;
+    }
+    std::fprintf(stderr,
+                 "the %s corpus holds between %u and %u blocks per page and "
+                 "its construction emits %u; the frequent-block-header "
+                 "ingredient this row is named for is not in the pages it "
+                 "built\n",
+                 name, density.min_blocks, density.max_blocks, want);
     return false;
 }
 
@@ -1147,7 +1264,7 @@ bool CheckRefillFloor(const RefillDensity& density) {
  * not exist. */
 void PrintReport(const Corpus& corpus, int level,
                  const std::vector<double>& sorted, size_t warmup, size_t runs,
-                 const RefillDensity* density) {
+                 const RefillDensity* density, double floor) {
     std::vector<size_t> sizes;
     sizes.reserve(corpus.originals.size());
     for (const auto& original : corpus.originals) {
@@ -1217,7 +1334,18 @@ void PrintReport(const Corpus& corpus, int level,
                     PerDecodedByte(*density),
                     static_cast<unsigned long long>(density->refills),
                     static_cast<unsigned long long>(density->out_bytes),
-                    density->worst_page, kWorstRefillFloor);
+                    density->worst_page, floor);
+        /* Read out of the decode and not out of the generator, for the reason
+         * --blockmix exists: a block boundary inside a page is not findable by
+         * scanning, so a walk that stopped at the opening header could report
+         * one block per page and be believed. */
+        std::printf("- blocks per page: min %u / max %u, %llu blocks over the "
+                    "corpus of which %llu dynamic, counted by cudec's own page "
+                    "decode (src/gdeflate_block.h) rather than by the "
+                    "construction that emitted them\n",
+                    density->min_blocks, density->max_blocks,
+                    static_cast<unsigned long long>(density->blocks),
+                    static_cast<unsigned long long>(density->dynamic_blocks));
         std::printf("- deferred copies: %llu, one per %u decoded bytes past "
                     "the opening literal run - the length round reserves and "
                     "the distance round on the same lane retires. ARITHMETIC "
@@ -1306,7 +1434,8 @@ bool RunLevel(const std::vector<unsigned char>& source, const std::string& name,
     if (!TimeCorpus(corpus, warmup, runs, &times)) {
         return false;
     }
-    PrintReport(corpus, level, times, warmup, runs, /*density=*/nullptr);
+    PrintReport(corpus, level, times, warmup, runs, /*density=*/nullptr,
+                /*floor=*/0.0);
     return true;
 }
 
@@ -1436,7 +1565,8 @@ bool ParseCount(const char* text, size_t lo, size_t hi, size_t* out) {
 void Usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s [--warmup N] [--runs N] [--assetlike] "
-                 "[--blocktypes] [--blockmix] [--worstrounds] [--selfcheck] "
+                 "[--blocktypes] [--blockmix] [--worstrounds] "
+                 "[--worstheaders] [--selfcheck] "
                  "[corpus files...]\n",
                  argv0);
 }
@@ -1694,21 +1824,43 @@ int RunBlockmix(const std::vector<unsigned char>& source,
     return ok ? 0 : 1;
 }
 
-/* The digests of the two worst-rounds corpora, the four-page one the ctest
- * entry builds and the full one the reported row is taken on. They are
+/* The digests of the four worst-case corpora - each row's four-page selfcheck
+ * corpus and the full one its reported row is taken on. They are
  * constants for the reason the level sweep's digests are: this page set is
  * emitted from fixed constants by code in this tree, so a change to the
  * generator, to either length vector or to the page writer's round order moves
  * one of them, and none of those would stop the pages round-tripping.
  *
- * BOTH ARE CHECKED ON EVERY RUN, and that is a departure from the sibling
+ * EACH IS CHECKED ON EVERY RUN, and that is a departure from the sibling
  * paths, which check a digest only under --selfcheck. It is deliberate: the
  * full corpus is the one a reported number is taken on, and a reporting path
  * whose corpus nothing pins is a number attesting a page set nobody fixed. */
 constexpr uint64_t kWorstRoundsSelfcheckDigest = 0x925326a21c48a952ull;
 constexpr uint64_t kWorstRoundsFullDigest = 0x6e2f2850f76891bbull;
+constexpr uint64_t kWorstHeadersSelfcheckDigest = 0xdda9f7867d7bd574ull;
+constexpr uint64_t kWorstHeadersFullDigest = 0xc79e0a872dba2ca3ull;
 
-/* The worst-rounds path. Four gates, all of them before anything is timed and
+/* The floor the many-block row is required to clear, and why it is its own
+ * number rather than the single-block row's.
+ *
+ * A BLOCK HEADER IS BITS THAT PRODUCE NO OUTPUT AT ALL, so cutting a page into
+ * many blocks raises refills per decoded byte without moving the bytes the
+ * page decodes to. That makes the two rows comparable in exactly one
+ * ingredient, and it makes the single-block row's measurement the thing this
+ * floor has to sit above: 0.6152 is what the same generator reaches with
+ * `blocks` set to 1, measured rather than argued, and a floor under it would
+ * be cleared by a generator that had lost its headers entirely. This floor is
+ * therefore set between that reading and the one the many-block shape reaches,
+ * so the weakening the row is most likely to suffer is refused by the number
+ * as well as by CheckBlocksPerPage above. */
+constexpr double kWorstHeadersRefillFloor = 0.66;
+static_assert(kWorstHeadersRefillFloor > kWorstRefillFloor,
+              "a many-block page spends strictly more bits per decoded byte "
+              "than the single-block page of the same construction, so a "
+              "headers floor at or under the rounds floor would refuse "
+              "nothing the rounds row does not already refuse");
+
+/* The worst-case rows. Five gates, all of them before anything is timed and
  * before anything is printed:
  *
  *  - the reference accepts every page and it round-trips to the source. It is
@@ -1719,31 +1871,34 @@ constexpr uint64_t kWorstRoundsFullDigest = 0x6e2f2850f76891bbull;
  *    drifted into a read of zeros;
  *  - cudec's own decode reproduces the source, fills a whole page, consumes
  *    exactly the emitted words, and yields the refill count;
+ *  - every page holds exactly the blocks the construction says, counted out of
+ *    that same decode. It runs BEFORE the floor because it names the
+ *    ingredient a drifted corpus stopped carrying, where the floor names a
+ *    number that moved;
  *  - the refill density clears its floor, on the worst page and not the mean;
  *  - the digest matches the pin for the corpus size that was built.
  *
  * A corpus that drifted is therefore named by what it stopped being before it
- * is named by a number that moved, and a corpus that failed any of the four
+ * is named by a number that moved, and a corpus that failed any of the five
  * prints no report at all - a throughput row beside a refused gate is the one
- * thing this path may not emit. */
-int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck) {
+ * thing this path may not emit.
+ *
+ * ONE FUNCTION FOR BOTH ROWS. They differ in the block count, the floor, the
+ * digests and the sentence they print about themselves, and in nothing else;
+ * a second copy of the five gates would be the place one of them silently
+ * stopped running. */
+int RunWorstShape(const char* name, const std::string& provenance,
+                  uint32_t blocks, double floor, uint64_t selfcheck_digest,
+                  uint64_t full_digest, size_t warmup, size_t runs,
+                  bool selfcheck) {
     const size_t pages = selfcheck ? kSelfcheckPages : kWorstRoundsPages;
     Corpus corpus;
-    corpus.name = "worst-rounds";
-    corpus.provenance =
-        "HAND-CONSTRUCTED by this harness and validated by the pinned "
-        "gdeflate fork, not produced by any compressor: one final dynamic "
-        "block per page, every symbol in it at DEFLATE's maximum codeword "
-        "length, and a body of minimum-length matches asked for through the "
-        "sixteen-extra-bit length symbol, so the deferred-copy path runs once "
-        "per three decoded bytes; ADVERSARIAL, the M4 security-posture row "
-        "and never a headline throughput figure, and NOT scale-comparable "
-        "with this harness's other corpora, which are recorded on their own "
-        "invocations and are several times this one in pages";
+    corpus.name = name;
+    corpus.provenance = provenance;
     corpus.composition = kCompositionNotAsserted;
 
     std::vector<unsigned char> source;
-    if (!BuildWorstRoundsCorpus(pages, &source, &corpus)) {
+    if (!BuildWorstCorpus(pages, blocks, &source, &corpus)) {
         return 1;
     }
     if (!CorpusRoundTrips(source, corpus)) {
@@ -1753,27 +1908,71 @@ int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck) {
     if (!MeasureRefillDensity(source, corpus, &density)) {
         return 1;
     }
-    if (!CheckRefillFloor(density)) {
+    if (!CheckBlocksPerPage(name, density, blocks)) {
         return 1;
     }
-    /* Every page opens with the dynamic block this generator emits, and it is
-     * the whole page: the writer puts BFINAL on the one block it writes. That
-     * is asserted rather than narrated, so a generator that started emitting
-     * something else is caught here and not in the prose. */
+    if (!CheckRefillFloor(name, density, floor)) {
+        return 1;
+    }
+    /* Every page opens with the dynamic block this generator emits. That is
+     * asserted rather than narrated, so a generator that started emitting
+     * something else is caught here and not in the prose. What the walk can
+     * say beyond the opening is decided by BFINAL and printed by
+     * AssertComposition itself: on the single-block row the opening block IS
+     * the page, and on the many-block row the walk reports a lower bound while
+     * the census above carries the count.  */
     if (!AssertComposition(&corpus, kBlockDynamic)) {
         return 1;
     }
     if (!CheckDigest(CorpusDigest(corpus), corpus.name, /*level=*/-1,
-                     selfcheck ? kWorstRoundsSelfcheckDigest
-                               : kWorstRoundsFullDigest)) {
+                     selfcheck ? selfcheck_digest : full_digest)) {
         return 1;
     }
     std::vector<double> times;
     if (!TimeCorpus(corpus, warmup, runs, &times)) {
         return 1;
     }
-    PrintReport(corpus, /*level=*/-1, times, warmup, runs, &density);
+    PrintReport(corpus, /*level=*/-1, times, warmup, runs, &density, floor);
     return 0;
+}
+
+/* The three ingredients of MASTERPLAN section 13.5 that do not need a block
+ * boundary, in a page that is one final dynamic block (issue #226). */
+int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck) {
+    return RunWorstShape(
+        "worst-rounds",
+        "HAND-CONSTRUCTED by this harness and validated by the pinned "
+        "gdeflate fork, not produced by any compressor: one final dynamic "
+        "block per page, every symbol in it at DEFLATE's maximum codeword "
+        "length, and a body of minimum-length matches asked for through the "
+        "sixteen-extra-bit length symbol, so the deferred-copy path runs once "
+        "per three decoded bytes; ADVERSARIAL, the M4 security-posture row "
+        "and never a headline throughput figure, and NOT scale-comparable "
+        "with this harness's other corpora, which are recorded on their own "
+        "invocations and are several times this one in pages",
+        /*blocks=*/1, kWorstRefillFloor, kWorstRoundsSelfcheckDigest,
+        kWorstRoundsFullDigest, warmup, runs, selfcheck);
+}
+
+/* The same page with the fourth ingredient added (issue #430): the same
+ * output, the same symbols and the same matches, cut into as many dynamic
+ * blocks as whole groups of matches allow, so every group pays a block header
+ * and the one-active-lane header rounds are a real share of the total. */
+int RunWorstHeaders(size_t warmup, size_t runs, bool selfcheck) {
+    return RunWorstShape(
+        "worst-headers",
+        "HAND-CONSTRUCTED by this harness and validated by the pinned "
+        "gdeflate fork, not produced by any compressor: the worst-rounds page "
+        "cut into one dynamic block per group of 32 minimum-length matches, "
+        "so it carries that row's maximum-length codewords and its "
+        "deferred-copy-per-three-bytes body AND a dynamic block header every "
+        "96 decoded bytes; ADVERSARIAL, the M4 security-posture row and never "
+        "a headline throughput figure, and NOT scale-comparable with this "
+        "harness's other corpora, which are recorded on their own invocations "
+        "and are several times this one in pages",
+        WorstHeaderBlocks(), kWorstHeadersRefillFloor,
+        kWorstHeadersSelfcheckDigest, kWorstHeadersFullDigest, warmup, runs,
+        selfcheck);
 }
 
 }  // namespace
@@ -1786,6 +1985,7 @@ int main(int argc, char** argv) {
     bool blocktypes = false;
     bool blockmix = false;
     bool worstrounds = false;
+    bool worstheaders = false;
     std::vector<std::string> files;
 
     for (int i = 1; i < argc; i++) {
@@ -1798,6 +1998,8 @@ int main(int argc, char** argv) {
             blockmix = true;
         } else if (arg == "--worstrounds") {
             worstrounds = true;
+        } else if (arg == "--worstheaders") {
+            worstheaders = true;
         } else if (arg == "--selfcheck") {
             selfcheck = true;
         } else if (arg == "--runs" && i + 1 < argc) {
@@ -1832,11 +2034,26 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if (worstrounds && (assetlike || blocktypes || blockmix || !files.empty())) {
+    if ((worstrounds || worstheaders) &&
+        (assetlike || blocktypes || blockmix || !files.empty())) {
         std::fprintf(stderr,
-                     "--worstrounds emits its own corpus and no compressor "
-                     "runs on that path; do not pass corpus files or any of "
-                     "the compressor-driven modes with it\n");
+                     "--worstrounds and --worstheaders emit their own corpora "
+                     "and no compressor runs on those paths; do not pass "
+                     "corpus files or any of the compressor-driven modes with "
+                     "them\n");
+        return 2;
+    }
+
+    /* Two shapes of one construction, differing in the ingredient each is
+     * named for, so a run that asked for both would print two rows and leave
+     * the reader to work out which quantity each locked. They are asked for
+     * one at a time. */
+    if (worstrounds && worstheaders) {
+        std::fprintf(stderr,
+                     "--worstrounds and --worstheaders are the same generator "
+                     "at one block per page and at one block per group of "
+                     "matches; each locks its own refill floor and its own "
+                     "digests, so they are run separately\n");
         return 2;
     }
 
@@ -1862,6 +2079,10 @@ int main(int argc, char** argv) {
 
     if (worstrounds) {
         return RunWorstRounds(warmup, runs, selfcheck);
+    }
+
+    if (worstheaders) {
+        return RunWorstHeaders(warmup, runs, selfcheck);
     }
 
     std::vector<unsigned char> source;

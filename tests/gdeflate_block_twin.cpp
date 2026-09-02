@@ -950,6 +950,231 @@ int RunTruncatedPage() {
 
 }  // namespace
 
+/* TWO DYNAMIC BLOCKS IN ONE HAND-EMITTED PAGE (issue #430), which is the first
+ * page in this tree whose block boundary was WRITTEN rather than read.
+ *
+ * WHY IT IS NOT COVERED BY WHAT IS ABOVE. RunCorpus decodes multi-block pages
+ * and CheckBlockBoundaries attributes their first block, but every one of those
+ * pages came out of the reference's compressor: where a block ends is the
+ * compressor's decision and both decoders merely follow it. Nothing had ever
+ * PRODUCED a boundary, so the inter-block round order - the reset a block opens
+ * with, the drain it closes with - was a property of this tree's decoder alone,
+ * with no second reader. The page below is emitted by
+ * tests/gdeflate_page_writer.h and handed to both, so a writer that put the
+ * second block's header one round early or late is refused by the reference
+ * rather than agreed with by cudec.
+ *
+ * WHAT IT ASSERTS BEYOND THE BYTES. The second block opens with a match that
+ * reaches back over the FIRST block's output, so a decoder that restarted its
+ * output cursor at a block boundary would refuse it (a match before the page's
+ * own output) rather than quietly produce a shorter page; and the block count
+ * is read off cudec's own census, so a page that collapsed into one block
+ * fails here rather than passing on identical bytes. */
+int RunTwoBlockPage() {
+    /* A complete code over the 258 symbols these bodies need - the literals,
+     * end-of-block, and the shortest length symbol - beside a two-symbol
+     * distance code whose symbol 0 is distance 1, the nearest match there is
+     * and the one that lands inside the first block's output. */
+    const std::vector<unsigned char> litlen_lens =
+        cudec_test::CompleteLengths(258);
+    const std::vector<unsigned char> dist_lens = cudec_test::CompleteLengths(2);
+
+    std::vector<unsigned char> all(litlen_lens);
+    all.insert(all.end(), dist_lens.begin(), dist_lens.end());
+    const std::vector<cudec_test::LenToken> toks = cudec_test::BuildTokens(all);
+    unsigned char precode_lens[cudec_detail::kGDeflateNumPrecodeSyms];
+    uint32_t num_explicit = 0;
+    REQUIRE(cudec_test::PlanPrecode(toks, /*forced_explicit=*/0, precode_lens,
+                                    &num_explicit));
+
+    cudec_test::PageBlock proto;
+    proto.litlen_lens = litlen_lens;
+    proto.dist_lens = dist_lens;
+    proto.toks = toks;
+    std::memcpy(proto.precode_lens, precode_lens, sizeof(precode_lens));
+    proto.num_explicit = num_explicit;
+
+    /* The first block: a run of literals short enough to sit inside one round
+     * of the 32 lanes plus a few, so the block ends mid-round and the drain
+     * that follows it is the thing the second block has to start after. */
+    const uint32_t kFirstLiterals = 40;
+    std::vector<unsigned char> want;
+    cudec_test::PageBlock first = proto;
+    for (uint32_t i = 0; i < kFirstLiterals; i++) {
+        const uint32_t sym = 'a' + (i % 26u);
+        first.body.push_back(cudec_test::BodyToken{sym, false, 0, 0});
+        want.push_back(static_cast<unsigned char>(sym));
+    }
+    first.body.push_back(
+        cudec_test::BodyToken{cudec_test::kEndOfBlock, false, 0, 0});
+
+    /* The second block: lane 0 reserves the shortest match the format has,
+     * 31 literals ride the other lanes, and lane 0's next round retires the
+     * reservation. The match's source is the byte before it, which the FIRST
+     * block wrote. */
+    cudec_test::PageBlock second = proto;
+    second.body.push_back(cudec_test::BodyToken{
+        cudec_detail::kGDeflateFirstLengthSym, false, 0, 0});
+    const uint64_t reserved = want.size();
+    want.resize(want.size() + cudec_detail::kGDeflateMinMatchLen, 0);
+    for (uint32_t i = 1; i < cudec_detail::kGDeflateNumStreams; i++) {
+        const uint32_t sym = 'A' + (i % 26u);
+        second.body.push_back(cudec_test::BodyToken{sym, false, 0, 0});
+        want.push_back(static_cast<unsigned char>(sym));
+    }
+    second.body.push_back(cudec_test::BodyToken{0u, true, 0, 0});
+    second.body.push_back(
+        cudec_test::BodyToken{cudec_test::kEndOfBlock, false, 0, 0});
+    /* The copy, mirrored byte by byte forwards exactly as GDeflateDoCopy runs
+     * it, and placed here rather than where the reservation was made: the
+     * bytes land in the hole the reservation left, after the literals that
+     * followed it were already written. */
+    for (uint32_t i = 0; i < cudec_detail::kGDeflateMinMatchLen; i++) {
+        want[reserved + i] = want[reserved + i - 1];
+    }
+
+    std::vector<cudec_test::PageBlock> blocks;
+    blocks.push_back(first);
+    blocks.push_back(second);
+    std::vector<unsigned char> page;
+    REQUIRE(cudec_test::EmitPageBlocks(blocks, &page));
+
+    libdeflate_result status = LIBDEFLATE_BAD_DATA;
+    size_t produced = 0;
+    REQUIRE(OracleVerdictPadded(page, want.size(), &status, &produced));
+    REQUIRE_CTX(status == LIBDEFLATE_SUCCESS, "oracle status %d",
+                static_cast<int>(status));
+    REQUIRE_CTX(produced == want.size(), "oracle produced %zu of %zu", produced,
+                want.size());
+
+    std::vector<unsigned char> out(want.size(), 0);
+    GDeflatePageState st;
+    uint64_t got = 0;
+    REQUIRE(GDeflateDecodePage(st, page.data(), page.size(), out.data(),
+                               out.size(), &got));
+    REQUIRE_CTX(got == want.size(), "cudec produced %llu of %zu",
+                static_cast<unsigned long long>(got), want.size());
+    REQUIRE(equal_bytes(out.data(), want.data(), want.size()));
+    /* The page really is two blocks rather than one that happened to produce
+     * the same bytes, read off the decode's own census. */
+    REQUIRE_CTX(st.blocks == 2u, "cudec walked %u blocks", st.blocks);
+    REQUIRE(st.type_blocks[cudec_detail::kGDeflateBlockDynamic] == 2u);
+    return 0;
+}
+
+/* THE THREE WAYS A CALLER CAN ASK FOR A PAGE THE TWO DECODERS WOULD READ
+ * DIFFERENTLY, and the proof that the writer refuses each of them.
+ *
+ * WHY THEY ARE REFUSALS IN THE WRITER RATHER THAN NEGATIVES AGAINST A DECODER.
+ * Every one of them produces a page that is still WELL FORMED as a word
+ * sequence: the words handed out and the words asked for still match, so the
+ * reference reads bits that are there and gets a different, valid-looking
+ * page. The failure would therefore surface as a fixture that decodes to
+ * unexpected bytes somewhere else entirely, or - worse for a corpus - not at
+ * all. Each is paired with RunTwoBlockPage above, which differs from all three
+ * in exactly the field being broken and must decode.
+ *
+ * DELETING ANY OF THE THREE REFUSALS TURNS THE MATCHING CASE HERE GREEN-TO-RED
+ * IN THE OTHER DIRECTION: the REQUIRE below is that the writer said no. */
+int RunWriterRefusesDriftedBodies() {
+    const std::vector<unsigned char> litlen_lens =
+        cudec_test::CompleteLengths(258);
+    const std::vector<unsigned char> dist_lens = cudec_test::CompleteLengths(2);
+    std::vector<unsigned char> all(litlen_lens);
+    all.insert(all.end(), dist_lens.begin(), dist_lens.end());
+    const std::vector<cudec_test::LenToken> toks = cudec_test::BuildTokens(all);
+    unsigned char precode_lens[cudec_detail::kGDeflateNumPrecodeSyms];
+    uint32_t num_explicit = 0;
+    REQUIRE(cudec_test::PlanPrecode(toks, /*forced_explicit=*/0, precode_lens,
+                                    &num_explicit));
+
+    cudec_test::PageBlock proto;
+    proto.litlen_lens = litlen_lens;
+    proto.dist_lens = dist_lens;
+    proto.toks = toks;
+    std::memcpy(proto.precode_lens, precode_lens, sizeof(precode_lens));
+    proto.num_explicit = num_explicit;
+
+    const cudec_test::BodyToken kEob{cudec_test::kEndOfBlock, false, 0, 0};
+    const cudec_test::BodyToken kLiteral{'x', false, 0, 0};
+    const cudec_test::BodyToken kLength{cudec_detail::kGDeflateFirstLengthSym,
+                                        false, 0, 0};
+    const cudec_test::BodyToken kDistance{0u, true, 0, 0};
+
+    std::vector<unsigned char> page;
+
+    /* A block with a successor that never states its end. The decoder would
+     * read on past the tokens this block declared, and where the next block's
+     * header begins would be decided by the bits rather than by the sequence
+     * the caller handed over. */
+    {
+        cudec_test::PageBlock unterminated = proto;
+        unterminated.body.push_back(kLiteral);
+        cudec_test::PageBlock last = proto;
+        last.body.push_back(kLiteral);
+        last.body.push_back(kEob);
+        std::vector<cudec_test::PageBlock> blocks;
+        blocks.push_back(unterminated);
+        blocks.push_back(last);
+        REQUIRE(!cudec_test::EmitPageBlocks(blocks, &page));
+    }
+
+    /* A block that ends while a lane still holds a reservation. The 32 drain
+     * rounds emit no bits, so the decoder would take whatever follows - the
+     * next block's header, or the page's zero tail - as that lane's distance
+     * symbol. The end-of-block rides lane 1, which holds nothing, so it is the
+     * end of the block that is wrong rather than the round it sits on. */
+    {
+        cudec_test::PageBlock stranded = proto;
+        stranded.body.push_back(kLength);
+        stranded.body.push_back(kEob);
+        REQUIRE(!cudec_test::EmitPageBlocks(
+            std::vector<cudec_test::PageBlock>(1, stranded), &page));
+    }
+
+    /* A distance symbol on a lane that reserved nothing. The decoder reads a
+     * distance only on a lane holding a copy, so it would read this one as a
+     * literal or a length out of the OTHER code entirely. */
+    {
+        cudec_test::PageBlock misspaced = proto;
+        misspaced.body.push_back(kDistance);
+        misspaced.body.push_back(kEob);
+        REQUIRE(!cudec_test::EmitPageBlocks(
+            std::vector<cudec_test::PageBlock>(1, misspaced), &page));
+    }
+
+    /* The pair for all three: the same three bodies made correct, in one page
+     * that must be emitted and must decode. A writer refusing everything would
+     * pass the three cases above and fail here. */
+    {
+        cudec_test::PageBlock ok_first = proto;
+        ok_first.body.push_back(kLiteral);
+        ok_first.body.push_back(kEob);
+        cudec_test::PageBlock ok_second = proto;
+        ok_second.body.push_back(kLength);
+        for (uint32_t i = 1; i < cudec_detail::kGDeflateNumStreams; i++) {
+            ok_second.body.push_back(kLiteral);
+        }
+        ok_second.body.push_back(kDistance);
+        ok_second.body.push_back(kEob);
+        std::vector<cudec_test::PageBlock> blocks;
+        blocks.push_back(ok_first);
+        blocks.push_back(ok_second);
+        REQUIRE(cudec_test::EmitPageBlocks(blocks, &page));
+
+        const size_t kCapacity =
+            1u + cudec_detail::kGDeflateMinMatchLen +
+            (cudec_detail::kGDeflateNumStreams - 1u);
+        libdeflate_result status = LIBDEFLATE_BAD_DATA;
+        size_t produced = 0;
+        REQUIRE(OracleVerdictPadded(page, kCapacity, &status, &produced));
+        REQUIRE_CTX(status == LIBDEFLATE_SUCCESS, "oracle status %d",
+                    static_cast<int>(status));
+        REQUIRE(produced == kCapacity);
+    }
+    return 0;
+}
+
 int main() {
     if (RunCorpus() != 0) {
         return 1;
@@ -979,6 +1204,12 @@ int main() {
         return 1;
     }
     if (RunEndOfBlockFromTheTail() != 0) {
+        return 1;
+    }
+    if (RunTwoBlockPage() != 0) {
+        return 1;
+    }
+    if (RunWriterRefusesDriftedBodies() != 0) {
         return 1;
     }
     std::printf("gdeflate_block_twin: ok\n");

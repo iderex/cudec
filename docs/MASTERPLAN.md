@@ -1954,10 +1954,33 @@ lane once per three decoded bytes: 21728 of them per page by the corpus's own
 construction, which is arithmetic rather than a count any decoder here
 reports.
 
-The frequent-block-header ingredient is NOT in it: the page writer it rides
-on emits one final block per page, and emitting a second means writing the
-inter-block round order, which no fixture in this tree has ever emitted.
-#430 holds that, and this paragraph is removed when it lands.
+**The fourth ingredient is a second row rather than a change to that one, and
+it is `bench_gdeflate --worstheaders` (#430).** The page writer now emits
+several blocks into one page - the inter-block round order mirrored off the
+block loop in `src/gdeflate_block.h`, the reset a block opens with and the
+drain it closes with - and the same generator cuts the page above into one
+dynamic block per group of 32 matches, which is a block header every 96
+decoded bytes and the most this construction admits, since a block carries
+whole groups or a lane would hold a reservation the drain cannot retire. The
+page decodes to the same bytes as the single-block one, so the two rows differ
+in exactly the ingredient they are compared on:
+
+    bench_gdeflate --worstheaders --selfcheck
+    - refill density: 0.7026 refills per decoded byte over 184176 refills and
+      262144 decoded bytes, worst page 0.7026, floor 0.6600 ...
+    - blocks per page: min 679 / max 679, 2716 blocks over the corpus of which
+      2716 dynamic, counted by cudec's own page decode
+
+Two rows with two floors rather than one row with a moved floor, because they
+lock different quantities: 0.6152 is what this construction reaches with no
+block boundary in it, so a headers floor under that reading would be cleared by
+a corpus that had lost its headers entirely, and the single-block row's own
+floor would be meaningless above it. The 0.66 between them was watched refusing
+that weakening. **A floor cannot carry the block-count claim either**, for the
+same reason it cannot carry the codeword-depth one: a header is a few hundred
+bits against a page of half a million. What refuses a collapsed corpus outright
+is a check that reads the block count out of the decode's own census and
+requires every page to hold exactly what the construction says.
 
 What would falsify this design, recorded before it is built:
 
