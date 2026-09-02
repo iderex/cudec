@@ -39,10 +39,13 @@
  * WHAT THE COMPOSITION LOCK CANNOT SEE, said before anyone reads it as more.
  * It reads the FIRST block of each page and stops. A GDeflate block boundary
  * is not findable by scanning - dossier 11.3 D5, and the schedule header says
- * the same - so reaching a page's second block means decoding to it, and
- * there is no decoder in the tree yet (#176, #182). So a family asserting
- * `static` proves every page OPENS with a static block, and says nothing
- * about what follows in that page.
+ * the same - so reaching a page's second block means decoding to it, and this
+ * walk decodes nothing. So a family asserting `static` proves every page OPENS
+ * with a static block, and says nothing about what follows in that page. THAT
+ * SENTENCE USED TO GIVE THE ABSENCE OF A DECODER AS THE REASON, naming #176
+ * and #182; both landed, `--blockmix` censuses whole pages through
+ * src/gdeflate_block.h, and the bound above is a property of THIS walk rather
+ * than of the tree.
  *
  * Ratio is printed beside throughput on every row. For a DEFLATE-class format
  * the ratio is half the pitch, and a throughput-only table would misreport
@@ -114,6 +117,12 @@ struct Corpus {
     std::vector<std::vector<unsigned char>> compressed;
     size_t original_bytes = 0;
     size_t compressed_bytes = 0;
+    /* Bytes inside `compressed` that no decoder reads: the zero tail a
+     * hand-emitted page carries for the reference's unchecked refill. Held
+     * apart from compressed_bytes because a ratio that silently counted
+     * padding would attest a stream that is not there. Zero for every corpus
+     * the compressor produced. */
+    size_t padding_bytes = 0;
     /* Printed verbatim in the methodology block, so it must stay true for
      * whichever corpus ran. */
     std::string provenance;
@@ -572,111 +581,216 @@ std::vector<unsigned char> MakeAssetlikeSource(size_t pages) {
  * force out of a decoder, so the page is emitted here and the reference is
  * kept as the authority on whether it is valid at all.
  *
+ * WHAT THE SHAPE IS, against the four ingredients MASTERPLAN section 13.5
+ * names. Three of them are here and the fourth is not:
+ *
+ *  - CODE LENGTHS LONG ENOUGH THAT THE ROOT ACCELERATOR MISSES. Every symbol
+ *    this page emits - literal, length and distance alike - sits at DEFLATE's
+ *    maximum codeword length. The spine symbols that make the code complete
+ *    are never emitted.
+ *  - EVERY LANE CONSUMING NEAR ITS WATERMARK ON EVERY ROUND. A lane spending
+ *    a maximum codeword plus a maximum extra-bit field per round refills on
+ *    most rounds; the measured rate is printed with the row.
+ *  - COPIES SPLIT ACROSS TWO ROUNDS ON THE SAME LANE. The body is minimum
+ *    matches: the length round reserves and the distance round on the same
+ *    lane retires, so `GDeflateDoCopy` runs once per three decoded bytes and
+ *    the deferred-copy machinery is exercised rather than skipped. Length
+ *    symbol 285 is DEFLATE64's base 3 with SIXTEEN extra bits, which is the
+ *    most expensive way the format has of asking for three bytes.
+ *  - FREQUENT BLOCK HEADERS is the one that is NOT here. The page writer this
+ *    generator rides on emits one final block per page; extending it to
+ *    several is unbuilt, and this corpus claims nothing about that ingredient.
+ *    Issue #430 holds it.
+ *
  * THE QUANTITY IS REFILLS PER DECODED BYTE, AND IT IS NOT THE ONE THE PLAN
- * FIRST NAMED. MASTERPLAN section 13.5 fixed rounds per decoded byte; a round
- * is 32 lanes consuming one symbol each, so an all-literal dynamic block and a
- * stored block both sit at 1/32 and a floor on that quantity cannot fail. A
- * refill is one 32-bit word handed to one lane, so it counts BITS consumed
- * rather than symbols, and it is the thing this shape moves. 13.5 was amended
- * with that reason in the same change as this generator.
+ * FIRST NAMED. Section 13.5 fixed rounds per decoded byte. That quantity does
+ * not separate an easy page from this one in the direction a floor can use: an
+ * all-literal dynamic block and a stored block both sit at exactly 1/32, so a
+ * floor between them is impossible, and a match-carrying page sits BELOW 1/32
+ * (two rounds per three bytes at the minimum length), so 1/32 is the maximum
+ * of that quantity rather than a value nothing falls under. A refill is one
+ * 32-bit word handed to one lane, so it counts the bits a page spends, and it
+ * ranks all three cases the way the cost does. 13.5 carries the same reasoning
+ * and was amended in the change that built this.
  *
- * THE RATIO PROXY IS REFUSED HERE RATHER THAN UNUSED, because the issue's own
- * scope line offers it. The M4 denominator table on #224 measured level 0 -
- * the highest ratio the format can produce - as the FASTEST family on both
- * corpora, so a ratio floor selects for the easiest pages and would leave CI
- * green over a corpus the report still called the worst case. The floor below
- * is read out of a decode instead.
- *
- * WHAT THE SHAPE IS. Every literal is coded at DEFLATE's maximum codeword
- * length, so each decoded byte costs 15 bits where a stored block costs 8.
- * That is 13.5's "code lengths long enough
- * that the root accelerator misses and the canonical walk runs" and its
- * "every lane consumes near its watermark on every round" in one construction:
- * a lane holding 32 bits and spending 15 of them per round falls below the
- * watermark on alternate rounds, which is the highest sustained refill rate a
- * literal stream can reach.
- *
- * WHAT IT DOES NOT CARRY, said here rather than left to be inferred. 13.5 also
- * names frequent block headers as part of the shape. The page writer this
- * corpus rides on emits one final block per page, and reaching the multi-block
- * form means mirroring the reference's inter-block drain rounds, which no
- * reading of this tree settles - so this corpus is the long-codeword half of
- * 13.5's shape and claims nothing about the header-round half. */
+ * WHAT REFILLS ARE AND ARE NOT, because the issue's scope line offers the
+ * compressed/original ratio as a substitute and the honest answer is not a
+ * clean refusal. For a page whose every emitted word is consumed - which this
+ * one is, exactly, and the check below proves it page by page - the two are
+ * affine: density equals the emitted stream's ratio divided by 32/8. What
+ * refills buy is that they are defined by decoder work rather than by page
+ * size, so they do not move with bytes no decoder reads, and they are read out
+ * of a decode that had to reproduce the source. The ratio proxy's real defect
+ * is over COMPRESSOR output, where it points the wrong way: the M4 denominator
+ * table on #224 measures level 0 - the highest ratio the format can produce -
+ * as the FASTEST family on both corpora. */
 
-/* DEFLATE's maximum code length (RFC 1951, and the bound
- * src/gdeflate_tables.h builds against). Nothing about this generator is
- * adversarial except that every emitted symbol sits at this length. */
-constexpr uint32_t kWorstCodeBits = 15;
+/* DEFLATE's maximum code length, from the header that builds against it rather
+ * than as a second copy of 15. Nothing about this generator is adversarial
+ * except that every emitted symbol sits at this length. */
+constexpr uint32_t kWorstCodeBits = cudec_detail::kGDeflateMaxCodeLen;
 
-/* The literal/length vector runs 0..256, so HLIT is 0 and the end-of-block
- * symbol is the last entry. */
-constexpr size_t kWorstLitLenSyms = 257;
+/* The literal/length vector runs 0..285, so the length symbol below is inside
+ * it and HLIT is 29. */
+constexpr uint32_t kWorstLengthSym = 285;
+constexpr size_t kWorstLitLenSyms = kWorstLengthSym + 1;
 
-/* The unary spine: symbols 0..kWorstSpineSyms-1 at lengths 1..kWorstSpineSyms.
- * They are never emitted; they exist so the four deep symbols below can sit at
- * the maximum length in a code that spends its codespace exactly. Kraft:
- * (1 - 2^-13) + 4 * 2^-15 = 1, which is why the spine is two shorter than the
- * maximum length rather than one. */
-constexpr uint32_t kWorstSpineSyms = kWorstCodeBits - 2;
+/* The unary spine: symbols 0..kWorstSpineSyms-1 at lengths 1..kWorstSpineSyms,
+ * never emitted, present so the deep symbols can sit at the maximum length in
+ * a code that spends its codespace exactly. */
+constexpr uint32_t kWorstLitLenSpine = 10;
+constexpr uint32_t kWorstLitLenDeep = 1u << (kWorstCodeBits - kWorstLitLenSpine);
+/* Two of the deep slots are the end-of-block symbol and the length symbol; the
+ * rest are literals, and they are the last ones before end-of-block. */
+constexpr uint32_t kWorstDeepLiterals = kWorstLitLenDeep - 2u;
+constexpr uint32_t kWorstFirstDeepLiteral =
+    cudec_test::kEndOfBlock - kWorstDeepLiterals;
 
-/* The three literals that carry the output, all at kWorstCodeBits. A single
- * literal would do for the density, but a page of one repeated byte is a
- * corpus whose round trip a wrong decoder can pass by accident. */
-constexpr uint32_t kWorstDeepLiterals[] = {253, 254, 255};
-constexpr size_t kWorstDeepLiteralCount =
-    sizeof(kWorstDeepLiterals) / sizeof(kWorstDeepLiterals[0]);
+/* The Kraft identity that makes the code complete, as the compiler's
+ * arithmetic rather than as a comment: the spine spends 1 - 2^-spine and the
+ * deep symbols spend deep * 2^-15, and the two are equal only when the deep
+ * count is exactly 2^(15 - spine). */
+static_assert(kWorstLitLenDeep == (1u << (kWorstCodeBits - kWorstLitLenSpine)),
+              "the deep literal/length count is what makes the code complete");
+static_assert(kWorstLitLenSpine < kWorstCodeBits,
+              "a spine at or past the maximum length spends the codespace "
+              "before the deep symbols get any");
+static_assert(kWorstFirstDeepLiteral > kWorstLitLenSpine,
+              "the spine and the deep literals must not claim one symbol");
+static_assert(kWorstLitLenSyms > cudec_test::kEndOfBlock &&
+                  kWorstLitLenSyms > kWorstLengthSym,
+              "every symbol this generator writes must be inside the vector it "
+              "writes into");
+static_assert(kWorstLitLenSyms >= 257 && kWorstLitLenSyms <= 288,
+              "HLIT is five bits over a 257-symbol floor");
 
-/* Slack past the words this page actually hands out, for the reason
- * tests/gdeflate_page_writer.h states: the reference's ENSURE_BITS reads a
- * word with no bound check, so a writer off by a refill would be reported as
- * an out-of-bounds read in the oracle rather than as a bug here. It is a
- * padding convention and not a check - cudec's own schedule refuses the same
- * read by an explicit bound. Small, because these bytes are counted in the
- * ratio this row prints. */
-constexpr uint32_t kWorstTailWords = 32;
+/* The distance vector is the whole alphabet, with its own spine and its own
+ * deep set. The deep set is the TOP of the alphabet because extra-bit count
+ * grows with the distance base, and an extra-bit field is bits the lane spends
+ * for no symbol: symbol 31 carries fourteen of them. */
+constexpr uint32_t kWorstDistSyms = cudec_detail::kGDeflateNumDistSyms;
+constexpr uint32_t kWorstDistSpine = 11;
+constexpr uint32_t kWorstDistDeep = 1u << (kWorstCodeBits - kWorstDistSpine);
+constexpr uint32_t kWorstFirstDeepDist = kWorstDistSyms - kWorstDistDeep;
+static_assert(kWorstFirstDeepDist > kWorstDistSpine,
+              "the distance spine and the deep distance symbols must not claim "
+              "one symbol");
+
+/* The match this page is made of: the minimum length the format admits, asked
+ * for in the most expensive way it can be asked for. */
+constexpr uint32_t kWorstMatchLen = cudec_detail::kGDeflateMinMatchLen;
+constexpr uint32_t kWorstLengthIndex =
+    kWorstLengthSym - 257u; /* into GDeflateLengthBase/Extra */
+
+/* One group is one round of reservations across all 32 lanes, followed by the
+ * round of retirements that pays for them. */
+constexpr uint32_t kWorstGroupMatches = cudec_detail::kGDeflateNumStreams;
+constexpr uint32_t kWorstGroupBytes = kWorstGroupMatches * kWorstMatchLen;
+
+/* The literal run the page opens with, and the group count that follows it.
+ * The run exists because a match may not reach before the page's own output,
+ * so the cheapest deep distance symbol's base is the floor on how much output
+ * must exist before the first match; the run is the smallest whole number of
+ * groups plus the page's own remainder that clears that base. Derived from the
+ * table rather than written down, so a base that moved moves the run with it.
+ */
+uint32_t WorstLeadBytes() {
+    uint32_t lead = kPageBytes % kWorstGroupBytes;
+    const uint32_t need = cudec_detail::GDeflateDistBase(kWorstFirstDeepDist);
+    while (lead < need) {
+        lead += kWorstGroupBytes;
+    }
+    return lead;
+}
+
+uint32_t WorstGroups() {
+    return static_cast<uint32_t>((kPageBytes - WorstLeadBytes()) /
+                                 kWorstGroupBytes);
+}
 
 /* Big enough that the timed run is not measuring the harness, far smaller than
- * the level sweep's corpora because every page here costs 15 bits per decoded
- * byte to emit as well as to decode. */
+ * the level sweep's corpora because every page here is emitted a bit at a time
+ * as well as decoded. The row therefore is NOT scale-comparable with the
+ * level-sweep rows, and the provenance string says so where the number is
+ * printed. */
 constexpr size_t kWorstRoundsPages = 512;
 
-/* The floor the corpus is required to clear, in refills per decoded byte.
+/* The floor the corpus is required to clear, in refills per decoded byte, and
+ * what sits under it.
  *
- * WHERE THE NUMBER COMES FROM. A page whose every literal costs kWorstCodeBits
- * consumes kWorstCodeBits bits per output byte, and a refill hands a lane
- * kGDeflateBitsPerPacket of them, so the construction sits just above
- * 15/32 = 0.469, and it measures 0.4695. The floor is set below that and well
- * above what any weaker page reaches: a stored block spends 8 bits per decoded
- * byte and therefore 0.250, and the same generator with a balanced literal
- * code instead of the long one measures 0.2612 - watched refusing, so the
- * distance between the two is a reading rather than an estimate. */
-constexpr double kWorstRefillFloor = 0.45;
+ * A refill hands a lane 32 bits, so a page spending b bits per decoded byte
+ * sits at b/32; a stored block spends 8 and lands at 0.250. This corpus
+ * spends a maximum-length length symbol, sixteen extra bits, a maximum-length
+ * distance symbol and up to fourteen more extra bits for every three decoded
+ * bytes, and measures 0.6152. The same generator with both codes balanced
+ * instead of maximal - the same matches, the same whole page, no long
+ * codeword anywhere - measures 0.4483 and is watched being refused. The floor
+ * sits between those two readings rather than between a reading and an
+ * estimate. */
+constexpr double kWorstRefillFloor = 0.55;
 
-/* The lengths of the literal/length code described above. */
+/* The literal/length code lengths described above. */
 std::vector<unsigned char> WorstLitLenLengths() {
     std::vector<unsigned char> lens(kWorstLitLenSyms, 0);
-    for (uint32_t i = 0; i < kWorstSpineSyms; i++) {
+    for (uint32_t i = 0; i < kWorstLitLenSpine; i++) {
         lens[i] = static_cast<unsigned char>(i + 1u);
     }
-    for (size_t i = 0; i < kWorstDeepLiteralCount; i++) {
-        lens[kWorstDeepLiterals[i]] = static_cast<unsigned char>(kWorstCodeBits);
+    for (uint32_t i = 0; i < kWorstDeepLiterals; i++) {
+        lens[kWorstFirstDeepLiteral + i] =
+            static_cast<unsigned char>(kWorstCodeBits);
     }
     lens[cudec_test::kEndOfBlock] = static_cast<unsigned char>(kWorstCodeBits);
+    lens[kWorstLengthSym] = static_cast<unsigned char>(kWorstCodeBits);
     return lens;
 }
 
-/* One page: a single final dynamic block whose body is kPageBytes literals,
- * every one of them coded at the maximum length, followed by end-of-block.
- * `page_index` rotates which of the three deep literals opens the page, so no
- * two pages in the corpus are the same bytes. */
+/* The distance code lengths described above. */
+std::vector<unsigned char> WorstDistLengths() {
+    std::vector<unsigned char> lens(kWorstDistSyms, 0);
+    for (uint32_t i = 0; i < kWorstDistSpine; i++) {
+        lens[i] = static_cast<unsigned char>(i + 1u);
+    }
+    for (uint32_t i = 0; i < kWorstDistDeep; i++) {
+        lens[kWorstFirstDeepDist + i] =
+            static_cast<unsigned char>(kWorstCodeBits);
+    }
+    return lens;
+}
+
+/* The most expensive distance symbol whose match can legally be taken at this
+ * output position. Every deep symbol costs a maximum codeword, so what
+ * separates them is the extra-bit field, which grows with the base - and the
+ * base is exactly what the output has to be long enough to reach back over
+ * (src/gdeflate_block.h refuses a match that begins before the page's own
+ * output). Walking down from the top is therefore walking down from the most
+ * expensive. */
+bool WorstDistSymFor(uint64_t out_pos, uint32_t* sym) {
+    for (uint32_t s = kWorstDistSyms; s-- > kWorstFirstDeepDist;) {
+        if (cudec_detail::GDeflateDistBase(s) <= out_pos) {
+            *sym = s;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* One page: an opening literal run, then `kWorstGroups` groups of 32 minimum
+ * matches, then end-of-block.
+ *
+ * THE GROUP SHAPE IS THE DECODER'S AND NOT A CHOICE. A body token at position
+ * p rides lane p mod 32, and the distance a reserved match needs is read on
+ * that lane's NEXT round - position p + 32. So 32 reservations followed by 32
+ * retirements is the only shape in which every lane holds a match for exactly
+ * one round, which is what "copies split across two rounds on the same lane"
+ * means when every lane does it at once.
+ *
+ * `page_index` seeds the literal run, so the pages of a corpus differ from one
+ * another in their bytes as well as in their index. */
 bool BuildWorstRoundsPage(size_t page_index,
                           std::vector<unsigned char>* original,
                           std::vector<unsigned char>* page) {
     const std::vector<unsigned char> litlen_lens = WorstLitLenLengths();
-    /* One distance symbol at length 1: the degenerate code the reference
-     * admits. No match is emitted, so the distance code is never read - it
-     * exists because HDIST has no encoding for an absent code. */
-    const std::vector<unsigned char> dist_lens = cudec_test::CompleteLengths(1);
+    const std::vector<unsigned char> dist_lens = WorstDistLengths();
 
     std::vector<unsigned char> all(litlen_lens);
     all.insert(all.end(), dist_lens.begin(), dist_lens.end());
@@ -690,34 +804,79 @@ bool BuildWorstRoundsPage(size_t page_index,
         return false;
     }
 
-    std::vector<uint32_t> symbols;
-    symbols.reserve(kPageBytes + 1);
-    original->clear();
-    original->reserve(kPageBytes);
-    for (size_t n = 0; n < kPageBytes; n++) {
-        const uint32_t sym =
-            kWorstDeepLiterals[(n + page_index) % kWorstDeepLiteralCount];
-        symbols.push_back(sym);
-        original->push_back(static_cast<unsigned char>(sym));
-    }
-    symbols.push_back(cudec_test::kEndOfBlock);
+    const uint32_t lead = WorstLeadBytes();
+    const uint32_t groups = WorstGroups();
+    std::vector<cudec_test::BodyToken> body;
+    body.reserve(lead + 2u * groups * kWorstGroupMatches + 1u);
+    original->assign(kPageBytes, 0);
 
-    if (!cudec_test::EmitPage(litlen_lens, dist_lens, toks, precode_lens,
-                              num_explicit, symbols, page)) {
+    /* The opening run. A fixed LCG seeded by the page index, so every page of
+     * a corpus is different bytes and every corpus is reproducible. */
+    uint64_t state = 0x9E3779B97F4A7C15ull + page_index;
+    uint64_t out_pos = 0;
+    for (uint32_t n = 0; n < lead; n++) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        const uint32_t sym =
+            kWorstFirstDeepLiteral +
+            static_cast<uint32_t>((state >> 33) % kWorstDeepLiterals);
+        body.push_back(cudec_test::BodyToken{sym, false, 0, 0});
+        (*original)[out_pos] = static_cast<unsigned char>(sym);
+        out_pos++;
+    }
+
+    for (uint32_t g = 0; g < groups; g++) {
+        uint64_t reserved[kWorstGroupMatches];
+        uint32_t dist_sym[kWorstGroupMatches];
+        for (uint32_t m = 0; m < kWorstGroupMatches; m++) {
+            if (!WorstDistSymFor(out_pos, &dist_sym[m])) {
+                std::fprintf(stderr,
+                             "no deep distance symbol reaches back over %llu "
+                             "bytes of output\n",
+                             static_cast<unsigned long long>(out_pos));
+                return false;
+            }
+            reserved[m] = out_pos;
+            out_pos += kWorstMatchLen;
+            body.push_back(cudec_test::BodyToken{
+                kWorstLengthSym, false,
+                cudec_detail::GDeflateLengthExtra(kWorstLengthIndex), 0});
+        }
+        for (uint32_t m = 0; m < kWorstGroupMatches; m++) {
+            const uint32_t s = dist_sym[m];
+            const uint64_t offset = cudec_detail::GDeflateDistBase(s);
+            /* Mirrors GDeflateDoCopy exactly, in the same order the decoder
+             * retires the group, so the expected bytes are what a decode
+             * produces rather than what this generator meant. */
+            for (uint32_t i = 0; i < kWorstMatchLen; i++) {
+                (*original)[reserved[m] + i] =
+                    (*original)[reserved[m] - offset + i];
+            }
+            body.push_back(cudec_test::BodyToken{
+                s, true, cudec_detail::GDeflateDistExtra(s), 0});
+        }
+    }
+    body.push_back(
+        cudec_test::BodyToken{cudec_test::kEndOfBlock, false, 0, 0});
+
+    if (out_pos != kPageBytes) {
+        std::fprintf(stderr,
+                     "the worst-rounds page produces %llu bytes and the page "
+                     "is %zu\n",
+                     static_cast<unsigned long long>(out_pos), kPageBytes);
+        return false;
+    }
+    if (!cudec_test::EmitPageTokens(litlen_lens, dist_lens, toks, precode_lens,
+                                    num_explicit, body, page)) {
         std::fprintf(stderr, "the page writer refused page %zu\n", page_index);
         return false;
     }
-    /* The writer appends a fixed tail sized for a decoding fixture, and this
-     * corpus prints a ratio, so it is cut back to this corpus's own slack -
-     * derived from the writer's declared constant rather than found by
-     * scanning back over zeros, which would eat an emitted word that happened
-     * to be zero (the reading fuzz/gdeflate_structure.h takes). */
-    const size_t writer_tail = cudec_test::kGDeflateWriterTailWords * 4u;
-    if (page->size() < writer_tail) {
-        std::fprintf(stderr, "the emitted page is shorter than the tail\n");
-        return false;
-    }
-    page->resize(page->size() - writer_tail + kWorstTailWords * 4u, 0);
+    /* The writer's zero tail is kept at the size the writer declares. It is
+     * not slack this corpus may trade for a tidier ratio: the reference
+     * refills without a bound check, so the tail is what turns an emission
+     * that drifted from the schedule into a read of zeros instead of a read
+     * past the end of this vector - and no sanitizer build covers bench/, so
+     * nothing else would see it. What the ratio owes instead is disclosure,
+     * which is `Corpus::padding_bytes` below. */
     return true;
 }
 
@@ -742,15 +901,19 @@ bool BuildWorstRoundsCorpus(size_t pages, std::vector<unsigned char>* source,
         corpus->original_bytes += corpus->originals[i].size();
         corpus->compressed_bytes += corpus->compressed[i].size();
     }
+    corpus->padding_bytes =
+        corpus->originals.size() * cudec_test::kGDeflateWriterTailWords * 4u;
     return true;
 }
 
-/* What the density lock reads. Both members are counted by a decode rather
- * than derived from sizes: a refill is a schedule event and a page's size
- * says nothing about how many of them it forces. */
+/* What the density lock reads. */
 struct RefillDensity {
     uint64_t refills = 0;
     uint64_t out_bytes = 0;
+    /* The worst single page, which is what the lock is taken on: an aggregate
+     * that clears a floor can hold a page set where most pages are trivial. */
+    double worst_page = 0.0;
+    uint64_t copies = 0;
 };
 
 double PerDecodedByte(const RefillDensity& d) {
@@ -765,13 +928,36 @@ double PerDecodedByte(const RefillDensity& d) {
  *
  * The decode is required to produce the source bytes, for the reason
  * CensusCorpus gives about its own walk: a count read off a decode that did
- * not follow this page is a number about something else. */
+ * not follow this page is a number about something else. It is also required
+ * to produce a WHOLE PAGE, which is the constraint the density is maximal
+ * under - the fixed per-page cost of the priming round, the header and the
+ * drain divides by the output, so a page emitting fewer bytes clears any floor
+ * without carrying a single long codeword.
+ *
+ * The source bound is asserted here rather than inherited from whichever gate
+ * ran first, so the gate order stays a matter of cost and not of safety. */
 bool MeasureRefillDensity(const std::vector<unsigned char>& source,
                           const Corpus& corpus, RefillDensity* density) {
     size_t offset = 0;
     for (size_t i = 0; i < corpus.compressed.size(); i++) {
         const size_t want = corpus.originals[i].size();
-        std::vector<unsigned char> out(want == 0 ? 1 : want);
+        if (want != kPageBytes) {
+            std::fprintf(stderr,
+                         "page %zu of %s decodes to %zu bytes and this corpus "
+                         "is locked per decoded byte, so a page short of the "
+                         "%zu-byte page would clear any floor on the fixed "
+                         "per-page cost alone\n",
+                         i, corpus.name.c_str(), want, kPageBytes);
+            return false;
+        }
+        if (offset + want > source.size()) {
+            std::fprintf(stderr,
+                         "page %zu of %s runs past the source it is compared "
+                         "against\n",
+                         i, corpus.name.c_str());
+            return false;
+        }
+        std::vector<unsigned char> out(want);
         cudec_detail::GDeflatePageState st;
         uint64_t produced = 0;
         if (!cudec_detail::GDeflateDecodePage(st, corpus.compressed[i].data(),
@@ -792,52 +978,39 @@ bool MeasureRefillDensity(const std::vector<unsigned char>& source,
                          i, corpus.name.c_str());
             return false;
         }
-        /* THE TAIL IS SLACK AND THIS IS WHERE THAT STOPS BEING AN ASSUMPTION.
-         * The page carries kWorstTailWords of zeros past the words the writer
-         * handed out, because the reference refills without a bound check and
-         * a writer off by one refill would show up as an out-of-bounds read
-         * inside the oracle rather than as a defect here. cudec's schedule
-         * refuses that read instead of padding for it, so its cursor says how
-         * far a mirror of the reference actually walked: a cursor inside the
-         * emitted words means the reference never reached the tail either, and
-         * a cursor past them means the tail is load-bearing and the emission
-         * has drifted from the schedule. */
-        const uint64_t page_words = corpus.compressed[i].size() / 4u;
-        const uint64_t emitted_words =
-            page_words < kWorstTailWords ? 0 : page_words - kWorstTailWords;
-        if (st.s.cursor > emitted_words) {
-            std::fprintf(stderr,
-                         "page %zu of %s consumed %llu of its %llu emitted "
-                         "words and reached into the %u-word tail, which is "
-                         "padding for the reference's unchecked refill and "
-                         "not stream this page emitted\n",
-                         i, corpus.name.c_str(),
-                         static_cast<unsigned long long>(st.s.cursor),
-                         static_cast<unsigned long long>(emitted_words),
-                         kWorstTailWords);
-            return false;
+        const double page_density = static_cast<double>(st.s.cursor) /
+                                    static_cast<double>(produced);
+        if (i == 0 || page_density < density->worst_page) {
+            density->worst_page = page_density;
         }
         density->refills += st.s.cursor;
         density->out_bytes += produced;
+        /* Every match is one copy, and every three bytes past the opening run
+         * is one match, so this is the deferred-copy path's own count rather
+         * than an inference from the shape. */
+        density->copies += (produced - WorstLeadBytes()) / kWorstMatchLen;
         offset += want;
     }
     return true;
 }
 
-/* The lock. Validity alone is not enough: a valid-but-easy page round-trips
- * and leaves CI green while the report still says worst case, which is what
- * this floor exists to refuse. */
+/* The lock. Validity alone is not enough: a valid-but-easy page set
+ * round-trips and leaves CI green while the report still says worst case,
+ * which is what this floor exists to refuse. It is taken on the WORST page and
+ * not on the mean, because a mean clears the floor while nine per cent of the
+ * corpus is the easiest page the format admits. */
 bool CheckRefillFloor(const RefillDensity& density) {
-    const double got = PerDecodedByte(density);
-    if (got >= kWorstRefillFloor) {
+    if (density.worst_page >= kWorstRefillFloor) {
         return true;
     }
     std::fprintf(stderr,
-                 "the worst-rounds corpus forces %.4f refills per decoded "
-                 "byte, under the %.4f floor this corpus exists to hold: it "
-                 "is still a valid page set and it is no longer the "
-                 "adversarial one the report names\n",
-                 got, kWorstRefillFloor);
+                 "the worst page of the worst-rounds corpus forces %.4f "
+                 "refills per decoded byte, under the %.4f floor this corpus "
+                 "exists to hold (the corpus mean is %.4f): it is still a "
+                 "valid page set and it is no longer the adversarial one the "
+                 "report names\n",
+                 density.worst_page, kWorstRefillFloor,
+                 PerDecodedByte(density));
     return false;
 }
 
@@ -865,14 +1038,26 @@ void PrintReport(const Corpus& corpus, int level,
                 "the denominator and carries no cudec number\n",
                 CUDEC_GDEFLATE_COMMIT);
     std::printf("- host CPU: %s\n", cudec_bench::HostCpuName().c_str());
+    /* The ratio is taken over the STREAM and never over the buffer: a
+     * hand-emitted page carries a zero tail no decoder reads, and counting it
+     * would attest bytes that are not stream. It is disclosed on its own line
+     * rather than dropped. */
+    const size_t stream_bytes = corpus.compressed_bytes - corpus.padding_bytes;
     std::printf("- corpus: %s, %zu pages, %.2f MB original, %.2f MB "
                 "compressed (ratio %.4f), %s\n",
                 corpus.name.c_str(), corpus.originals.size(),
                 static_cast<double>(corpus.original_bytes) / 1e6,
-                static_cast<double>(corpus.compressed_bytes) / 1e6,
-                static_cast<double>(corpus.compressed_bytes) /
+                static_cast<double>(stream_bytes) / 1e6,
+                static_cast<double>(stream_bytes) /
                     static_cast<double>(corpus.original_bytes),
                 corpus.provenance.c_str());
+    if (corpus.padding_bytes != 0) {
+        std::printf("- padding: %.2f MB on top of the compressed figure "
+                    "above, a zero tail per page for the reference's "
+                    "unchecked refill; no decoder reads it and the ratio "
+                    "does not count it\n",
+                    static_cast<double>(corpus.padding_bytes) / 1e6);
+    }
     if (level >= 0) {
         std::printf("- granularity: %zu KiB pages, compression level %d\n",
                     kPageBytes / 1024, level);
@@ -897,14 +1082,23 @@ void PrintReport(const Corpus& corpus, int level,
                 corpus.composition.c_str());
     if (density != nullptr) {
         std::printf("- refill density: %.4f refills per decoded byte over "
-                    "%llu refills and %llu decoded bytes, floor %.4f, counted "
-                    "by cudec's own schedule (src/gdeflate_schedule.h) on a "
-                    "decode required to reproduce the source; this is the "
-                    "quantity the corpus is locked on and not a timing\n",
+                    "%llu refills and %llu decoded bytes, worst page "
+                    "%.4f, floor %.4f taken on the worst page rather "
+                    "than on the mean, counted by cudec's own schedule "
+                    "(src/gdeflate_schedule.h) on a decode required to "
+                    "reproduce the source and to fill a whole page; this "
+                    "is the quantity the corpus is locked on and not a "
+                    "timing\n",
                     PerDecodedByte(*density),
                     static_cast<unsigned long long>(density->refills),
                     static_cast<unsigned long long>(density->out_bytes),
-                    kWorstRefillFloor);
+                    density->worst_page, kWorstRefillFloor);
+        std::printf("- deferred copies: %llu retired, one per %u decoded "
+                    "bytes past the opening literal run; the length "
+                    "round reserves and the distance round on the same "
+                    "lane retires\n",
+                    static_cast<unsigned long long>(density->copies),
+                    kWorstMatchLen);
     }
     const double p50 = Percentile(sorted, 50);
     const double p90 = Percentile(sorted, 90);
@@ -1373,24 +1567,34 @@ int RunBlockmix(const std::vector<unsigned char>& source,
     return ok ? 0 : 1;
 }
 
-/* The digest of the kSelfcheckPages-page worst-rounds corpus. It is a
- * constant for the same reason the level sweep's digests are: this page set is
+/* The digests of the two worst-rounds corpora, the four-page one the ctest
+ * entry builds and the full one the reported row is taken on. They are
+ * constants for the reason the level sweep's digests are: this page set is
  * emitted from fixed constants by code in this tree, so a change to the
- * generator, to the length vector or to the page writer's round order moves
- * it, and none of those would stop the pages round-tripping. */
-constexpr uint64_t kWorstRoundsSelfcheckDigest = 0x44a114301d086752ull;
-
-/* The worst-rounds path. Three gates before anything is timed, in the order
- * that puts the cheapest disqualification first:
+ * generator, to either length vector or to the page writer's round order moves
+ * one of them, and none of those would stop the pages round-tripping.
  *
+ * BOTH ARE CHECKED ON EVERY RUN, and that is a departure from the sibling
+ * paths, which check a digest only under --selfcheck. It is deliberate: the
+ * full corpus is the one a reported number is taken on, and a reporting path
+ * whose corpus nothing pins is a number attesting a page set nobody fixed. */
+constexpr uint64_t kWorstRoundsSelfcheckDigest = 0x925326a21c48a952ull;
+constexpr uint64_t kWorstRoundsFullDigest = 0x6e2f2850f76891bbull;
+
+/* The worst-rounds path. Four gates before anything is timed:
+ *
+ *  - cudec's own decode reproduces the source, fills a whole page, and yields
+ *    the refill count. It runs FIRST because it is the bounds-checked reader:
+ *    the reference refills without a bound check, so anything structurally
+ *    wrong with a page should be refused by the decoder that refuses rather
+ *    than found by the one that reads;
+ *  - the refill density clears its floor, on the worst page and not the mean;
  *  - the reference accepts every page and it round-trips to the source, which
  *    is the sole authority on validity here;
- *  - cudec's own decode reproduces the same bytes and yields the refill count;
- *  - the refill density clears its floor.
+ *  - the digest matches the pin for the corpus size that was built.
  *
- * The digest is checked after all three under --selfcheck, so a corpus that
- * drifted is named by what it stopped being before it is named by a number
- * that moved. */
+ * A corpus that drifted is therefore named by what it stopped being before it
+ * is named by a number that moved. */
 int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck) {
     const size_t pages = selfcheck ? kSelfcheckPages : kWorstRoundsPages;
     Corpus corpus;
@@ -1398,17 +1602,16 @@ int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck) {
     corpus.provenance =
         "HAND-CONSTRUCTED by this harness and validated by the pinned "
         "gdeflate fork, not produced by any compressor: one final dynamic "
-        "block per page whose every literal is coded at DEFLATE's maximum "
-        "codeword length, so each decoded byte costs 15 bits where a stored "
-        "block costs 8; ADVERSARIAL, the M4 security-posture row and never a "
-        "headline throughput figure";
+        "block per page, every symbol in it at DEFLATE's maximum codeword "
+        "length, and a body of minimum-length matches asked for through the "
+        "sixteen-extra-bit length symbol, so the deferred-copy path runs once "
+        "per three decoded bytes; ADVERSARIAL, the M4 security-posture row "
+        "and never a headline throughput figure, and NOT scale-comparable "
+        "with the level-sweep rows above, which are six times this corpus";
     corpus.composition = kCompositionNotAsserted;
 
     std::vector<unsigned char> source;
     if (!BuildWorstRoundsCorpus(pages, &source, &corpus)) {
-        return 1;
-    }
-    if (!CorpusRoundTrips(source, corpus)) {
         return 1;
     }
     RefillDensity density;
@@ -1416,6 +1619,9 @@ int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck) {
         return 1;
     }
     if (!CheckRefillFloor(density)) {
+        return 1;
+    }
+    if (!CorpusRoundTrips(source, corpus)) {
         return 1;
     }
     /* Every page opens with the dynamic block this generator emits, and it is
@@ -1426,9 +1632,9 @@ int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck) {
         return 1;
     }
     bool ok = true;
-    if (selfcheck &&
-        !CheckDigest(CorpusDigest(corpus), corpus.name, /*level=*/-1,
-                     kWorstRoundsSelfcheckDigest)) {
+    if (!CheckDigest(CorpusDigest(corpus), corpus.name, /*level=*/-1,
+                     selfcheck ? kWorstRoundsSelfcheckDigest
+                               : kWorstRoundsFullDigest)) {
         ok = false;
     }
     std::vector<double> times;

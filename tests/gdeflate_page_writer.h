@@ -1,4 +1,5 @@
-/* A GDeflate page writer, for tests only (issue #175). It exists because the
+/* A GDeflate page writer, for the tests and the bench (issues #175, #226).
+ * It exists because the
  * reference's answer to "is this a code?" is not callable: the pinned fork
  * compiles `gdeflate_decompress.c` with `HIDE_INTERFACE` defined, so
  * `build_decode_table` is static inside that translation unit and the plain
@@ -6,6 +7,12 @@
  * reference's table construction is a whole GDeflate page, so a test that
  * wants the reference's verdict on a chosen code-length vector has to emit
  * one.
+ *
+ * WHO READS IT. tests/ drives it for the fixtures below; fuzz/ drives it
+ * through fuzz/gdeflate_structure.h; and bench/bench_gdeflate.cpp drives it for
+ * the adversarial corpus (#226), which is why the header is not test-only any
+ * more. The bench consumer is also the one that broke the size assumption
+ * stated at LaneBits below.
  *
  * WHAT MAKES THIS SAFE TO TRUST. A writer that is wrong produces pages the
  * reference rejects, and a reject is exactly what a negative test is looking
@@ -46,9 +53,15 @@
 
 namespace cudec_test {
 
-/* One byte per bit while the page is being built. A page here is a few hundred
- * symbols, so the shape that is easiest to reason about wins over the shape
- * that is compact. */
+/* One byte per bit while the page is being built: the shape that is easiest to
+ * reason about wins over the shape that is compact.
+ *
+ * WHAT THAT COSTS, MEASURED RATHER THAN ASSUMED. It said a page here is a few
+ * hundred symbols. The adversarial corpus (#226) drives a whole 64 KiB page
+ * through it, which is 65537 symbols and about 0.94 MB of lane storage for one
+ * page. That is paid one page at a time and the whole corpus run measures
+ * 6.52 s wall and 173 MB peak, so the shape stands - but a caller sizing a
+ * fixture off the old sentence would be sizing off a number that moved. */
 using LaneBits = std::vector<unsigned char>;
 
 /* Slack for the reference's unchecked refill, not a property of the format.
@@ -342,17 +355,39 @@ inline bool PlanPrecode(const std::vector<LenToken>& toks, uint32_t forced_expli
     return true;
 }
 
+/* One element of the BODY stream. A literal or a length symbol reads out of
+ * the literal/length code; the distance symbol a reserved match needs reads
+ * out of the distance code, on the same lane one round of its own later
+ * (src/gdeflate_block.h: a round whose lane holds a pending copy reads the
+ * distance and nothing else). Both kinds can carry the extra-bit field that
+ * follows them in the SAME round, which is what lets a body carry matches at
+ * all rather than literals only. */
+struct BodyToken {
+    uint32_t sym;
+    bool from_dist;
+    uint32_t extra_bits;
+    uint32_t extra_value;
+};
+
 /* Emit one whole page: a single final dynamic block whose header carries
- * `toks` and whose body encodes `symbols`. Every round here mirrors
+ * `toks` and whose body encodes `body`. Every round here mirrors
  * gdeflate_decompress_template.h in the pinned fork - the header fields ride
  * lane 0 with no round between them, each precode length is its own round,
- * and a repeat code's extra bits are pushed before the round ends. */
-inline bool EmitPage(const std::vector<unsigned char>& litlen_lens,
-              const std::vector<unsigned char>& dist_lens,
-              const std::vector<LenToken>& toks,
-              const unsigned char precode_lens[cudec_detail::kGDeflateNumPrecodeSyms],
-              uint32_t num_explicit, const std::vector<uint32_t>& symbols,
-              std::vector<unsigned char>* page) {
+ * and a repeat code's extra bits are pushed before the round ends.
+ *
+ * THE BODY IS A TOKEN STREAM AND NOT A SYMBOL LIST, because a match is two
+ * rounds on one lane rather than one symbol: the token at position p rides
+ * lane p mod 32, so a length token at p has its distance token at p+32 by
+ * construction. A caller that gets that spacing wrong emits a page the
+ * reference reads differently from this writer, which is the failure the
+ * single-copy rule for this file exists to keep to one place. */
+inline bool EmitPageTokens(
+    const std::vector<unsigned char>& litlen_lens,
+    const std::vector<unsigned char>& dist_lens,
+    const std::vector<LenToken>& toks,
+    const unsigned char precode_lens[cudec_detail::kGDeflateNumPrecodeSyms],
+    uint32_t num_explicit, const std::vector<BodyToken>& body,
+    std::vector<unsigned char>* page) {
     cudec_detail::GDeflatePrecodeTable precode;
     if (!cudec_detail::GDeflateBuildTable(precode_lens, cudec_detail::kGDeflateNumPrecodeSyms, precode)) {
         return false;
@@ -361,6 +396,10 @@ inline bool EmitPage(const std::vector<unsigned char>& litlen_lens,
     const bool litlen_ok =
         cudec_detail::GDeflateBuildTable(litlen_lens.data(),
                            static_cast<uint32_t>(litlen_lens.size()), litlen);
+    cudec_detail::GDeflateDistTable dist;
+    const bool dist_ok =
+        cudec_detail::GDeflateBuildTable(dist_lens.data(),
+                           static_cast<uint32_t>(dist_lens.size()), dist);
 
     GDeflatePageWriter w;
     w.Reset();
@@ -389,20 +428,31 @@ inline bool EmitPage(const std::vector<unsigned char>& litlen_lens,
         w.Advance();
     }
 
-    if (!symbols.empty()) {
+    if (!body.empty()) {
         if (!litlen_ok) {
             return false;
         }
         w.Reset();
-        for (size_t i = 0; i < symbols.size(); i++) {
+        for (size_t i = 0; i < body.size(); i++) {
+            const BodyToken& t = body[i];
+            if (t.from_dist && !dist_ok) {
+                return false;
+            }
             uint32_t code = 0;
             uint32_t len = 0;
-            if (!CodewordOf(litlen, litlen_lens.data(), symbols[i], &code,
-                            &len)) {
+            const bool found =
+                t.from_dist
+                    ? CodewordOf(dist, dist_lens.data(), t.sym, &code, &len)
+                    : CodewordOf(litlen, litlen_lens.data(), t.sym, &code,
+                                 &len);
+            if (!found) {
                 return false;
             }
             w.PushCode(code, len);
-            if (symbols[i] == kEndOfBlock) {
+            if (t.extra_bits != 0) {
+                w.Push(t.extra_bits, t.extra_value);
+            }
+            if (!t.from_dist && t.sym == kEndOfBlock) {
                 /* The reference leaves the decode loop on end-of-block without
                  * advancing, then runs 32 rounds to drain deferred copies.
                  * Those rounds refill, so the writer owes their words. */
@@ -420,6 +470,25 @@ inline bool EmitPage(const std::vector<unsigned char>& litlen_lens,
     }
     *page = w.Finish();
     return true;
+}
+
+/* The literals-only body, which is what every fixture written before matches
+ * were expressible needs. One token per symbol, no extra bits, no distance
+ * code read - so this is the same page it always emitted, and the round order
+ * is still the one above rather than a second copy of it. */
+inline bool EmitPage(const std::vector<unsigned char>& litlen_lens,
+              const std::vector<unsigned char>& dist_lens,
+              const std::vector<LenToken>& toks,
+              const unsigned char precode_lens[cudec_detail::kGDeflateNumPrecodeSyms],
+              uint32_t num_explicit, const std::vector<uint32_t>& symbols,
+              std::vector<unsigned char>* page) {
+    std::vector<BodyToken> body;
+    body.reserve(symbols.size());
+    for (size_t i = 0; i < symbols.size(); i++) {
+        body.push_back(BodyToken{symbols[i], false, 0, 0});
+    }
+    return EmitPageTokens(litlen_lens, dist_lens, toks, precode_lens,
+                          num_explicit, body, page);
 }
 
 }  // namespace cudec_test

@@ -146,12 +146,14 @@ target_link_libraries(bench_gdeflate PRIVATE gdeflate_oracle)
 #
 # ../tests for tests/gdeflate_page_writer.h, which the --worstrounds corpus
 # emits its pages with (issue #226). That header holds the mirror of the
-# decoder's round order, and its own comment says why there may be exactly one
-# copy of it: a page that got a refill wrong is a page the reference reads off
-# the end of. A generator in this directory with its own copy would be the
-# second one. It is a header this directory READS - the consumer-only rule
-# above is about not modifying project targets, and nothing here builds or
-# links a test target.
+# decoder's round order - which lane takes which word in which round, and where
+# a deferred copy's distance is read - and it was lifted out of one fixture file
+# under issue #193 precisely so a second consumer would share it instead of
+# copying it. A generator in this directory with its own copy would be that
+# second copy. It is a header this directory READS: the consumer-only rule above
+# is about not modifying project targets, and nothing here builds or links a
+# test target. bench_zstd already crosses the same boundary one step further,
+# by compiling ../tests/zstd_corpus.cpp.
 target_include_directories(
   bench_gdeflate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src
                          ${CMAKE_CURRENT_SOURCE_DIR}/../tests)

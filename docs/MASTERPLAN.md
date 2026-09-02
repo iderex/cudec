@@ -1873,41 +1873,75 @@ runs.
 
 **The quantity that corpus locks is REFILLS per decoded byte, and this
 section fixed ROUNDS until #226 built it.** The change is not a
-convenience. A round is one symbol per lane, so an all-literal dynamic block
-and a stored block both sit at exactly 1/32 rounds per decoded byte, and a
-floor on that quantity is one no page can fall under - a density lock exists
-to catch a generator that stopped being adversarial, and one that a
-pathological input cannot move proves nothing. A refill is one 32-bit word
-handed to one lane, so it counts the bits a page spends rather than the
-symbols it emits, and it separates the two cases the round count cannot.
-Measured on the corpus the flag builds:
+convenience, and the reason it was made is narrower than the reason first
+written here. A round is one symbol per lane, so an all-literal dynamic
+block and a stored block sit at exactly the same 1/32 rounds per decoded
+byte: no floor separates the adversarial page from the easiest one the
+format admits, which is the whole job a density lock has. What stood here
+went further and said no page could fall under 1/32. That is false, and it
+is corrected rather than trimmed because a later reader would have checked
+it: a match costs two rounds on one lane - the length round reserves, the
+distance round retires - and yields at least three bytes, so a
+match-carrying page sits at 2/(32L) and 1/32 is the MAXIMUM of that quantity
+rather than a bound below it.
+
+A refill is one 32-bit word handed to one lane, so it counts the bits a page
+spends rather than the symbols it emits, and it ranks all three cases the
+way the cost does. Measured on the corpus the flag builds, one line of the
+report, wrapped here and not otherwise altered:
 
     bench_gdeflate --worstrounds --selfcheck
-    - refill density: 0.4695 refills per decoded byte over 123088 refills and
-      262144 decoded bytes, floor 0.4500
+    - refill density: 0.6152 refills per decoded byte over 161272 refills and
+      262144 decoded bytes, worst page 0.6152, floor 0.5500 taken on the worst
+      page rather than on the mean, counted by cudec's own schedule
+      (src/gdeflate_schedule.h) on a decode required to reproduce the source
+      and to fill a whole page; this is the quantity the corpus is locked on
+      and not a timing
 
-Against that, arithmetic rather than a second measurement, and marked as
-such: a refill hands a lane 32 bits, so a page spending b bits per decoded
-byte sits at b/32. A stored block spends 8 and lands at 0.250; a page whose
-literals carry a balanced code over the 257 literal/length symbols spends
-about 9 and lands near 0.28, which is what the weakened generator measures
-at 0.2612 when the floor above is watched refusing it.
+Beside it, arithmetic rather than a second measurement and marked as such: a
+refill hands a lane 32 bits, so a page spending b bits per decoded byte sits
+at b/32, and a stored block spends 8 and lands at 0.250. And beside that, a
+second reading rather than an estimate: the same generator with both codes
+balanced instead of maximal - the same matches, the same whole page, no long
+codeword anywhere - measures 0.4483 and is watched being refused by the
+floor. The floor therefore sits between two readings.
 
-The ratio proxy is refused for the same reason and it is the one that reads
-as success. The M4 CPU denominator recorded on #224 measures level 0 - the
-highest ratio this format can produce, since it emits uncompressed blocks by
-construction - as the FASTEST family on both corpora. A ratio floor
-therefore selects for the easiest pages while the report still says worst
-case.
+**Refills are not independent of the compressed size, and saying so was the
+other overreach.** For a page whose every emitted word is consumed - which
+the corpus is, exactly, and its own per-page check proves it - refills per
+decoded byte is the emitted stream's expansion ratio divided by four. What
+the refill count buys is that it is defined by decoder WORK: it does not
+move with bytes no decoder reads, it is read out of a decode that had to
+reproduce the source, and it is unavailable to a page that stopped decoding
+half way. The ratio's real defect is over COMPRESSOR output, and it is
+measured rather than argued: the M4 CPU denominator recorded on #224 has
+level 0 - the highest ratio this format can produce, since it emits
+uncompressed blocks by construction - as the FASTEST family on both corpora,
+so a ratio floor taken over compressor output selects for the easiest pages
+while the report still says worst case.
 
-That corpus is #226, `bench_gdeflate --worstrounds`, and the floor is its
-proof: every literal coded at DEFLATE's maximum codeword length, validated
-by the pinned reference, counted by cudec's own schedule on a decode
-required to reproduce the source. It is the long-codeword half of the shape
-above; the frequent-block-header half is not in it, because the page writer
-it rides on emits one final block per page and reaching the multi-block form
-means mirroring the reference's inter-block drain rounds, which nothing in
-this tree settles.
+**The floor's denominator is pinned as well as its numerator.** The fixed
+per-page cost - the 32-word priming round, the block header, the drain -
+divides by whatever the page produced, so a page emitting a hundred bytes
+clears any floor with no long codeword in it at all. The corpus therefore
+requires every page to decode to a whole 64 KiB tile. The floor is also
+taken on the WORST page rather than on the corpus mean, and the difference
+is measured rather than supposed: with one page of four built the easy way,
+the mean is 0.5735 and clears the 0.5500 floor while the worst page is
+0.4483 and does not.
+
+That corpus is #226, `bench_gdeflate --worstrounds`. Of the four ingredients
+this section opens with it carries three. Every symbol it emits sits at the
+maximum codeword length, literals, lengths and distances alike. Its lanes
+spend a maximum codeword plus a maximum extra-bit field per round. And its
+body is minimum-length matches, so a copy is split across two rounds on one
+lane once per three decoded bytes and `GDeflateDoCopy` runs 21728 times per
+page rather than never.
+
+The frequent-block-header ingredient is NOT in it: the page writer it rides
+on emits one final block per page, and emitting a second means writing the
+inter-block round order, which no fixture in this tree has ever emitted.
+#430 holds that, and this paragraph is removed when it lands.
 
 What would falsify this design, recorded before it is built:
 
