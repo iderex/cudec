@@ -1869,10 +1869,95 @@ lane consumes near its watermark on every round, copies split across two
 rounds on the same lane (section 11), block headers frequent enough that
 the one-active-lane header rounds are a real share of the total, and code
 lengths long enough that the root accelerator misses and the canonical walk
-runs. The quantity that corpus locks is rounds per decoded byte, and its
-generator asserts a floor on it, so a generator that stops being
-adversarial reds CI rather than quietly reporting a better number. That
-corpus is #226 and the density floor is its proof.
+runs.
+
+**The quantity that corpus locks is REFILLS per decoded byte, and this
+section fixed ROUNDS until #226 built it.** The change is not a
+convenience, and the reason it was made is narrower than the reason first
+written here. A round is one symbol per lane, so an all-literal dynamic
+block and a stored block sit at exactly the same 1/32 rounds per decoded
+byte: no floor separates the adversarial page from the easiest one the
+format admits, which is the whole job a density lock has. What stood here
+went further and said no page could fall under 1/32. That is false, and it
+is corrected rather than trimmed because a later reader would have checked
+it: a match costs two rounds on one lane - the length round reserves, the
+distance round retires - and yields at least three bytes, so a
+match-carrying page sits at 2/(32L) and 1/32 is the MAXIMUM of that quantity
+rather than a bound below it.
+
+A refill is one 32-bit word handed to one lane, so it counts the bits a page
+spends rather than the symbols it emits, and it ranks all three cases the
+way the cost does. Measured on the corpus the flag builds, one line of the
+report, wrapped here and not otherwise altered:
+
+    bench_gdeflate --worstrounds --selfcheck
+    - refill density: 0.6152 refills per decoded byte over 161272 refills and
+      262144 decoded bytes, worst page 0.6152, floor 0.5500 taken on the worst
+      page rather than on the mean, counted by cudec's own schedule
+      (src/gdeflate_schedule.h) on a decode required to reproduce the source
+      and to fill a whole page; this is the quantity the corpus is locked on
+      and not a timing
+
+Beside it, arithmetic rather than a second measurement and marked as such: a
+refill hands a lane 32 bits, so a page spending b bits per decoded byte sits
+at b/32, and a stored block spends 8 and lands at 0.250. And beside that, a
+second reading rather than an estimate: the same generator with both codes
+balanced instead of maximal - the same matches, the same whole page, no long
+codeword anywhere - measures 0.4483, and the same generator with every
+codeword capped at twelve bits instead of fifteen measures 0.5523. Both are
+weakenings run by hand and watched being refused; the pull request carries the
+transcripts. The floor sits above the second of them.
+
+**A density floor cannot carry the codeword-depth claim on its own, and it is
+not asked to.** Most of a minimum-length match's cost is its extra-bit fields,
+which are the same width whatever the codewords are, so a twelve-bit code
+loses about a tenth of the density rather than most of it. What refuses a
+shallow code outright is a check that reads the length of every symbol the page
+emits out of the vector it is encoded from, so the sentence the report prints
+about codeword depth is a refusal rather than an assertion.
+
+**Refills are not independent of the compressed size, and saying so was the
+other overreach.** For a page whose every emitted word is consumed - which
+the corpus is, exactly, and its own per-page check refuses a page that is
+not - refills per decoded byte is the emitted stream's expansion ratio divided
+by four. What
+the refill count buys is that it is defined by decoder WORK: it does not
+move with bytes no decoder reads, it is read out of a decode that had to
+reproduce the source, and it is unavailable to a page that stopped decoding
+half way. The ratio's real defect is over COMPRESSOR output, and it is
+measured rather than argued: the M4 CPU denominator recorded on #224 has
+level 0 - the highest ratio this format can produce, since it emits
+uncompressed blocks by construction - as the FASTEST family on both corpora,
+so a ratio floor taken over compressor output selects for the easiest pages
+while the report still says worst case.
+
+**The floor's denominator is pinned as well as its numerator.** The fixed
+per-page cost - the 32-word priming round, the block header, the drain -
+divides by whatever the page produced, so a page emitting a hundred bytes
+clears any floor with no long codeword in it at all. The corpus therefore
+requires every page to decode to a whole 64 KiB tile. The floor is also
+taken on the WORST page rather than on the corpus mean, and the difference
+is read off a run rather than supposed. With one page of the 512 built the
+easy way - all literals, still every codeword at the maximum length, still a
+whole page - the run prints a corpus mean of 0.6149, which clears the 0.6000
+floor, beside a worst page of 0.4697, which does not.
+
+That corpus is #226, `bench_gdeflate --worstrounds`. Of the four ingredients
+this section opens with it carries three. Every symbol it emits sits at the
+maximum codeword length, literals, lengths and distances alike, and a check
+that reads the depth off the vector each symbol is encoded from refuses a
+generator that shallowed them. A length round spends that codeword and sixteen
+extra bits, a distance round that codeword and the widest extra-bit field the
+output so far reaches back over, and a literal round the codeword alone. And
+its body is minimum-length matches, so a copy is split across two rounds on one
+lane once per three decoded bytes: 21728 of them per page by the corpus's own
+construction, which is arithmetic rather than a count any decoder here
+reports.
+
+The frequent-block-header ingredient is NOT in it: the page writer it rides
+on emits one final block per page, and emitting a second means writing the
+inter-block round order, which no fixture in this tree has ever emitted.
+#430 holds that, and this paragraph is removed when it lands.
 
 What would falsify this design, recorded before it is built:
 
