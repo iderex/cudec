@@ -1869,10 +1869,45 @@ lane consumes near its watermark on every round, copies split across two
 rounds on the same lane (section 11), block headers frequent enough that
 the one-active-lane header rounds are a real share of the total, and code
 lengths long enough that the root accelerator misses and the canonical walk
-runs. The quantity that corpus locks is rounds per decoded byte, and its
-generator asserts a floor on it, so a generator that stops being
-adversarial reds CI rather than quietly reporting a better number. That
-corpus is #226 and the density floor is its proof.
+runs.
+
+**The quantity that corpus locks is REFILLS per decoded byte, and this
+section fixed ROUNDS until #226 built it.** The change is not a
+convenience. A round is one symbol per lane, so an all-literal dynamic block
+and a stored block both sit at exactly 1/32 rounds per decoded byte, and a
+floor on that quantity is one no page can fall under - a density lock exists
+to catch a generator that stopped being adversarial, and one that a
+pathological input cannot move proves nothing. A refill is one 32-bit word
+handed to one lane, so it counts the bits a page spends rather than the
+symbols it emits, and it separates the two cases the round count cannot.
+Measured on the corpus the flag builds:
+
+    bench_gdeflate --worstrounds --selfcheck
+    - refill density: 0.4695 refills per decoded byte over 123088 refills and
+      262144 decoded bytes, floor 0.4500
+
+Against that, arithmetic rather than a second measurement, and marked as
+such: a refill hands a lane 32 bits, so a page spending b bits per decoded
+byte sits at b/32. A stored block spends 8 and lands at 0.250; a page whose
+literals carry a balanced code over the 257 literal/length symbols spends
+about 9 and lands near 0.28, which is what the weakened generator measures
+at 0.2612 when the floor above is watched refusing it.
+
+The ratio proxy is refused for the same reason and it is the one that reads
+as success. The M4 CPU denominator recorded on #224 measures level 0 - the
+highest ratio this format can produce, since it emits uncompressed blocks by
+construction - as the FASTEST family on both corpora. A ratio floor
+therefore selects for the easiest pages while the report still says worst
+case.
+
+That corpus is #226, `bench_gdeflate --worstrounds`, and the floor is its
+proof: every literal coded at DEFLATE's maximum codeword length, validated
+by the pinned reference, counted by cudec's own schedule on a decode
+required to reproduce the source. It is the long-codeword half of the shape
+above; the frequent-block-header half is not in it, because the page writer
+it rides on emits one final block per page and reaching the multi-block form
+means mirroring the reference's inter-block drain rounds, which nothing in
+this tree settles.
 
 What would falsify this design, recorded before it is built:
 

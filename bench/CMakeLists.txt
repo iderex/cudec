@@ -143,8 +143,18 @@ add_executable(bench_gdeflate bench_gdeflate.cpp)
 target_link_libraries(bench_gdeflate PRIVATE gdeflate_oracle)
 # ../src for the corpus digest, which reads src/xxhash64.h - the hash already
 # in the tree rather than a new dependency for a bench.
-target_include_directories(bench_gdeflate PRIVATE
-                           ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+#
+# ../tests for tests/gdeflate_page_writer.h, which the --worstrounds corpus
+# emits its pages with (issue #226). That header holds the mirror of the
+# decoder's round order, and its own comment says why there may be exactly one
+# copy of it: a page that got a refill wrong is a page the reference reads off
+# the end of. A generator in this directory with its own copy would be the
+# second one. It is a header this directory READS - the consumer-only rule
+# above is about not modifying project targets, and nothing here builds or
+# links a test target.
+target_include_directories(
+  bench_gdeflate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src
+                         ${CMAKE_CURRENT_SOURCE_DIR}/../tests)
 # The report names the oracle pin, and it is passed in from the one place that
 # holds it (cmake/CudecGDeflateOracle.cmake) rather than typed into the source:
 # a commit written twice is a commit that can disagree with itself, and the
@@ -210,6 +220,22 @@ add_test(NAME bench_gdeflate_blocktypes_selfcheck COMMAND bench_gdeflate
 # device to run on the host side.
 add_test(NAME bench_gdeflate_blockmix_selfcheck COMMAND bench_gdeflate
                                                  --blockmix --selfcheck)
+
+# The GDeflate throughput worst case (issue #226). Separate from every entry
+# above because it rots on a different property again: those rot on corpus
+# shape and on block-type coverage, this one rots on ADVERSARIALITY. Its pages
+# are emitted by this harness rather than by the compressor - a compressor
+# picks the code that costs the fewest bits, which is the opposite of what
+# this row is for - so validity is not a given and the reference is the gate
+# on it. Round-tripping is still not the check: a valid-but-easy page set
+# round-trips and leaves this entry green while the report says worst case, so
+# the entry also holds a floor on refills per decoded byte, counted by cudec's
+# own schedule on a decode required to reproduce the source.
+#
+# CPU-only, like the entries above: the emitter, the reference decode and the
+# refill count are all host code.
+add_test(NAME bench_gdeflate_worst_selfcheck COMMAND bench_gdeflate
+                                              --worstrounds --selfcheck)
 
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
@@ -290,5 +316,6 @@ set_tests_properties(
   bench_snappy_worst_selfcheck bench_snappy_worstlit_selfcheck
   bench_gdeflate_selfcheck bench_gdeflate_assetlike_selfcheck
   bench_gdeflate_blocktypes_selfcheck bench_gdeflate_blockmix_selfcheck
+  bench_gdeflate_worst_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()
