@@ -239,6 +239,20 @@ add_test(NAME bench_gdeflate_blockmix_selfcheck COMMAND bench_gdeflate
 add_test(NAME bench_gdeflate_worst_selfcheck COMMAND bench_gdeflate
                                               --worstrounds --selfcheck)
 
+# The same worst case with the fourth ingredient of masterplan 13.5 in it
+# (issue #430): the same page cut into one dynamic block per group of matches,
+# so it pays a block header every 96 decoded bytes. Its own entry rather than a
+# widening of the one above, because it locks its own quantities - a higher
+# refill floor, its own digests, and a block count per page read out of cudec's
+# decode - and an entry that ran both would report one verdict over two
+# corpora. It is also the entry that rots if the page writer's INTER-BLOCK
+# round order drifts: nothing else in this tree emits a second block into a
+# page, so a wrong boundary reds here and nowhere else.
+#
+# CPU-only, like the entries above.
+add_test(NAME bench_gdeflate_worstheaders_selfcheck
+         COMMAND bench_gdeflate --worstheaders --selfcheck)
+
 # The Zstd worst-case corpus (issue #229). No CUDA in it at all: the frames
 # are constructed on the host, emitted through the reference's own
 # sequence-compression entry point and decoded by the reference, so the
@@ -318,6 +332,6 @@ set_tests_properties(
   bench_snappy_worst_selfcheck bench_snappy_worstlit_selfcheck
   bench_gdeflate_selfcheck bench_gdeflate_assetlike_selfcheck
   bench_gdeflate_blocktypes_selfcheck bench_gdeflate_blockmix_selfcheck
-  bench_gdeflate_worst_selfcheck
+  bench_gdeflate_worst_selfcheck bench_gdeflate_worstheaders_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()
