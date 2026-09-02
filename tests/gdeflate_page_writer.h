@@ -56,12 +56,14 @@ namespace cudec_test {
 /* One byte per bit while the page is being built: the shape that is easiest to
  * reason about wins over the shape that is compact.
  *
- * WHAT THAT COSTS, MEASURED RATHER THAN ASSUMED. It said a page here is a few
- * hundred symbols. The adversarial corpus (#226) drives a whole 64 KiB page
- * through it, which is 65537 symbols and about 0.94 MB of lane storage for one
- * page. That is paid one page at a time and the whole corpus run measures
- * 6.52 s wall and 173 MB peak, so the shape stands - but a caller sizing a
- * fixture off the old sentence would be sizing off a number that moved. */
+ * THE SENTENCE THAT USED TO BOUND IT IS GONE. It said a page here is a few
+ * hundred symbols, and the adversarial corpus (#226) drives whole 64 KiB pages
+ * through this writer instead - tens of thousands of tokens, and one byte of
+ * lane storage for every bit the page spends, so of the order of a megabyte
+ * for one page. The shape still stands, because a page is built and released
+ * one at a time. No figure is quoted here: a cost that moves with the caller
+ * is not a property of this header, and the caller that pays it prints its own
+ * numbers with its own methodology. */
 using LaneBits = std::vector<unsigned char>;
 
 /* Slack for the reference's unchecked refill, not a property of the format.

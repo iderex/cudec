@@ -1903,13 +1903,24 @@ refill hands a lane 32 bits, so a page spending b bits per decoded byte sits
 at b/32, and a stored block spends 8 and lands at 0.250. And beside that, a
 second reading rather than an estimate: the same generator with both codes
 balanced instead of maximal - the same matches, the same whole page, no long
-codeword anywhere - measures 0.4483 and is watched being refused by the
-floor. The floor therefore sits between two readings.
+codeword anywhere - measures 0.4483, and the same generator with every
+codeword capped at twelve bits instead of fifteen measures 0.5523. Both are
+weakenings run by hand and watched being refused; the pull request carries the
+transcripts. The floor sits above the second of them.
+
+**A density floor cannot carry the codeword-depth claim on its own, and it is
+not asked to.** Most of a minimum-length match's cost is its extra-bit fields,
+which are the same width whatever the codewords are, so a twelve-bit code
+loses about a tenth of the density rather than most of it. What refuses a
+shallow code outright is a check that reads the length of every symbol the page
+emits out of the vector it is encoded from, so the sentence the report prints
+about codeword depth is a refusal rather than an assertion.
 
 **Refills are not independent of the compressed size, and saying so was the
 other overreach.** For a page whose every emitted word is consumed - which
-the corpus is, exactly, and its own per-page check proves it - refills per
-decoded byte is the emitted stream's expansion ratio divided by four. What
+the corpus is, exactly, and its own per-page check refuses a page that is
+not - refills per decoded byte is the emitted stream's expansion ratio divided
+by four. What
 the refill count buys is that it is defined by decoder WORK: it does not
 move with bytes no decoder reads, it is read out of a decode that had to
 reproduce the source, and it is unavailable to a page that stopped decoding
@@ -1926,17 +1937,22 @@ divides by whatever the page produced, so a page emitting a hundred bytes
 clears any floor with no long codeword in it at all. The corpus therefore
 requires every page to decode to a whole 64 KiB tile. The floor is also
 taken on the WORST page rather than on the corpus mean, and the difference
-is measured rather than supposed: with one page of four built the easy way,
-the mean is 0.5735 and clears the 0.5500 floor while the worst page is
-0.4483 and does not.
+is read off a run rather than supposed. With one page of the 512 built the
+easy way - all literals, still every codeword at the maximum length, still a
+whole page - the run prints a corpus mean of 0.6149, which clears the 0.6000
+floor, beside a worst page of 0.4697, which does not.
 
 That corpus is #226, `bench_gdeflate --worstrounds`. Of the four ingredients
 this section opens with it carries three. Every symbol it emits sits at the
-maximum codeword length, literals, lengths and distances alike. Its lanes
-spend a maximum codeword plus a maximum extra-bit field per round. And its
-body is minimum-length matches, so a copy is split across two rounds on one
-lane once per three decoded bytes and `GDeflateDoCopy` runs 21728 times per
-page rather than never.
+maximum codeword length, literals, lengths and distances alike, and a check
+that reads the depth off the vector each symbol is encoded from refuses a
+generator that shallowed them. A length round spends that codeword and sixteen
+extra bits, a distance round that codeword and the widest extra-bit field the
+output so far reaches back over, and a literal round the codeword alone. And
+its body is minimum-length matches, so a copy is split across two rounds on one
+lane once per three decoded bytes: 21728 of them per page by the corpus's own
+construction, which is arithmetic rather than a count any decoder here
+reports.
 
 The frequent-block-header ingredient is NOT in it: the page writer it rides
 on emits one final block per page, and emitting a second means writing the
