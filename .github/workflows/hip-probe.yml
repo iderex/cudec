@@ -1,0 +1,68 @@
+# TEMPORARY, issue #432: the one-off run that compiles the HIP build body
+# inside the digest-pinned production ROCm container, on a GitHub-hosted
+# runner with no GPU. Removed before the pull request merges; the standing
+# job is issue #210's. Not a required check.
+name: hip-probe
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  hip:
+    name: hip-probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: rocm/dev-ubuntu-24.04:7.2.4@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install git and CMake
+        run: >-
+          apt-get update -q -o Acquire::Retries=3 &&
+          apt-get install -yq -o Acquire::Retries=3 --no-install-recommends
+          git cmake
+
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain facts
+        run: >-
+          cmake --version &&
+          ls /opt/rocm/bin | head -50 &&
+          ls /opt/rocm/lib/llvm/bin 2>/dev/null | head -20;
+          /opt/rocm/bin/hipconfig --version;
+          /opt/rocm/bin/hipconfig --platform;
+          /opt/rocm/lib/llvm/bin/clang++ --version
+
+      - name: Configure (HIP engine)
+        run: cmake -B build-hip -DCUDEC_ENABLE_HIP=ON
+
+      - name: Build
+        run: >-
+          cmake --build build-hip -j &&
+          test -x build-hip/tests/smoke &&
+          test -x build-hip/tests/gpu_fixture &&
+          test -x build-hip/tests/frame_twin &&
+          test -x build-hip/tests/stream_twin &&
+          test -x build-hip/tests/termination_gpu &&
+          test -x build-hip/tests/determinism_gpu &&
+          test -x build-hip/tests/snappy_block_device &&
+          test -x build-hip/bench/bench_lz4 &&
+          test -x build-hip/bench/bench_snappy &&
+          test -x build-hip/examples/example_decode_frame
+
+      - name: Host-side tests (runner has no GPU)
+        run: >-
+          ctest --test-dir build-hip -LE gpu --no-tests=error
+          --output-on-failure &&
+          ctest --test-dir build-hip -N | tee all-hip.txt &&
+          ctest --test-dir build-hip -LE gpu -N | tee host-hip.txt
