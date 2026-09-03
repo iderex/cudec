@@ -27,6 +27,8 @@
 #ifndef CUDEC_VENDOR_RT_H
 #define CUDEC_VENDOR_RT_H
 
+#include "cudec.h"
+
 #include <cstddef>
 
 /* __HIP_PLATFORM_AMD__ is defined by hipcc when it targets AMD, and by nothing
@@ -149,6 +151,17 @@ inline error_t event_synchronize(event_t e) {
 }
 inline error_t device_synchronize() { return CUDEC_RT_DEVICE_SYNCHRONIZE(); }
 inline error_t get_last_error() { return CUDEC_RT_GET_LAST_ERROR(); }
+
+/* THE ONE PLACE THE PUBLIC STREAM HANDLE MEETS THE RUNTIME'S (masterplan
+ * section 15.6). cudec_stream_t is the CUDA driver's stream pointer on both
+ * backends, so the public header carries no backend define and a consumer
+ * built against it yesterday is not rebuilt for the port; a HIP caller passes
+ * its stream through that typedef with a cast, and this is where the pointer
+ * gets its runtime type back, once, on the way into a launch. On CUDA the two
+ * types are one type and the cast is the identity. */
+inline stream_t stream_from_abi(cudec_stream_t s) {
+    return reinterpret_cast<stream_t>(s);
+}
 
 /* WHETHER THE BACKEND FIXES THE WAVE WIDTH, and zero where it does not. This
  * is the one difference between the two backends that reaches past the mapping

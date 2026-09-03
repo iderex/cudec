@@ -153,10 +153,10 @@ int DecodeWithWatchdog(const Batch& b, size_t begin, size_t count) {
     cudec_rt::event_t finished;
     REQUIRE_RT(cudec_rt::stream_create(&stream));
     REQUIRE_RT(cudec_rt::event_create_untimed(&finished));
-    REQUIRE(cudec_lz4_decompress_batch(b.d_srcs + begin, b.d_sizes + begin,
-                                       b.d_dsts + begin, b.d_caps + begin,
-                                       count, b.d_results + begin,
-                                       stream) == CUDEC_OK);
+    REQUIRE(cudec_lz4_decompress_batch(
+                b.d_srcs + begin, b.d_sizes + begin, b.d_dsts + begin,
+                b.d_caps + begin, count, b.d_results + begin,
+                cudec_rt::abi_stream(stream)) == CUDEC_OK);
     REQUIRE_RT(cudec_rt::event_record(finished, stream));
 
     const auto start = std::chrono::steady_clock::now();

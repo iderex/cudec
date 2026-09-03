@@ -232,7 +232,7 @@ int RunShippedEntry(const Format& f, const Batch& b) {
     cudec_rt::stream_t stream;
     REQUIRE_RT(cudec_rt::stream_create(&stream));
     REQUIRE(f.entry(b.d_srcs, b.d_sizes, b.d_dsts, b.d_caps, b.n, b.d_results,
-                    stream) == CUDEC_OK);
+                    cudec_rt::abi_stream(stream)) == CUDEC_OK);
     REQUIRE_RT(cudec_rt::stream_synchronize(stream));
     REQUIRE_RT(cudec_rt::stream_destroy(stream));
     return 0;
@@ -259,7 +259,8 @@ int RunSplitStreams(const Format& f, const Batch& b, unsigned stream_count) {
          * 16-byte alignment the ABI requires of d_results. */
         REQUIRE(f.entry(b.d_srcs + begin, b.d_sizes + begin,
                         b.d_dsts + begin, b.d_caps + begin, count,
-                        b.d_results + begin, streams[s]) == CUDEC_OK);
+                        b.d_results + begin,
+                        cudec_rt::abi_stream(streams[s])) == CUDEC_OK);
     }
     for (unsigned s = 0; s < stream_count; s++) {
         REQUIRE_RT(cudec_rt::stream_synchronize(streams[s]));

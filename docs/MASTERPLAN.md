@@ -2611,7 +2611,33 @@ slice of a destination written by nobody
 from the digits, because there it is a statement about the launch and not
 about the ABI.
 
-### 15.6 What would falsify this design
+### 15.6 The stream handle is one type on both backends
+
+`cudec_stream_t` stays `struct CUstream_st*` in `include/cudec.h`, on the
+HIP build as on the CUDA build. The header is one header for both backends
+and carries no backend define, so the ABI a consumer compiles against is
+the same pointer on either build, and nothing a consumer built yesterday
+has to be rebuilt. On the HIP build the caller passes its `hipStream_t`
+through that typedef with a cast, which is the one thing the header's
+comment says in addition to what it said before: both handles are a
+pointer to the driver's stream object, NULL is the default stream on both,
+and the per-thread sentinel has its HIP spelling.
+
+The conversion back to the runtime's type happens once, in
+`src/vendor_rt.h`, the seam #240 landed for exactly this kind of
+difference, as a `reinterpret_cast` at the point a stream enters the batch
+launch; `src/batch.cu` keeps passing `cudec_stream_t` and never learns
+which backend it is under. The harness and the bench make the same cast in
+the other direction, in one function of `tests/vendor_rt_test.h`, when they
+hand a stream they created to the C ABI.
+
+A backend-selected typedef is refused: it would make the public header
+depend on a define the consumer has to match, and a pointer that is the
+same width and the same meaning on both sides does not need two names.
+
+Decided on #432, 2026-09-03, before the build body landed.
+
+### 15.7 What would falsify this design
 
 - **A shim that stops being a header.** If mapping the runtime surface
   needs behaviour rather than names, the single-source claim is what breaks,

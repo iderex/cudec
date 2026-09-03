@@ -1,7 +1,10 @@
-/* GPU decode timing for the bench harness. Owns all CUDA (device buffers,
- * CUDA-event timing, both kernel variants) so bench_lz4.cpp stays host-only.
- * Reports device-resident decode throughput - data already on the GPU, so
- * H2D/D2H is excluded and the number is pure kernel decode throughput. */
+/* GPU decode timing for the bench harness. Owns all device work (device
+ * buffers, event timing, both kernel variants) so bench_lz4.cpp stays
+ * host-only, and reaches the runtime through the harness seam
+ * (tests/vendor_rt_test.h) so this one file is the bench on both backends
+ * (issue #432). Reports device-resident decode throughput - data already on
+ * the GPU, so H2D/D2H is excluded and the number is pure kernel decode
+ * throughput. */
 #include "gpu_bench.h"
 
 #include "bench_stats.h"
@@ -9,8 +12,7 @@
 #include "chunk_decode.cuh"
 #include "lz4_block.h"
 #include "snappy_block.h"
-
-#include <cuda_runtime.h>
+#include "vendor_rt_test.h"
 
 #include <algorithm>
 #include <chrono>
@@ -33,59 +35,62 @@ namespace {
 template <class Parser>
 cudec_status LaunchParseOnly(const void* const* s, const size_t* ss,
                              void* const* d, const size_t* dc, size_t n,
-                             cudec_chunk_result* r, cudaStream_t stream) {
+                             cudec_chunk_result* r, cudec_rt::stream_t stream) {
     const cudec_status valid =
         cudec_detail::validate_batch_args(s, ss, d, dc, n, r);
     if (valid != CUDEC_OK) {
         return valid;
     }
-    (void)cudaGetLastError();
+    (void)cudec_rt::get_last_error();
     cudec_detail::chunk_decode_batch<Parser, true, cudec_detail::kCudaWaveSize>
         <<<cudec_detail::decode_grid_blocks(n), cudec_detail::kBlockThreads, 0,
            stream>>>(s, ss, d, dc, n, r);
-    return cudaGetLastError() == cudaSuccess ? CUDEC_OK : CUDEC_ERR_CUDA;
+    return cudec_rt::get_last_error() == cudec_rt::success ? CUDEC_OK
+                                                           : CUDEC_ERR_CUDA;
 }
 
-#define BG_CUDA(call)                            \
-    do {                                         \
-        if ((call) != cudaSuccess) return false; \
+#define BG_RT(call)                                       \
+    do {                                                  \
+        if ((call) != cudec_rt::success) return false;    \
     } while (0)
 
 /* The one launch shape every timed variant here has: the batch ABI's own
- * argument list. Named once so the timing loop and the format entries below
- * cannot disagree about it. */
+ * argument list, with the stream in the runtime's own type - the two public
+ * launchers below make the ABI cast, the parse-only one launches directly.
+ * Named once so the timing loop and the format entries cannot disagree
+ * about it. */
 using LaunchFn = cudec_status (*)(const void* const*, const size_t*,
                                   void* const*, const size_t*, size_t,
-                                  cudec_chunk_result*, cudaStream_t);
+                                  cudec_chunk_result*, cudec_rt::stream_t);
 
 /* Event-times `launch` over `runs` iterations after `warmup`, returning the
  * p50 milliseconds. */
 bool TimeKernel(LaunchFn launch,
                 const void** d_s, size_t* d_ss, void** d_d, size_t* d_dc,
-                size_t n, cudec_chunk_result* d_r, cudaStream_t stream,
+                size_t n, cudec_chunk_result* d_r, cudec_rt::stream_t stream,
                 int warmup, int runs, double* p50_ms) {
     for (int i = 0; i < warmup; i++) {
         if (launch(d_s, d_ss, d_d, d_dc, n, d_r, stream) != CUDEC_OK) {
             return false;
         }
     }
-    BG_CUDA(cudaStreamSynchronize(stream));
-    cudaEvent_t start, stop;
-    BG_CUDA(cudaEventCreate(&start));
-    BG_CUDA(cudaEventCreate(&stop));
+    BG_RT(cudec_rt::stream_synchronize(stream));
+    cudec_rt::event_t start, stop;
+    BG_RT(cudec_rt::event_create(&start));
+    BG_RT(cudec_rt::event_create(&stop));
     std::vector<float> times(static_cast<size_t>(runs));
     for (int i = 0; i < runs; i++) {
-        BG_CUDA(cudaEventRecord(start, stream));
+        BG_RT(cudec_rt::event_record(start, stream));
         if (launch(d_s, d_ss, d_d, d_dc, n, d_r, stream) != CUDEC_OK) {
             return false;
         }
-        BG_CUDA(cudaEventRecord(stop, stream));
-        BG_CUDA(cudaEventSynchronize(stop));
-        BG_CUDA(cudaEventElapsedTime(&times[static_cast<size_t>(i)], start,
-                                     stop));
+        BG_RT(cudec_rt::event_record(stop, stream));
+        BG_RT(cudec_rt::event_synchronize(stop));
+        BG_RT(cudec_rt::event_elapsed_ms(&times[static_cast<size_t>(i)],
+                                         start, stop));
     }
-    BG_CUDA(cudaEventDestroy(start));
-    BG_CUDA(cudaEventDestroy(stop));
+    BG_RT(cudec_rt::event_destroy(start));
+    BG_RT(cudec_rt::event_destroy(stop));
     std::sort(times.begin(), times.end());
     /* The same nearest-rank definition the CPU rows use, so the two rows of
      * one report mean the same thing (bench/bench_stats.h). */
@@ -95,14 +100,17 @@ bool TimeKernel(LaunchFn launch,
 
 cudec_status LaunchFull(const void* const* s, const size_t* ss,
                         void* const* d, const size_t* dc, size_t n,
-                        cudec_chunk_result* r, cudaStream_t stream) {
-    return cudec_lz4_decompress_batch(s, ss, d, dc, n, r, stream);
+                        cudec_chunk_result* r, cudec_rt::stream_t stream) {
+    return cudec_lz4_decompress_batch(s, ss, d, dc, n, r,
+                                      cudec_rt::abi_stream(stream));
 }
 
 cudec_status LaunchFullSnappy(const void* const* s, const size_t* ss,
                               void* const* d, const size_t* dc, size_t n,
-                              cudec_chunk_result* r, cudaStream_t stream) {
-    return cudec_snappy_decompress_batch(s, ss, d, dc, n, r, stream);
+                              cudec_chunk_result* r,
+                              cudec_rt::stream_t stream) {
+    return cudec_snappy_decompress_batch(s, ss, d, dc, n, r,
+                                         cudec_rt::abi_stream(stream));
 }
 
 double Median(std::vector<double>* t) {
@@ -152,9 +160,9 @@ bool TimeCtxSteady(const void* const* h_src, const size_t* h_ssz,
 }
 
 /* Cold wall time: each iteration creates a FRESH context and times only its
- * first decode - which pays the staging grow (cudaHostAlloc/cudaMalloc) - then
- * destroys it. So (cold - steady) is the amortized per-call setup the reusable
- * context removes. */
+ * first decode - which pays the staging grow (the pinned and the device
+ * allocation) - then destroys it. So (cold - steady) is the amortized
+ * per-call setup the reusable context removes. */
 bool TimeCtxCold(const void* const* h_src, const size_t* h_ssz,
                  void* const* dst, const size_t* h_cap, size_t n,
                  cudec_mem_space space, int runs, double* p50_ms) {
@@ -197,12 +205,12 @@ bool BenchBatch(LaunchFn full, LaunchFn parse_only,
     for (size_t i = 0; i < n; i++) {
         void* ds = nullptr;
         void* dd = nullptr;
-        BG_CUDA(cudaMalloc(&ds, comp_sizes[i] ? comp_sizes[i] : 1));
+        BG_RT(cudec_rt::device_malloc(&ds, comp_sizes[i] ? comp_sizes[i] : 1));
         if (comp_sizes[i]) {
-            BG_CUDA(cudaMemcpy(ds, comp[i], comp_sizes[i],
-                               cudaMemcpyHostToDevice));
+            BG_RT(cudec_rt::memcpy(ds, comp[i], comp_sizes[i],
+                                   cudec_rt::memcpy_h2d));
         }
-        BG_CUDA(cudaMalloc(&dd, orig_sizes[i] ? orig_sizes[i] : 1));
+        BG_RT(cudec_rt::device_malloc(&dd, orig_sizes[i] ? orig_sizes[i] : 1));
         h_s[i] = ds;
         h_d[i] = dd;
         h_ss[i] = comp_sizes[i];
@@ -213,32 +221,32 @@ bool BenchBatch(LaunchFn full, LaunchFn parse_only,
     void** d_d;
     size_t *d_ss, *d_dc;
     cudec_chunk_result* d_r;
-    BG_CUDA(cudaMalloc(&d_s, n * sizeof(*d_s)));
-    BG_CUDA(cudaMalloc(&d_d, n * sizeof(*d_d)));
-    BG_CUDA(cudaMalloc(&d_ss, n * sizeof(*d_ss)));
-    BG_CUDA(cudaMalloc(&d_dc, n * sizeof(*d_dc)));
-    BG_CUDA(cudaMalloc(&d_r, n * sizeof(*d_r)));
-    BG_CUDA(cudaMemcpy(d_s, h_s.data(), n * sizeof(*d_s),
-                       cudaMemcpyHostToDevice));
-    BG_CUDA(cudaMemcpy(d_d, h_d.data(), n * sizeof(*d_d),
-                       cudaMemcpyHostToDevice));
-    BG_CUDA(cudaMemcpy(d_ss, h_ss.data(), n * sizeof(*d_ss),
-                       cudaMemcpyHostToDevice));
-    BG_CUDA(cudaMemcpy(d_dc, h_dc.data(), n * sizeof(*d_dc),
-                       cudaMemcpyHostToDevice));
+    BG_RT(cudec_rt::device_malloc(&d_s, n * sizeof(*d_s)));
+    BG_RT(cudec_rt::device_malloc(&d_d, n * sizeof(*d_d)));
+    BG_RT(cudec_rt::device_malloc(&d_ss, n * sizeof(*d_ss)));
+    BG_RT(cudec_rt::device_malloc(&d_dc, n * sizeof(*d_dc)));
+    BG_RT(cudec_rt::device_malloc(&d_r, n * sizeof(*d_r)));
+    BG_RT(cudec_rt::memcpy(d_s, h_s.data(), n * sizeof(*d_s),
+                           cudec_rt::memcpy_h2d));
+    BG_RT(cudec_rt::memcpy(d_d, h_d.data(), n * sizeof(*d_d),
+                           cudec_rt::memcpy_h2d));
+    BG_RT(cudec_rt::memcpy(d_ss, h_ss.data(), n * sizeof(*d_ss),
+                           cudec_rt::memcpy_h2d));
+    BG_RT(cudec_rt::memcpy(d_dc, h_dc.data(), n * sizeof(*d_dc),
+                           cudec_rt::memcpy_h2d));
 
-    cudaStream_t stream;
-    BG_CUDA(cudaStreamCreate(&stream));
+    cudec_rt::stream_t stream;
+    BG_RT(cudec_rt::stream_create(&stream));
 
     /* Correctness precondition: every chunk must decode OK, or the numbers
      * are meaningless (honest-numbers discipline). */
     if (full(d_s, d_ss, d_d, d_dc, n, d_r, stream) != CUDEC_OK) {
         return false;
     }
-    BG_CUDA(cudaStreamSynchronize(stream));
+    BG_RT(cudec_rt::stream_synchronize(stream));
     std::vector<cudec_chunk_result> res(n);
-    BG_CUDA(cudaMemcpy(res.data(), d_r, n * sizeof(*d_r),
-                       cudaMemcpyDeviceToHost));
+    BG_RT(cudec_rt::memcpy(res.data(), d_r, n * sizeof(*d_r),
+                           cudec_rt::memcpy_d2h));
     for (size_t i = 0; i < n; i++) {
         if (res[i].status != CUDEC_OK ||
             res[i].bytes_written != orig_sizes[i]) {
@@ -278,22 +286,29 @@ bool cudec_bench_gpu_device_line(char* out, size_t n) {
         return false;
     }
     int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+    if (cudec_rt::get_device_count(&count) != cudec_rt::success ||
+        count == 0) {
         std::snprintf(out, n, "none visible to this process");
         return false;
     }
-    cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) {
+    cudec_rt::device_prop_t prop{};
+    if (cudec_rt::get_device_properties(&prop, 0) != cudec_rt::success) {
         std::snprintf(out, n, "device query failed");
         return false;
     }
     int driver = 0;
     int runtime = 0;
-    (void)cudaDriverGetVersion(&driver);
-    (void)cudaRuntimeGetVersion(&runtime);
-    std::snprintf(out, n, "%s (sm_%d%d), driver %d.%d, runtime %d.%d",
-                  prop.name, prop.major, prop.minor, driver / 1000,
-                  (driver % 100) / 10, runtime / 1000, (runtime % 100) / 10);
+    (void)cudec_rt::driver_get_version(&driver);
+    (void)cudec_rt::runtime_get_version(&runtime);
+    /* The architecture token and the version split are the backend's own
+     * spellings, read from the seam rather than assumed here. */
+    char arch[64];
+    cudec_rt::device_arch(prop, arch, sizeof(arch));
+    std::snprintf(out, n, "%s (%s), driver %d.%d, runtime %d.%d", prop.name,
+                  arch, cudec_rt::version_major(driver),
+                  cudec_rt::version_minor(driver),
+                  cudec_rt::version_major(runtime),
+                  cudec_rt::version_minor(runtime));
     return true;
 }
 
@@ -343,7 +358,7 @@ bool cudec_bench_gpu_stream_ctx(const unsigned char* const* comp,
 
     /* One device and one host output arena, sliced per chunk. */
     void* d_out = nullptr;
-    BG_CUDA(cudaMalloc(&d_out, total_out ? total_out : 1));
+    BG_RT(cudec_rt::device_malloc(&d_out, total_out ? total_out : 1));
     std::vector<void*> d_dst(n);
     std::vector<unsigned char> h_out(total_out ? total_out : 1);
     std::vector<void*> h_dst(n);

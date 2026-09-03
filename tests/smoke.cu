@@ -68,11 +68,13 @@ int main() {
     REQUIRE_RT(cudec_rt::memcpy(d_dst_caps, h_sizes, sizeof(h_sizes),
                             cudec_rt::memcpy_h2d));
 
-    /* cudec_rt::stream_t converts to cudec_stream_t with no cast: the public
-     * header's stream type is verified binary-compatible right here. */
+    /* The public header's stream type is one pointer type on both backends
+     * (masterplan section 15.6): abi_stream is the identity on CUDA and the
+     * one cast a HIP caller makes, and the binary compatibility the header
+     * claims is exercised right here. */
     cudec_rt::stream_t stream;
     REQUIRE_RT(cudec_rt::stream_create(&stream));
-    cudec_stream_t api_stream = stream;
+    cudec_stream_t api_stream = cudec_rt::abi_stream(stream);
 
     /* Every reject path, one at a time, so dropping any single validation
      * check fails the test: each missing array, a misaligned result

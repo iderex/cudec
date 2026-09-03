@@ -6,9 +6,10 @@
 # it compiles src/version.c alone, so cudec_lz4f_decompress is not in the
 # archive and nothing that calls it can LINK there. Compiling it is still the
 # half that carries the property this directory exists for, since a header a
-# consumer cannot compile against is broken in both configurations. The CUDA
-# configuration links and produces the binary CI then checks for.
-if(CUDEC_ENABLE_CUDA)
+# consumer cannot compile against is broken in both configurations. A device
+# configuration - either backend, the frame example calls no runtime of its
+# own - links and produces the binary CI then checks for.
+if(CUDEC_DEVICE_LANGUAGE)
   add_executable(example_decode_frame decode_frame.c)
   # cudec's frame orchestration is C++, so the archive carries objects that
   # need the C++ runtime; CMake picks the link driver from the consuming

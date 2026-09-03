@@ -115,8 +115,8 @@ int RunBatch(const std::vector<Chunk>& chunks, BatchEntry entry,
 
     cudec_rt::stream_t stream;
     REQUIRE_RT(cudec_rt::stream_create(&stream));
-    REQUIRE(entry(d_srcs, d_sizes, d_dsts, d_caps, n, d_results, stream) ==
-            CUDEC_OK);
+    REQUIRE(entry(d_srcs, d_sizes, d_dsts, d_caps, n, d_results,
+                  cudec_rt::abi_stream(stream)) == CUDEC_OK);
     REQUIRE_RT(cudec_rt::stream_synchronize(stream));
     REQUIRE_RT(cudec_rt::stream_destroy(stream));
 

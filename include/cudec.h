@@ -49,7 +49,13 @@ typedef enum cudec_status {
 /* Binary-compatible with cudaStream_t without pulling in the CUDA headers:
  * both are pointers to the driver's CUstream_st. Pass a cudaStream_t
  * directly; NULL means the legacy default stream (callers built with
- * per-thread default streams pass cudaStreamPerThread explicitly). */
+ * per-thread default streams pass cudaStreamPerThread explicitly).
+ *
+ * The same type on the HIP build: this header carries no backend define, so
+ * the ABI a consumer compiles against is one pointer on either build. A HIP
+ * caller passes its hipStream_t through this typedef with a cast - both
+ * handles are a pointer to the driver's stream object, NULL is the default
+ * stream on both, and the per-thread sentinel is hipStreamPerThread there. */
 typedef struct CUstream_st* cudec_stream_t;
 
 /* Per-chunk outcome, written by the device into a caller-provided device

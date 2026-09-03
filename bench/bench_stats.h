@@ -22,9 +22,9 @@ namespace cudec_bench {
  * run, not the second-slowest a floor index would pick. The rank == 0 clamp is
  * what makes pct == 0 and a one-element sample land on a real index.
  *
- * Templated because the device path times with cudaEventElapsedTime into
- * float and the host path uses double; the index arithmetic is identical and
- * the sample's own type is returned unconverted.
+ * Templated because the device path times with the runtime's event timer
+ * into float and the host path uses double; the index arithmetic is identical
+ * and the sample's own type is returned unconverted.
  *
  * REQUIRES: `sorted` is non-empty and ascending. Callers sort immediately
  * before the call - the harness aborts on an empty sample long before here,

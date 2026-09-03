@@ -192,10 +192,13 @@ the defect. `scripts/check-fuzz-corpus.sh` refuses a corpus that no longer
 matches its manifest and an emptied target directory - the shape libFuzzer
 otherwise reads as a legal start-from-scratch run and exits 0 on.
 
-`-DCUDEC_ENABLE_HIP=ON` exists and currently refuses on every machine: there
-are no HIP device sources yet, so the option fails the configure rather than
-handing back a host-only library that looks like a working port. The two
-options are mutually exclusive in one build tree.
+`-DCUDEC_ENABLE_HIP=ON` builds the same sources as the CUDA configuration
+through CMake's HIP language, for an explicit architecture list, and refuses
+the configure where no HIP toolchain is found rather than handing back a
+host-only library that looks like a working port. No machine this project has
+been built on carries that toolchain, so the HIP configuration is proven only
+where a ROCm container compiles it (#210) and has never executed on an AMD
+device. The two options are mutually exclusive in one build tree.
 
 ### Documents and the paths they name
 

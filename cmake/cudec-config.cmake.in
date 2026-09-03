@@ -32,6 +32,15 @@ if(@CUDEC_PACKAGE_NEEDS_CUDA@)
   find_dependency(CUDAToolkit)
 endif()
 
+# The HIP flavour, same shape and same reason: a prefix from a HIP build
+# carries $<LINK_ONLY:hip::host> in its exported interface, so the consumer
+# needs the package that defines it, and a prefix from any other build must
+# not ask for one.
+if(@CUDEC_PACKAGE_NEEDS_HIP@)
+  include(CMakeFindDependencyMacro)
+  find_dependency(hip)
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/cudec-targets.cmake")
 
 check_required_components(cudec)

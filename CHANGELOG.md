@@ -84,13 +84,17 @@ write (#82). Everything in it is in the tree today.
   prefix does require the toolkit on the consuming machine and a project that
   enables C++, both stated in [README.md](README.md).
 
-- **`CUDEC_ENABLE_HIP`, a build option that currently refuses.** It is here so
-  the HIP port has a fail-closed contract to land against, and it fails the
-  configure on every machine: without a HIP toolchain it says so, and with one
-  it says that cudec carries no HIP device sources yet. Neither case falls back
-  to a host-only build, because a build that quietly dropped the device engine
-  and reported success would read exactly like a working port. It is also
-  mutually exclusive with `CUDEC_ENABLE_CUDA` in one build tree.
+- **`CUDEC_ENABLE_HIP`, the HIP build of the same sources.** The option
+  compiles the one set of device sources through CMake's HIP language for an
+  explicit architecture list (`gfx90a`, `gfx942`, `gfx1100` and `gfx1201` by
+  default, overridable), links `hip::host`, and refuses the configure where no
+  HIP toolchain is found rather than falling back to a host-only build,
+  because a build that quietly dropped the device engine and reported success
+  would read exactly like a working port. `cudec_stream_t` keeps its CUDA
+  driver pointer type on that build; a HIP caller passes its stream through it
+  with a cast. It is mutually exclusive with `CUDEC_ENABLE_CUDA` in one build
+  tree. Compiled in a ROCm container and never executed on an AMD device: no
+  AMD numbers exist and none are claimed.
 
 ### Changed
 
@@ -114,8 +118,9 @@ write (#82). Everything in it is in the tree today.
     `CUDEC_ERR_NOT_IMPLEMENTED`, and no CUDA call is made.
   - **Zstd** has host-side format parsers under `src/` and no public surface at
     all: `include/cudec.h` names no Zstd entry point, on any build.
-  - **The HIP port** carries no device sources. `CUDEC_ENABLE_HIP` exists to
-    fail the configure rather than to produce a build.
+  - **The HIP port** compiles and has not run. `CUDEC_ENABLE_HIP` produces a
+    build that no AMD device has executed, so nothing about its behaviour on
+    one is claimed.
 
   The milestone table in [README.md](README.md) carries the same list against
   the milestones that own each one.
