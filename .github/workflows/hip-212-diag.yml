@@ -70,4 +70,3 @@ jobs:
           fi
           grep -q 'MISSING:Lz4Parser<64>' neg.log && grep -q 'MISSING:SnappyParser<64>' neg.log && ! grep -q 'MISSING:Lz4Parser<32>' neg.log
           cat neg.log
-          git checkout -- src/batch.cu
