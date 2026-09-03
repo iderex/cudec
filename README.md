@@ -26,10 +26,12 @@ properties a closed binary cannot offer:
   check in cudec is readable, tested, and fuzz-diffed against the reference
   implementations - liblz4 and snappy today, with zlib and libzstd joining as
   the DEFLATE and Zstd formats land.
-- **Portability.** CUDA first; a HIP port is a planned milestone. What that
-  milestone claims is one kernel family, single-source across both vendors
-  behind the same C ABI, auditable and fail-closed on either - not a first on
-  AMD, for the reason the field table linked above gives.
+- **Portability.** CUDA first. The HIP port compiles and has not run: the
+  same sources build as HIP for four AMD architectures in a ROCm container,
+  and no AMD GPU has executed the result. What that milestone claims is one
+  kernel family, single-source across both vendors behind the same C ABI,
+  auditable and fail-closed on either - not a first on AMD, for the reason
+  the field table linked above gives.
 - **Hackability.** Format quirks, tuning trade-offs, and kernel design are
   documented in the tree, not behind a support contract.
 
@@ -50,19 +52,20 @@ liblz4 and snappy. Snappy is batch-only by decision, not by omission: there is
 no Snappy streaming entry and no milestone carries one. The design record is
 [docs/MASTERPLAN.md](docs/MASTERPLAN.md); the measured LZ4 and Snappy
 baselines, each carrying its full methodology, are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md). GDeflate, Zstd and the HIP port are
-planned, not yet implemented. Progress is tracked in the issues and
-milestones:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). GDeflate and Zstd are planned, not
+yet implemented. The HIP port compiles and has never run on an AMD GPU (see
+Building), so no AMD number and no AMD correctness claim exists. Progress is
+tracked in the issues and milestones:
 
-| Milestone        | Deliverable                                         | Status  |
-| ---------------- | --------------------------------------------------- | ------- |
-| M0 - Foundation  | Toolchain, CMake+CUDA skeleton, CI, test harness    | done    |
-| M1 - LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      | done    |
-| M2 - LZ4 batch   | Frame format, batch API, streaming path, benchmarks | done    |
-| M3 - Snappy      | Snappy decode on the same kernel family             | done    |
-| M4 - GDeflate    | GDeflate decode as an auditable CUDA library        | planned |
-| M5 - Zstd        | Zstd decode (FSE/Huffman sequences)                 | planned |
-| M6 - Portability | HIP port                                            | planned |
+| Milestone        | Deliverable                                         | Status   |
+| ---------------- | --------------------------------------------------- | -------- |
+| M0 - Foundation  | Toolchain, CMake+CUDA skeleton, CI, test harness    | done     |
+| M1 - LZ4 block   | Warp-cooperative LZ4 block decode, fuzz-diffed      | done     |
+| M2 - LZ4 batch   | Frame format, batch API, streaming path, benchmarks | done     |
+| M3 - Snappy      | Snappy decode on the same kernel family             | done     |
+| M4 - GDeflate    | GDeflate decode as an auditable CUDA library        | planned  |
+| M5 - Zstd        | Zstd decode (FSE/Huffman sequences)                 | planned  |
+| M6 - Portability | HIP port, same sources, compiled and never run      | compiles |
 
 ## Principles
 
@@ -105,8 +108,29 @@ docker run --rm --gpus all -v "$PWD:/w" -w /w \
          ctest --test-dir build-cuda --no-tests=error --output-on-failure"
 ```
 
-Either build installs into a prefix that an outside project consumes through
-`find_package` (`build-cuda` in place of `build` for the CUDA flavour):
+The HIP build is the same decoder compiled for AMD: the same sources, driven
+as CMake's HIP language (ROCm 7.0 or later; the maintained path is the
+production `rocm/dev-ubuntu-24.04` container, 7.2.4 at the time of writing).
+It compiles for `gfx90a`, `gfx942`, `gfx1100` and `gfx1201` unless
+`CMAKE_HIP_ARCHITECTURES` says otherwise, and never auto-detects a device. It
+has been compiled, not run: no AMD GPU has executed this decoder, so the
+command below runs the host-side subset only, and the gpu-labeled tests exist
+in that build as binaries nothing has yet executed. On-device AMD validation
+is the community's to produce, and the runbook and result intake for it are
+not written yet (#245, #246).
+
+```sh
+docker run --rm -v "$PWD:/w" -w /w \
+  rocm/dev-ubuntu-24.04:7.2.4@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054 \
+  sh -c "apt-get update -q && apt-get install -yq cmake >/dev/null && \
+         cmake -B build-hip -DCUDEC_ENABLE_HIP=ON && \
+         cmake --build build-hip -j && \
+         ctest --test-dir build-hip -LE gpu --no-tests=error --output-on-failure"
+```
+
+Any of the three builds installs into a prefix that an outside project
+consumes through `find_package` (`build-cuda` or `build-hip` in place of
+`build` for the device flavours):
 
 ```sh
 cmake --install build --prefix /some/prefix
@@ -118,10 +142,13 @@ target_link_libraries(your_target PRIVATE cudec::cudec)
 ```
 
 Point the consumer's configure at the prefix with
-`-DCMAKE_PREFIX_PATH=/some/prefix`. The consumer writes nothing about CUDA: a
-prefix from a CUDA build carries its own `find_dependency(CUDAToolkit)`, and a
-host-only prefix carries none, so it stays consumable on a machine that has no
-CUDA toolkit at all. Both flavours are installed and consumed in CI.
+`-DCMAKE_PREFIX_PATH=/some/prefix`. The consumer writes nothing about the
+backend: a prefix from a CUDA build carries its own
+`find_dependency(CUDAToolkit)`, a prefix from a HIP build carries
+`find_dependency(hip)` in the same shape, and a host-only prefix carries
+none, so it stays consumable on a machine that has no device toolkit at all.
+The host-only and CUDA flavours are installed and consumed in CI; no consumer
+has been built against a HIP prefix yet.
 
 Two limits on the CUDA flavour, both consumer-side. It needs the CUDA toolkit
 present on the consuming machine, not merely the runtime library: the
@@ -130,8 +157,10 @@ And the consuming project must enable C++ (`project(... LANGUAGES C CXX)`),
 because cudec's host orchestration is C++ and CMake picks the link driver from
 the languages the consuming project enabled, not from the archive. A C-only
 consumer links `cudec_version()` and fails on the first decode call with
-undefined C++ runtime symbols. The host-only prefix has neither limit; it is
-pure C and needs no toolkit.
+undefined C++ runtime symbols. The HIP flavour carries the same two limits
+with a ROCm installation in place of the toolkit, and nothing has exercised
+them. The host-only prefix has neither limit; it is pure C and needs no
+toolkit.
 
 cudec builds as a static library only, and a top-level configure with
 `BUILD_SHARED_LIBS=ON` is refused rather than producing an untested shared
@@ -142,8 +171,9 @@ asking for 0.0 is not handed 0.1.
 ## Usage
 
 [examples/decode_frame.c](examples/decode_frame.c) decodes a `.lz4` frame using
-the public header and libc, and nothing else. Both builds compile it, and the
-CUDA build links it into `build-cuda/examples/example_decode_frame`.
+the public header and libc, and nothing else. Every build compiles it, and the
+CUDA and HIP builds link it into `build-cuda/examples/example_decode_frame`
+and `build-hip/examples/example_decode_frame`.
 
 [examples/decode_batch.cu](examples/decode_batch.cu) decodes four independent
 LZ4 blocks in one batch call, one of them deliberately corrupt, so the
