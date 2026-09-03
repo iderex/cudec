@@ -389,6 +389,17 @@ if(CUDEC_DEVICE_LANGUAGE)
   cudec_device_target(cudec)
   target_compile_options(
     cudec PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>)
+  # The archive is consumed by executables the HOST linker produces - the C
+  # example here, a consumer's own build - and Ubuntu's g++ links PIE by
+  # default while the ROCm clang emits non-PIE device objects by default, so
+  # a HIP libcudec.a fails that link with an R_X86_64_32S relocation until
+  # its objects are position-independent. Measured on the first container
+  # link of the body (issue #432). Withheld on CUDA on purpose: the host
+  # compiler nvcc drives already defaults to PIE-compatible objects there,
+  # and that configuration's flags stay as they were.
+  if(CUDEC_DEVICE_LANGUAGE STREQUAL "HIP")
+    set_target_properties(cudec PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  endif()
 
   # Keep tests/ after everything that may touch the cudec target: its
   # conformance checks snapshot the target's properties at this point -
