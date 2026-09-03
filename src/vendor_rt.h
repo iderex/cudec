@@ -162,6 +162,13 @@ inline error_t get_last_error() { return CUDEC_RT_GET_LAST_ERROR(); }
 inline stream_t stream_from_abi(cudec_stream_t s) {
     return reinterpret_cast<stream_t>(s);
 }
+/* The inverse, for the library's own host paths (frame.cpp, stream.cpp) that
+ * hand a stream they created to the batch entry, and for the harness and the
+ * bench, which do the same. Both are pointers to the driver's stream object,
+ * so nothing is lost in either direction. */
+inline cudec_stream_t abi_stream(stream_t s) {
+    return reinterpret_cast<cudec_stream_t>(s);
+}
 
 /* WHETHER THE BACKEND FIXES THE WAVE WIDTH, and zero where it does not. This
  * is the one difference between the two backends that reaches past the mapping

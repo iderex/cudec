@@ -98,15 +98,6 @@ using device_prop_t = CUDEC_RT_DEVICE_PROP_T;
 
 inline constexpr error_t error_not_ready = CUDEC_RT_ERROR_NOT_READY;
 
-/* The public handle a harness or a bench hands the C ABI. cudec_stream_t is
- * the CUDA driver's pointer type on both backends (masterplan section 15.6),
- * so on CUDA this is the identity and on HIP it is the one cast a caller
- * makes; src/vendor_rt.h's stream_from_abi is its inverse on the library's
- * side of the seam. */
-inline cudec_stream_t abi_stream(stream_t s) {
-    return reinterpret_cast<cudec_stream_t>(s);
-}
-
 /* One thin inline per operation, as in src/vendor_rt.h, so a call site cannot
  * pass a flag the port has not mapped. */
 inline error_t device_memset(void* p, int value, size_t bytes) {

@@ -49,7 +49,7 @@
  * define the same macro for the same reason, and a device translation unit
  * that decodes more than one format includes more than one header. */
 #ifndef CUDEC_HOST_DEVICE
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIP__)
 #define CUDEC_HOST_DEVICE __host__ __device__
 #else
 #define CUDEC_HOST_DEVICE

@@ -423,7 +423,8 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
         cudec_chunk_result* d_res =
             static_cast<cudec_chunk_result*>(ctx.d_results.p) + begin;
         const cudec_status launched = cudec_lz4_decompress_batch(
-            dd_src, dd_ssz, dd_dst, dd_cap, wn, d_res, stream);
+            dd_src, dd_ssz, dd_dst, dd_cap, wn, d_res,
+            cudec_rt::abi_stream(stream));
         if (launched != CUDEC_OK) {
             WAVE_FAIL(launched);
         }
