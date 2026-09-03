@@ -535,6 +535,25 @@ endif()
 # This test makes the second instantiation a build product and runs the
 # shipped one.
 cudec_add_test(wave_width_gpu SOURCES wave_width_gpu.cu GPU)
+# The same property read off the HIP archive's DEVICE CODE, with no device
+# at all (issue #212): the fat binary is unbundled per offload architecture
+# and each code object's symbol table must carry both widths of both
+# parsers. HIP only, because it is the binary where a width can go missing
+# without this machine noticing - the CUDA build runs wave_width_gpu on a
+# device instead - and host-side, so the GPU-less container job runs it.
+# The tools are the HIP compiler's own neighbours, so the entry cannot pass
+# by finding some other llvm-objdump on the PATH.
+if(CUDEC_DEVICE_LANGUAGE STREQUAL "HIP")
+  get_filename_component(_cudec_hip_tool_dir "${CMAKE_HIP_COMPILER}" DIRECTORY)
+  add_test(
+    NAME hip_wave_instantiations
+    COMMAND
+      bash ${PROJECT_SOURCE_DIR}/scripts/check-hip-wave-instantiations.sh
+      "${_cudec_hip_tool_dir}" "${CUDEC_DEVICE_ARCHITECTURES}"
+      "$<TARGET_OBJECTS:cudec>")
+  set_tests_properties(hip_wave_instantiations
+                       PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
+endif()
 # frame_twin verifies the library's own xxhash32.h against liblz4's XXH32,
 # which it reaches through the src/ include every device test is granted.
 cudec_add_test(frame_twin SOURCES frame_twin.cu LIBS lz4_frame_oracle GPU)
