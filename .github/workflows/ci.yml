@@ -1,10 +1,10 @@
 # CI - the fail-closed pull-request gate.
 #
 # Runs only on pull requests to `main`, so the mainline scaffolding push does
-# not trigger it. Every PR must build both configurations, pass the host-side
-# test subset, and pass the format check before it can merge; the bench step
-# is added by the PR that introduces bench/ and becomes part of these
-# required checks.
+# not trigger it. Every PR must build the host-only, the CUDA and the HIP
+# configurations, pass the host-side test subset on the two device flavours,
+# and pass the format check before it can merge; the bench step is added by
+# the PR that introduces bench/ and becomes part of these required checks.
 
 name: CI
 
@@ -394,6 +394,102 @@ jobs:
           grep -E ': termination_gpu$' gpu-deferred.txt &&
           grep -E ': determinism_gpu$' gpu-deferred.txt &&
           grep -E ': snappy_block_device$' gpu-deferred.txt
+
+  hip:
+    # The job name is the required-check context the ruleset will name once
+    # this has been green on main (issue #210) - keep it stable.
+    name: hip
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The production ROCm stream, pinned by digest: the plain tag is 1.2 GB,
+    # its -complete sibling is 7.4 GB of math libraries nothing here links,
+    # and `latest` is the preview stream this job excludes by name. The
+    # runner has no AMD GPU, and no AMD GPU has ever run this decoder: this
+    # job proves the one set of sources compiles as HIP for both wave widths'
+    # architectures and runs the host-side subset, the same selection the
+    # build job runs, with the gpu-labelled entries deferred to a device
+    # nobody here has.
+    container:
+      image: rocm/dev-ubuntu-24.04:7.2.4@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Tools BEFORE checkout, git among them, for the reason the build job
+      # gives. This image carries no vendor apt repository to drop.
+      - name: Install git and CMake
+        run: >-
+          apt-get update -q -o Acquire::Retries=3 &&
+          apt-get install -yq -o Acquire::Retries=3 --no-install-recommends
+          git cmake
+
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Explicit offload architectures, always: the compiler's own device
+      # auto-detection is what breaks on a GPU-less machine, not compilation.
+      # CDNA (gfx90a, gfx942) is wave64 and RDNA (gfx1100, gfx1201) is wave32,
+      # so one fat binary carries both instantiations of the kernel family,
+      # and hip_wave_instantiations below reads them back out of it. The
+      # `test -x` lines are the fail-closed half: a renamed or unknown CMake
+      # option is a warning and not an error, so the binaries are proven to
+      # exist rather than assumed. example_decode_batch is absent on purpose -
+      # it is a CUDA consumer example, written against that runtime.
+      - name: Configure and build (HIP engine)
+        run: >-
+          cmake -B build-hip -DCUDEC_ENABLE_HIP=ON
+          "-DCMAKE_HIP_ARCHITECTURES=gfx90a;gfx942;gfx1100;gfx1201" &&
+          cmake --build build-hip -j &&
+          test -x build-hip/tests/smoke &&
+          test -x build-hip/tests/gpu_fixture &&
+          test -x build-hip/tests/frame_twin &&
+          test -x build-hip/tests/stream_twin &&
+          test -x build-hip/tests/termination_gpu &&
+          test -x build-hip/tests/determinism_gpu &&
+          test -x build-hip/tests/snappy_block_device &&
+          test -x build-hip/tests/wave_width_gpu &&
+          test -x build-hip/bench/bench_lz4 &&
+          test -x build-hip/bench/bench_snappy &&
+          test -x build-hip/examples/example_decode_frame
+
+      # The same per-name identity greps as the build job, so a host test that
+      # silently drops out of the selection reds this lane too, plus the one
+      # entry that exists on this flavour only: the device-code read of both
+      # wave widths (issue #212).
+      - name: Host-side tests (runner has no GPU)
+        run: >-
+          ctest --test-dir build-hip -LE gpu --no-tests=error
+          --output-on-failure &&
+          ctest --test-dir build-hip -LE gpu -N | tee hip-host-selected.txt &&
+          grep -E ': conformance_c$' hip-host-selected.txt &&
+          grep -E ': oracle_lz4$' hip-host-selected.txt &&
+          grep -E ': parser_twin$' hip-host-selected.txt &&
+          grep -E ': snappy_parser_twin$' hip-host-selected.txt &&
+          grep -E ': tilestream_host_negative$' hip-host-selected.txt &&
+          grep -E ': termination$' hip-host-selected.txt &&
+          grep -E ': launch_fail$' hip-host-selected.txt &&
+          grep -E ': bench_selfcheck$' hip-host-selected.txt &&
+          grep -E ': bench_worst4b_selfcheck$' hip-host-selected.txt &&
+          grep -E ': oracle_gdeflate$' hip-host-selected.txt &&
+          grep -E ': gdeflate_probes$' hip-host-selected.txt &&
+          grep -E ': gdeflate_schedule_twin$' hip-host-selected.txt &&
+          grep -E ': gdeflate_header_twin$' hip-host-selected.txt &&
+          grep -E ': gdeflate_block_twin$' hip-host-selected.txt &&
+          grep -E ': hip_wave_instantiations$' hip-host-selected.txt &&
+          echo "Compiled for HIP, never executed on an AMD device:" &&
+          ctest --test-dir build-hip -L gpu -N | tee hip-gpu-deferred.txt &&
+          grep -E ': smoke$' hip-gpu-deferred.txt &&
+          grep -E ': gpu_fixture$' hip-gpu-deferred.txt &&
+          grep -E ': frame_twin$' hip-gpu-deferred.txt &&
+          grep -E ': stream_twin$' hip-gpu-deferred.txt &&
+          grep -E ': termination_gpu$' hip-gpu-deferred.txt &&
+          grep -E ': determinism_gpu$' hip-gpu-deferred.txt &&
+          grep -E ': snappy_block_device$' hip-gpu-deferred.txt &&
+          grep -E ': wave_width_gpu$' hip-gpu-deferred.txt
 
   sanitize:
     # The host-side ASan/UBSan gate over the untrusted-input decode path (issue

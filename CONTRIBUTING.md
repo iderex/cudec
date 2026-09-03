@@ -196,9 +196,10 @@ otherwise reads as a legal start-from-scratch run and exits 0 on.
 through CMake's HIP language, for an explicit architecture list, and refuses
 the configure where no HIP toolchain is found rather than handing back a
 host-only library that looks like a working port. No machine this project has
-been built on carries that toolchain, so the HIP configuration is proven only
-where a ROCm container compiles it (#210) and has never executed on an AMD
-device. The two options are mutually exclusive in one build tree.
+been built on carries that toolchain, so the HIP configuration is proven where
+the `hip` job compiles it on every pull request, in the digest-pinned
+production ROCm container for four architectures, and it has never executed on
+an AMD device. The two options are mutually exclusive in one build tree.
 
 ### Documents and the paths they name
 
