@@ -77,7 +77,7 @@ cudec_status submit_batch(const void* const* d_src_ptrs,
                 chunk_count, d_results, stream);
             break;
         case cudec_detail::WaveInstantiation::kWave64:
-            launch_decode<Parser, cudec_detail::kWaveWidth64>(
+            launch_decode<Parser, cudec_detail::kWaveWidth32>(
                 d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities,
                 chunk_count, d_results, stream);
             break;
