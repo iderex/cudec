@@ -47,7 +47,7 @@
 #define CUDEC_RT_MEMCPY_D2H hipMemcpyDeviceToHost
 #define CUDEC_RT_STREAM_NONBLOCKING hipStreamNonBlocking
 #define CUDEC_RT_HOST_ALLOC_DEFAULT hipHostMallocDefault
-#define CUDEC_RT_MALLOC hipMalloc
+#define CUDEC_RT_MALLOC hipMallocX
 #define CUDEC_RT_FREE hipFree
 #define CUDEC_RT_HOST_ALLOC hipHostMalloc
 #define CUDEC_RT_HOST_FREE hipHostFree
