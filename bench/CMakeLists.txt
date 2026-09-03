@@ -4,7 +4,10 @@
 # which shares the shipped kernel via src/chunk_decode.cuh). Consumer-only by
 # rule: this directory links project targets and never modifies them (the
 # conformance snapshot in tests/ runs before it).
-find_package(CUDAToolkit REQUIRED)
+
+# gpu_bench.cu is a device translation unit on whichever backend is being
+# built; the top-level CMakeLists says how (issue #432).
+cudec_device_sources(gpu_bench.cu)
 
 add_executable(bench_lz4 bench_lz4.cpp gpu_bench.cu)
 # lz4_frame_oracle is the frame COMPRESSOR for --frame (issue #132): the
@@ -12,21 +15,20 @@ add_executable(bench_lz4 bench_lz4.cpp gpu_bench.cu)
 # cudec_lz4f_decompress on, and liblz4's frame compressor defaults to the
 # linked mode cudec refuses. Nothing here decodes through it - the frame
 # decode under test is cudec's.
-target_link_libraries(bench_lz4 PRIVATE cudec cudec_test_fixtures lz4_oracle
-                                        lz4_frame_oracle CUDA::cudart)
+target_link_libraries(
+  bench_lz4 PRIVATE cudec cudec_test_fixtures lz4_oracle lz4_frame_oracle
+                    ${CUDEC_DEVICE_RUNTIME_TARGET})
 # gpu_bench.cu includes the internal kernel header from src/.
 target_include_directories(bench_lz4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-set_target_properties(
-  bench_lz4 PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
-                       CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
-                       CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+set_target_properties(bench_lz4 PROPERTIES CXX_STANDARD 17
+                                           CXX_STANDARD_REQUIRED ON)
+cudec_device_target(bench_lz4)
 # -O2 unconditionally on the host path: an empty CMAKE_BUILD_TYPE (the
 # documented container command) would otherwise time -O0 marshaling around
-# the decoder. The CUDA path carries the project's strict device flags.
+# the decoder. The device path carries the project's strict device flags
+# (cudec_device_target above).
 target_compile_options(
-  bench_lz4
-  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-O2>
-          ${CUDEC_CUDA_STRICT_FLAGS})
+  bench_lz4 PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-O2>)
 
 # Rot protection: one short self-checked run on the built-in corpus as a
 # host-side ctest entry, so the harness cannot silently break between
@@ -85,24 +87,22 @@ set_tests_properties(bench_frame_selfcheck PROPERTIES LABELS gpu RUN_SERIAL
 # guarantee that no parse-only kernel ships is src/chunk_decode.cuh's and is
 # untouched by this.
 add_executable(bench_snappy bench_snappy.cpp gpu_bench.cu)
-target_link_libraries(bench_snappy PRIVATE cudec cudec_test_fixtures
-                                           snappy_oracle CUDA::cudart)
+target_link_libraries(
+  bench_snappy PRIVATE cudec cudec_test_fixtures snappy_oracle
+                       ${CUDEC_DEVICE_RUNTIME_TARGET})
 # The corpus digest reads src/xxhash64.h, the hash already in the tree;
 # gpu_bench.cu includes the internal kernel header from the same directory.
 target_include_directories(bench_snappy PRIVATE
                            ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-set_target_properties(
-  bench_snappy PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
-                          CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
-                          CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+set_target_properties(bench_snappy PROPERTIES CXX_STANDARD 17
+                                              CXX_STANDARD_REQUIRED ON)
+cudec_device_target(bench_snappy)
 # -O2 unconditionally for the reason bench_lz4 gives above: the documented
 # container command sets no CMAKE_BUILD_TYPE, and an -O0 reference decoder
-# would be timed instead of the reference decoder. The CUDA path carries the
-# project's strict device flags, as it does for bench_lz4.
+# would be timed instead of the reference decoder. The device path carries
+# the project's strict device flags, as it does for bench_lz4.
 target_compile_options(
-  bench_snappy
-  PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-O2>
-          ${CUDEC_CUDA_STRICT_FLAGS})
+  bench_snappy PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-O2>)
 
 # Same rot protection as the entries above, and one more thing besides. The
 # selfcheck builds both corpus shapes from a fixed PRNG and asserts the

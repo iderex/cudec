@@ -74,12 +74,15 @@ jobs:
       #
       # Three legs, and the third is the one that costs something. This image
       # has no HIP toolchain, so legs 1 and 2 only ever exercise the toolchain
-      # refusal; the SECOND refusal - the one that stops a decoder-less HIP
-      # build on a machine that does have ROCm - would then be gated by
-      # nothing. Leg 3 reaches it by handing the configure a compiler, which is
-      # why the block probes CMAKE_HIP_COMPILER itself instead of using
-      # check_language (that module skips its probe when the variable is
-      # already set, and the refusal would be skipped with it).
+      # refusal; what lies past it - the build body issue #432 put where the
+      # "carries no HIP device sources" refusal used to be - would then be
+      # gated by nothing here. Leg 3 reaches it by handing the configure a
+      # compiler, which is why the block probes CMAKE_HIP_COMPILER itself
+      # instead of using check_language (that module skips its probe when the
+      # variable is already set, and the refusal would be skipped with it).
+      # Whether the body COMPILES is the ROCm container job's question (issue
+      # #210); this leg proves only that a supplied toolchain is taken to the
+      # body and not to a refusal.
       #
       # Messages are matched after collapsing whitespace: CMake re-wraps
       # FATAL_ERROR text to its own width, so a phrase can arrive split across
@@ -131,20 +134,28 @@ jobs:
           }
 
           # Leg 3: a caller-supplied compiler passes the toolchain arm, so the
-          # device-sources refusal is the one that must fire. /bin/sh is not a
-          # HIP compiler and is not asked to be one - nothing here compiles.
-          if cmake -B "$out/no-sources" -DCUDEC_ENABLE_HIP=ON \
+          # configure must go on to the body. /bin/sh is not a HIP compiler
+          # and is not asked to be one - nothing here compiles: the configure
+          # has to die inside CMake's own compiler check, AFTER the line that
+          # says the body was reached, and on neither refusal.
+          if cmake -B "$out/body" -DCUDEC_ENABLE_HIP=ON \
                -DCMAKE_HIP_COMPILER=/bin/sh > "$out/3.log" 2>&1; then
-            echo "FAIL: configure succeeded with no HIP device sources"
+            echo "FAIL: configure succeeded with a shell as the HIP compiler"
             cat "$out/3.log"
             exit 1
           fi
           flat "$out/3.log" | grep -q \
-            "cudec carries no HIP device sources yet" || {
-            echo "FAIL: a supplied compiler did not reach the sources refusal"
+            "enabling the HIP language for" || {
+            echo "FAIL: a supplied compiler did not reach the build body"
             cat "$out/3.log"
             exit 1
           }
+          if flat "$out/3.log" | grep -q \
+               "CUDEC_ENABLE_HIP requires a HIP toolchain"; then
+            echo "FAIL: a supplied compiler was refused as a missing toolchain"
+            cat "$out/3.log"
+            exit 1
+          fi
 
           cat "$out/1.log" "$out/2.log" "$out/3.log"
 

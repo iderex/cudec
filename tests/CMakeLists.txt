@@ -67,14 +67,29 @@ endif()
 function(cudec_add_test name)
   cmake_parse_arguments(T "GPU;HUGE" "" "SOURCES;LIBS" ${ARGN})
   # The host-only sanitizer gate (issue #42) builds only the GPU-less,
-  # host-instrumentable subset: a GPU test is a .cu binary linked by nvcc,
-  # which cannot pull in the ASan-instrumented cudec without sanitizing the
-  # device link. Skip them so the sanitizer build stays pure host.
+  # host-instrumentable subset: a GPU test is a .cu binary linked by the
+  # device toolchain, which cannot pull in the ASan-instrumented cudec without
+  # sanitizing the device link. Skip them so the sanitizer build stays pure
+  # host.
   if((T_GPU OR T_HUGE) AND CUDEC_SANITIZE)
     return()
   endif()
+  # The device sources keep their .cu suffix on both backends; under HIP the
+  # language is told per file (top-level CMakeLists.txt, issue #432).
+  set(_device_sources ${T_SOURCES})
+  list(FILTER _device_sources INCLUDE REGEX "\\.cu$")
+  if(_device_sources)
+    cudec_device_sources(${_device_sources})
+  endif()
   add_executable(${name} ${T_SOURCES})
   target_link_libraries(${name} PRIVATE cudec ${T_LIBS})
+  # A device-side test drives the runtime itself through the harness seam, so
+  # it links the runtime target by name rather than inheriting whatever the
+  # device linker adds on its own - the CUDA linker adds cudart implicitly,
+  # the HIP language does not promise the same, and one spelling serves both.
+  if(T_GPU OR T_HUGE)
+    target_link_libraries(${name} PRIVATE ${CUDEC_DEVICE_RUNTIME_TARGET})
+  endif()
   # A device-side test reaches src/: at minimum for the vendor seam it drives
   # the runtime through (tests/vendor_rt_test.h includes src/vendor_rt.h,
   # issue #243), and several also launch the shipped kernel or twin a format
@@ -85,13 +100,11 @@ function(cudec_add_test name)
     target_include_directories(${name}
                                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
   endif()
-  set_target_properties(
-    ${name} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
-                       CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
-                       CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  set_target_properties(${name} PROPERTIES CXX_STANDARD 17
+                                           CXX_STANDARD_REQUIRED ON)
+  cudec_device_target(${name})
   target_compile_options(
-    ${name} PRIVATE ${CUDEC_CUDA_STRICT_FLAGS}
-                    $<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Werror>)
+    ${name} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Werror>)
   # Sanitizer flags on the host test's own TUs (C/C++ only) and its link, so
   # the instrumented cudec/fixtures objects pull in the runtimes. GPU tests
   # returned above, so this only ever reaches host executables.
@@ -495,9 +508,13 @@ target_include_directories(termination
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 cudec_add_test(launch_fail SOURCES launch_fail.cpp)
 # Belt and suspenders with the setenv inside launch_fail.cpp: zero visible
-# devices is the test condition, on the GPU machine too.
-set_tests_properties(launch_fail PROPERTIES ENVIRONMENT
-                                            "CUDA_VISIBLE_DEVICES=")
+# devices is the test condition, on the GPU machine too. Both runtimes' masks
+# are set, because the entry compiles for either; what an empty HIP mask does
+# on an AMD device has not been observed here, since no AMD device has run
+# this suite (issue #432).
+set_tests_properties(
+  launch_fail PROPERTIES ENVIRONMENT
+                         "CUDA_VISIBLE_DEVICES=;HIP_VISIBLE_DEVICES=")
 cudec_add_test(smoke SOURCES smoke.cu GPU)
 cudec_add_test(gpu_fixture SOURCES gpu_fixture.cu LIBS cudec_test_fixtures
                GPU)
@@ -555,10 +572,14 @@ cudec_add_test(huge_match_gpu SOURCES huge_match_gpu.cu LIBS
 # build. These are drift detectors, not tamper-proofing - the honest limits
 # are recorded in docs/MASTERPLAN.md section 5.
 
-# The library must depend on nothing beyond the CUDA runtime - checked on
+# The library must depend on nothing beyond the device runtime - checked on
 # the private AND consumer-facing link surfaces (an INTERFACE dependency of
 # a static library is exactly what its consumers inherit), and on link
-# options, which could smuggle a -l dependency past the target lists.
+# options, which could smuggle a -l dependency past the target lists. The
+# runtime is the one target the top-level CMakeLists names for the backend
+# being built (CUDA::cudart or hip::host), read from there rather than
+# spelled a second time here, and the match is exact: a second CUDA:: target
+# is a dependency too.
 foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES LINK_OPTIONS
               INTERFACE_LINK_OPTIONS)
   get_target_property(_entries cudec ${_prop})
@@ -566,14 +587,14 @@ foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES LINK_OPTIONS
     foreach(_entry IN LISTS _entries)
       # A PRIVATE link of an imported target lands in the interface list
       # wrapped as $<LINK_ONLY:CUDA::cudart>; strip that wrapper before
-      # matching so CUDA::cudart (the CUDA runtime the rule permits) is not
-      # a false positive.
+      # matching so the runtime the rule permits is not a false positive.
       string(REGEX REPLACE "^\\$<LINK_ONLY:(.+)>$" "\\1" _bare "${_entry}")
-      if(NOT _bare MATCHES "^CUDA::")
+      if(NOT _bare STREQUAL "${CUDEC_DEVICE_RUNTIME_TARGET}")
         message(
           FATAL_ERROR
             "cudec carries '${_entry}' in ${_prop} - the library must depend "
-            "on nothing beyond the CUDA runtime")
+            "on nothing beyond the device runtime "
+            "(${CUDEC_DEVICE_RUNTIME_TARGET})")
       endif()
     endforeach()
   endif()
@@ -593,7 +614,9 @@ endif()
 # front end diagnoses both probes (#177-D), so this proves the
 # --Werror=all-warnings seam end to end; the -Xcompiler=-Werror suffix has
 # no cheap gcc-only trigger (the front end shadows every candidate tried)
-# and stays covered by the substring check only.
+# and stays covered by the substring check only. The invocation is the
+# top-level CMakeLists' CUDEC_DEVICE_PROBE_COMMAND, so the same two probes
+# judge whichever backend is being built under its own strict-flag spelling.
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/probes/host_warning.cu
      "int main() {\n    int unused_host_variable;\n    return 0;\n}\n")
 file(
@@ -609,7 +632,7 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/probes/control_clean.cu
      "int main() { return 0; }\n")
 execute_process(
   COMMAND
-    ${CMAKE_CUDA_COMPILER} ${CUDEC_CUDA_STRICT_FLAGS_RAW} -arch=sm_86 -c
+    ${CUDEC_DEVICE_PROBE_COMMAND} -c
     ${CMAKE_CURRENT_BINARY_DIR}/probes/control_clean.cu -o
     ${CMAKE_CURRENT_BINARY_DIR}/probes/control_clean.o
   RESULT_VARIABLE _control_exit
@@ -623,7 +646,7 @@ endif()
 foreach(_probe host_warning device_warning)
   execute_process(
     COMMAND
-      ${CMAKE_CUDA_COMPILER} ${CUDEC_CUDA_STRICT_FLAGS_RAW} -arch=sm_86 -c
+      ${CUDEC_DEVICE_PROBE_COMMAND} -c
       ${CMAKE_CURRENT_BINARY_DIR}/probes/${_probe}.cu -o
       ${CMAKE_CURRENT_BINARY_DIR}/probes/${_probe}.o
     RESULT_VARIABLE _probe_exit
@@ -903,6 +926,39 @@ endforeach()
 if(_vendor_test_violations)
   message(FATAL_ERROR "the harness vendor seam has leaked:\n"
                       "${_vendor_test_violations}")
+endif()
+
+# ---- The bench's half of the same seam (issue #432). bench/gpu_bench.cu
+# drives the device the way the ladder does - it allocates, uploads, times
+# with events - and it does so through tests/vendor_rt_test.h, so it makes the
+# same single-source claim and fails the same way. Rule one again, pointed at
+# bench/ with NO exempted file: the bench adds no table of its own, and a
+# backend name anywhere under bench/ is a translation unit that compiles on
+# one backend only.
+file(GLOB_RECURSE _vendor_bench_sources RELATIVE
+     ${CMAKE_CURRENT_SOURCE_DIR}/../bench CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/../bench/*.c
+     ${CMAKE_CURRENT_SOURCE_DIR}/../bench/*.cc
+     ${CMAKE_CURRENT_SOURCE_DIR}/../bench/*.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../bench/*.cu
+     ${CMAKE_CURRENT_SOURCE_DIR}/../bench/*.cuh
+     ${CMAKE_CURRENT_SOURCE_DIR}/../bench/*.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/../bench/*.hpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../bench/*.inl)
+if(NOT _vendor_bench_sources)
+  message(FATAL_ERROR "the bench vendor-seam scan found no sources under "
+                      "bench/ - the glob has stopped matching (issue #432)")
+endif()
+set(_vendor_bench_violations "")
+foreach(_source IN LISTS _vendor_bench_sources)
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../bench/${_source} _vsrc)
+  cudec_scan_vendor_spelling("${_vsrc}" "bench/${_source}"
+                             "tests/vendor_rt_test.h" _found)
+  string(APPEND _vendor_bench_violations "${_found}")
+endforeach()
+if(_vendor_bench_violations)
+  message(FATAL_ERROR "the bench vendor seam has leaked:\n"
+                      "${_vendor_bench_violations}")
 endif()
 
 file(READ ${_vendor_rt_test} _vendor_rt_test_src)

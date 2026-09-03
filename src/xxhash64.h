@@ -26,7 +26,7 @@
 #include <stdint.h>
 
 #ifndef CUDEC_HOST_DEVICE
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIP__)
 #define CUDEC_HOST_DEVICE __host__ __device__
 #else
 #define CUDEC_HOST_DEVICE

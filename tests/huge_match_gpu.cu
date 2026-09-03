@@ -158,9 +158,9 @@ int main() {
 
     cudec_rt::stream_t stream;
     REQUIRE_RT(cudec_rt::stream_create(&stream));
-    REQUIRE(cudec_lz4_decompress_batch(b.src_ptrs, b.src_sizes, b.dst_ptrs,
-                                       b.dst_caps, 1, b.results,
-                                       stream) == CUDEC_OK);
+    REQUIRE(cudec_lz4_decompress_batch(
+                b.src_ptrs, b.src_sizes, b.dst_ptrs, b.dst_caps, 1, b.results,
+                cudec_rt::abi_stream(stream)) == CUDEC_OK);
     REQUIRE_RT(cudec_rt::stream_synchronize(stream));
 
     cudec_chunk_result result{};

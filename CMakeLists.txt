@@ -134,6 +134,31 @@ if(CUDEC_SANITIZE)
     PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:${CUDEC_SANITIZE_COMPILE_FLAGS}>)
 endif()
 
+# ---- The device engine: one of two backends, and one shape.
+#
+# Everything the two backends share is written once, below both toolchain
+# blocks: the test net, the bench harness, the timeout discipline and the
+# library's own shape do not depend on which compiler produced the device
+# objects (masterplan section 15, single source). What differs is the language
+# CMake drives, the runtime target the library links, the strict-flag spelling
+# and how the liveness probes invoke the compiler, and each toolchain block
+# writes those into the variables below so that no CMakeLists outside this
+# file names a backend:
+#
+#   CUDEC_DEVICE_LANGUAGE        CUDA or HIP; empty in the host-only build
+#   CUDEC_DEVICE_ARCHITECTURES   the architecture list every device target
+#                                carries
+#   CUDEC_DEVICE_RUNTIME_TARGET  the ONE imported runtime target the library
+#                                may link; the no-dependency rule in tests/
+#                                reads it rather than a spelling of its own
+#   CUDEC_DEVICE_STRICT_FLAGS_RAW / CUDEC_DEVICE_STRICT_FLAGS
+#                                warnings-as-errors for the device TUs, raw
+#                                for the probes and language-guarded for the
+#                                targets - one list, so an edit is probed
+#   CUDEC_DEVICE_PROBE_COMMAND   the direct compiler invocation the probes in
+#                                tests/CMakeLists.txt run a known-bad TU under
+set(CUDEC_DEVICE_LANGUAGE "")
+
 if(CUDEC_ENABLE_CUDA)
   if(MSVC)
     # cl.exe ignores the GCC-style strict-warning flags below with a
@@ -154,12 +179,148 @@ if(CUDEC_ENABLE_CUDA)
     set(CMAKE_CUDA_ARCHITECTURES 80 86-real)
   endif()
   enable_language(CUDA)
+  # frame.cpp (the LZ4 frame orchestrator) is host C++ that drives the
+  # device batch decoder, so it needs the CUDA runtime.
+  find_package(CUDAToolkit REQUIRED)
+
+  set(CUDEC_DEVICE_LANGUAGE CUDA)
+  set(CUDEC_DEVICE_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  set(CUDEC_DEVICE_RUNTIME_TARGET CUDA::cudart)
+  set(CUDEC_DEVICE_STRICT_FLAGS_RAW --Werror=all-warnings
+                                    -Xcompiler=-Wall,-Wextra,-Werror)
+  set(CUDEC_DEVICE_PROBE_COMMAND ${CMAKE_CUDA_COMPILER}
+                                 ${CUDEC_DEVICE_STRICT_FLAGS_RAW} -arch=sm_86)
+endif()
+
+# ---- The HIP language path (issue #209; the build body is issue #432).
+#
+# Two arms, in this order. The first is the toolchain refusal, which a runner
+# with no ROCm exercises on every pull request. The second is the build: the
+# same sources the CUDA arm compiles, driven as CMake's HIP language, against
+# the explicit architecture list below. There is no third state - a configure
+# that found a toolchain either produces the decoder or fails inside CMake's
+# own compiler check, never a host-only library that reports success.
+#
+# The stream handle is the one ABI-visible thing this arm touches, and it does
+# not move: cudec_stream_t stays the CUDA driver's pointer type on both
+# backends and src/vendor_rt.h converts it once where a stream enters a launch
+# (masterplan section 15.6). A backend-selected typedef is refused there.
+if(CUDEC_ENABLE_HIP)
+  # Deliberately NOT check_language(HIP). That module wraps its probe in
+  # `if(NOT DEFINED CMAKE_HIP_COMPILER)`, so a value from a toolchain file, a
+  # superbuild, a -D on the command line, or this build tree's own cache makes
+  # it a silent no-op and the refusal below would be skipped over a compiler
+  # nothing validated. It also FORCE-caches a negative result, which pins a
+  # build directory to "none was found" even after ROCm is installed. Probing
+  # here keeps both properties out: the probe runs every configure, and it
+  # writes no cache entry of its own.
+  set(_cudec_hip_compiler "")
+  if(CMAKE_HIP_COMPILER)
+    set(_cudec_hip_compiler "${CMAKE_HIP_COMPILER}")
+  else()
+    find_program(
+      _cudec_hip_compiler_probe
+      NAMES hipcc
+      HINTS ENV ROCM_PATH /opt/rocm
+      PATH_SUFFIXES bin
+      NO_CACHE)
+    if(_cudec_hip_compiler_probe)
+      set(_cudec_hip_compiler "${_cudec_hip_compiler_probe}")
+    endif()
+  endif()
+
+  if(NOT _cudec_hip_compiler)
+    # ROCm rather than a specific binary: CMake drives the HIP language with a
+    # clang that it locates from the ROCm installation, and rejects some
+    # drivers passed directly as CMAKE_HIP_COMPILER. Naming the toolkit is
+    # what a reader can act on; naming one executable would send them at a
+    # value CMake may refuse.
+    message(
+      FATAL_ERROR
+        "CUDEC_ENABLE_HIP requires a HIP toolchain (a ROCm installation, or "
+        "CMAKE_HIP_COMPILER pointing at a compiler CMake accepts for the HIP "
+        "language) and none was found. This never falls back to a host-only "
+        "build: a configuration that dropped the device engine and still "
+        "succeeded would be a fail-open gate.")
+  endif()
+
+  # Explicit offload architectures, always (issue #210): the compiler's own
+  # GPU auto-detection is what breaks on a machine with no AMD device, which
+  # is every machine that has built this so far. Both wave widths are in the
+  # list on purpose - CDNA (gfx90a, gfx942) runs wave64 and RDNA (gfx1100,
+  # gfx1201) runs wave32 - so one fat binary carries both instantiations of
+  # the kernel family (issue #212). Overridable from the command line; the
+  # CI job owns the list it compiles.
+  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx90a gfx942 gfx1100 gfx1201)
+  endif()
+  # Printed before the language is enabled: the CI leg that hands this
+  # configure a non-compiler proves the body was reached by finding this line
+  # and neither refusal, and CMake's own wording past this point is not ours
+  # to match.
+  message(
+    STATUS
+      "cudec: HIP toolchain found (${_cudec_hip_compiler}); enabling the HIP "
+      "language for ${CMAKE_HIP_ARCHITECTURES}")
+  enable_language(HIP)
+  # hip::host, not hip::device. CMake's HIP language already compiles the
+  # device translation units with the offload flags derived from
+  # HIP_ARCHITECTURES; what the library still needs from the package is the
+  # runtime the host translation units (frame.cpp, stream.cpp, compiled by the
+  # host C++ compiler) link and include against, and that is hip::host.
+  # hip::device would add clang-only device options to every language on the
+  # target, which the host compiler does not accept.
+  find_package(hip REQUIRED HINTS "${CMAKE_HIP_COMPILER_ROCM_ROOT}"
+                                  ENV ROCM_PATH /opt/rocm)
+
+  set(CUDEC_DEVICE_LANGUAGE HIP)
+  set(CUDEC_DEVICE_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
+  set(CUDEC_DEVICE_RUNTIME_TARGET hip::host)
+  # Clang spelling: one front end diagnoses both the host and the device pass,
+  # so the GCC-style set reaches both without an -Xcompiler relay.
+  set(CUDEC_DEVICE_STRICT_FLAGS_RAW -Wall -Wextra -Werror)
+  list(GET CMAKE_HIP_ARCHITECTURES 0 _cudec_hip_probe_arch)
+  set(CUDEC_DEVICE_PROBE_COMMAND
+      ${CMAKE_HIP_COMPILER} ${CUDEC_DEVICE_STRICT_FLAGS_RAW} -x hip
+      --offload-arch=${_cudec_hip_probe_arch})
+endif()
+
+if(CUDEC_DEVICE_LANGUAGE)
+  set(CUDEC_DEVICE_STRICT_FLAGS
+      $<$<COMPILE_LANGUAGE:${CUDEC_DEVICE_LANGUAGE}>:${CUDEC_DEVICE_STRICT_FLAGS_RAW}>
+  )
   # The project language is C; the test net and the bench harness add .cpp
   # translation units, so CXX is enabled here where both subdirectories
   # can see it (a language enabled inside one subdirectory is invisible to
   # its siblings).
   enable_language(CXX)
   enable_testing()
+
+  # The device sources carry the .cu suffix on both backends: one set of files
+  # is the port's whole claim, and CMake maps that suffix to the CUDA language
+  # by default. Under HIP each one is told its language here rather than
+  # renamed, so the configure-time scanners in tests/CMakeLists.txt that glob
+  # *.cu keep seeing them.
+  function(cudec_device_sources)
+    if(CUDEC_DEVICE_LANGUAGE STREQUAL "HIP")
+      set_source_files_properties(${ARGN} PROPERTIES LANGUAGE HIP)
+    endif()
+  endfunction()
+
+  # The device-side properties every target with a device translation unit
+  # carries, written once: the language standard, the architecture list and
+  # the strict flags. A target created before its language was enabled (the
+  # library is) gets no architecture list by default, which is why this is a
+  # property set and not an inheritance.
+  function(cudec_device_target name)
+    set_target_properties(
+      ${name}
+      PROPERTIES ${CUDEC_DEVICE_LANGUAGE}_STANDARD 17
+                 ${CUDEC_DEVICE_LANGUAGE}_STANDARD_REQUIRED ON
+                 ${CUDEC_DEVICE_LANGUAGE}_ARCHITECTURES
+                 "${CUDEC_DEVICE_ARCHITECTURES}")
+    target_compile_options(${name} PRIVATE ${CUDEC_DEVICE_STRICT_FLAGS})
+  endfunction()
 
   # Every ctest entry carries a finite TIMEOUT (issue #72). A decoder that
   # fails to terminate hangs the runner instead of failing it, and a hang is
@@ -220,28 +381,25 @@ if(CUDEC_ENABLE_CUDA)
     endforeach()
   endfunction()
 
-  # Single source of truth for the strict device flags: the raw list also
-  # feeds the configure-time liveness probes in tests/CMakeLists.txt, so an
-  # edit here is probed, not trusted.
-  set(CUDEC_CUDA_STRICT_FLAGS_RAW --Werror=all-warnings
-                                  -Xcompiler=-Wall,-Wextra,-Werror)
-  set(CUDEC_CUDA_STRICT_FLAGS
-      $<$<COMPILE_LANGUAGE:CUDA>:${CUDEC_CUDA_STRICT_FLAGS_RAW}>)
-
-  # frame.cpp (the LZ4 frame orchestrator) is host C++ that drives the
-  # device batch decoder, so it needs the CUDA runtime.
-  find_package(CUDAToolkit REQUIRED)
+  cudec_device_sources(src/batch.cu)
   target_sources(cudec PRIVATE src/batch.cu src/frame.cpp src/stream.cpp)
-  target_link_libraries(cudec PRIVATE CUDA::cudart)
-  # The cudec target predates enable_language(CUDA), so the architecture
-  # list must be applied as an explicit target property.
-  set_target_properties(
-    cudec PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
-                     CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
-                     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+  target_link_libraries(cudec PRIVATE ${CUDEC_DEVICE_RUNTIME_TARGET})
+  set_target_properties(cudec PROPERTIES CXX_STANDARD 17
+                                         CXX_STANDARD_REQUIRED ON)
+  cudec_device_target(cudec)
   target_compile_options(
-    cudec PRIVATE ${CUDEC_CUDA_STRICT_FLAGS}
-                  $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>)
+    cudec PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>)
+  # The archive is consumed by executables the HOST linker produces - the C
+  # example here, a consumer's own build - and Ubuntu's g++ links PIE by
+  # default while the ROCm clang emits non-PIE device objects by default, so
+  # a HIP libcudec.a fails that link with an R_X86_64_32S relocation until
+  # its objects are position-independent. Measured on the first container
+  # link of the body (issue #432). Withheld on CUDA on purpose: the host
+  # compiler nvcc drives already defaults to PIE-compatible objects there,
+  # and that configuration's flags stay as they were.
+  if(CUDEC_DEVICE_LANGUAGE STREQUAL "HIP")
+    set_target_properties(cudec PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  endif()
 
   # Keep tests/ after everything that may touch the cudec target: its
   # conformance checks snapshot the target's properties at this point -
@@ -249,10 +407,11 @@ if(CUDEC_ENABLE_CUDA)
   # follows because it consumes targets defined in tests/ and is
   # consumer-only by rule (it links project targets, never modifies them).
   add_subdirectory(tests)
-  # bench_lz4 is a single nvcc-linked binary (bench_lz4.cpp + gpu_bench.cu); it
-  # cannot link the ASan-instrumented cudec without dragging the sanitizer onto
-  # the device link, so the host-only sanitizer gate omits bench entirely. Its
-  # CPU self-checks stay covered by the normal (non-sanitized) build.
+  # bench_lz4 is a single device-linked binary (bench_lz4.cpp + gpu_bench.cu);
+  # it cannot link the ASan-instrumented cudec without dragging the sanitizer
+  # onto the device link, so the host-only sanitizer gate omits bench
+  # entirely. Its CPU self-checks stay covered by the normal (non-sanitized)
+  # build.
   if(NOT CUDEC_SANITIZE)
     add_subdirectory(bench)
   endif()
@@ -260,81 +419,6 @@ if(CUDEC_ENABLE_CUDA)
   # Last, so it sees every directory both subdirectories added: no ctest entry
   # anywhere in the tree may have escaped the timeout check (issue #72).
   cudec_sweep_test_timeouts(${CMAKE_CURRENT_SOURCE_DIR})
-endif()
-
-# ---- The HIP language path (issue #209).
-#
-# Read this before reading the code, because the block is deliberately smaller
-# than it looks like it should be: cudec has NO HIP device sources and no
-# vendor shim yet, so there is no configuration of this option, on any machine,
-# that can produce a HIP build today. The option exists to hold the
-# fail-closed contract while the port is written, and it refuses in two named
-# ways rather than one so that the refusal a reader hits tells them which of
-# the two things is missing.
-#
-# The order is chosen so a runner with no ROCm exercises the toolchain refusal
-# on every PR, and a caller who supplies a compiler reaches the second one -
-# which is what lets the build job gate BOTH arms without a ROCm runner.
-#
-# Nothing between the two refusals: no enable_language, no architecture
-# default, no test registration. Every one of those would be configuration
-# whose result cannot reach a target, and enable_language(HIP) would in
-# addition abort the configure with CMake's own message before the second
-# refusal could name the real reason. They land with the sources they serve.
-if(CUDEC_ENABLE_HIP)
-  # Deliberately NOT check_language(HIP). That module wraps its probe in
-  # `if(NOT DEFINED CMAKE_HIP_COMPILER)`, so a value from a toolchain file, a
-  # superbuild, a -D on the command line, or this build tree's own cache makes
-  # it a silent no-op and the refusal below would be skipped over a compiler
-  # nothing validated. It also FORCE-caches a negative result, which pins a
-  # build directory to "none was found" even after ROCm is installed. Probing
-  # here keeps both properties out: the probe runs every configure, and it
-  # writes no cache entry of its own.
-  set(_cudec_hip_compiler "")
-  if(CMAKE_HIP_COMPILER)
-    set(_cudec_hip_compiler "${CMAKE_HIP_COMPILER}")
-  else()
-    find_program(
-      _cudec_hip_compiler_probe
-      NAMES hipcc
-      HINTS ENV ROCM_PATH /opt/rocm
-      PATH_SUFFIXES bin
-      NO_CACHE)
-    if(_cudec_hip_compiler_probe)
-      set(_cudec_hip_compiler "${_cudec_hip_compiler_probe}")
-    endif()
-  endif()
-
-  if(NOT _cudec_hip_compiler)
-    # ROCm rather than a specific binary: CMake drives the HIP language with a
-    # clang that it locates from the ROCm installation, and rejects some
-    # drivers passed directly as CMAKE_HIP_COMPILER. Naming the toolkit is
-    # what a reader can act on; naming one executable would send them at a
-    # value CMake may refuse.
-    message(
-      FATAL_ERROR
-        "CUDEC_ENABLE_HIP requires a HIP toolchain (a ROCm installation, or "
-        "CMAKE_HIP_COMPILER pointing at a compiler CMake accepts for the HIP "
-        "language) and none was found. This never falls back to a host-only "
-        "build: a configuration that dropped the device engine and still "
-        "succeeded would be a fail-open gate.")
-  endif()
-
-  # The second refusal. It is unconditional on purpose and it is the whole
-  # answer to "what does this option do on a machine that HAS ROCm": it
-  # refuses, because everything it would need to compile is still unwritten.
-  # A configure that succeeded here would hand back a cudec with no decoder in
-  # it and report success, which reads identically to a working port and is
-  # the exact failure this option exists to prevent. The port replaces this
-  # message with the sources, the architecture default and the hip::device
-  # link; until then the message is the contract.
-  message(
-    FATAL_ERROR
-      "CUDEC_ENABLE_HIP found a HIP toolchain (${_cudec_hip_compiler}) but "
-      "cudec carries no HIP device sources yet, so this configuration would "
-      "build a library with no decoder in it and report success. The port "
-      "lands them; until then this option refuses rather than producing a "
-      "build.")
 endif()
 
 # ---- The fuzz gate (issue #140). Opt-in, default OFF, and fail-closed twice
@@ -458,6 +542,14 @@ if(PROJECT_IS_TOP_LEVEL)
     set(CUDEC_PACKAGE_NEEDS_CUDA 1)
   else()
     set(CUDEC_PACKAGE_NEEDS_CUDA 0)
+  endif()
+  # The HIP flavour carries hip::host through the exported interface the same
+  # way, so its config owes the same find_dependency line for the same reason
+  # (issue #432).
+  if(CUDEC_ENABLE_HIP)
+    set(CUDEC_PACKAGE_NEEDS_HIP 1)
+  else()
+    set(CUDEC_PACKAGE_NEEDS_HIP 0)
   endif()
 
   configure_package_config_file(

@@ -19,7 +19,8 @@ void launch_decode(const void* const* d_src_ptrs, const size_t* d_src_sizes,
                    cudec_stream_t stream) {
     cudec_detail::chunk_decode_batch<Parser, false, WaveSize>
         <<<cudec_detail::decode_grid_blocks(chunk_count),
-           cudec_detail::kBlockThreadsFor<WaveSize>, 0, stream>>>(
+           cudec_detail::kBlockThreadsFor<WaveSize>, 0,
+           cudec_rt::stream_from_abi(stream)>>>(
             d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
             d_results);
 }
