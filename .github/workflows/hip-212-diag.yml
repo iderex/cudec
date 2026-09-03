@@ -1,17 +1,20 @@
-# TEMPORARY, issue #212: a diagnostic run, on pushes to this branch only, that
-# prints what each ROCm binary tool sees in the HIP archive's device code, so
-# the instantiation check is written from a reading rather than from memory.
-# Removed before anything merges.
+# TEMPORARY, issue #212: runs the instantiation check inside the production
+# ROCm image on pushes to this branch - the positive, the negative (the
+# 64-wide arm compiled out of src/batch.cu) and the fail-closed legs - so the
+# check is proven to bite before it lands. Removed before anything merges;
+# the standing container job is issue #210's.
 name: hip-212-diag
 
 on:
   push:
     branches: [ci/212-hip-wave-instantiations]
+  pull_request:
+    branches: [main]
 
 permissions: {}
 
 jobs:
-  diag:
+  check:
     name: hip-212-diag
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -34,29 +37,37 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Configure and build the library only (HIP engine)
-        run: >-
-          cmake -B build-hip -DCUDEC_ENABLE_HIP=ON &&
-          cmake --build build-hip -j --target cudec
+      - name: Configure and build (HIP engine)
+        run: cmake -B build-hip -DCUDEC_ENABLE_HIP=ON && cmake --build build-hip -j
 
-      - name: What the tools see
+      - name: Positive, as ctest runs it in the host-side subset
+        run: >-
+          ctest --test-dir build-hip -R '^hip_wave_instantiations$'
+          --no-tests=error --output-on-failure &&
+          ctest --test-dir build-hip -LE gpu -N | grep -E ': hip_wave_instantiations$'
+
+      - name: Fail-closed legs, each must red for the reason it names
         run: |
-          set +e
-          L=/opt/rocm/lib/llvm/bin
+          s=scripts/check-hip-wave-instantiations.sh
           obj=$(find build-hip -name 'batch.cu.o' | head -1)
-          echo "== object: $obj"; ls -l "$obj" build-hip/libcudec.a
-          echo "== llvm tools present"; ls $L | grep -E 'nm$|objdump|objcopy|readelf|offload|bundler|dis'
-          echo "== rocm bin tools"; ls /opt/rocm/bin | grep -E 'roc-obj|bundler'
-          echo "== sections"; $L/llvm-readelf -S "$obj" | grep -i -E 'hip|offload|fatbin|bundle'
-          echo "== host symbols naming the kernel"; $L/llvm-nm "$obj" | grep chunk_decode_batch | $L/llvm-cxxfilt | cut -c1-200
-          echo "== roc-obj-ls -v"; /opt/rocm/bin/roc-obj-ls -v "$obj"; echo "exit=$?"
-          echo "== roc-obj-ls -v on the archive"; /opt/rocm/bin/roc-obj-ls -v build-hip/libcudec.a; echo "exit=$?"
-          echo "== bundler --list --type=o on the object"; $L/clang-offload-bundler --list --type=o --input="$obj"; echo "exit=$?"
-          echo "== dump .hip_fatbin"; $L/llvm-objcopy --dump-section .hip_fatbin=fb.bin "$obj" /dev/null; echo "exit=$?"; ls -l fb.bin; head -c 24 fb.bin | od -c | head -2
-          for t in o bc s hipfb; do echo "== bundler --list --type=$t on fb.bin"; $L/clang-offload-bundler --list --type=$t --input=fb.bin; echo "exit=$?"; done
-          echo "== llvm-objdump --offloading"; $L/llvm-objdump --offloading "$obj"; echo "exit=$?"; ls -la . | grep -v '^d' | head -20
-          echo "== roc-obj extract"; mkdir -p rocobj && /opt/rocm/bin/roc-obj -o rocobj "$obj"; echo "exit=$?"; ls -l rocobj
-          for f in rocobj/*; do echo "== nm $f"; $L/llvm-nm "$f" | grep -i chunk_decode | $L/llvm-cxxfilt | cut -c1-200; done
-          echo "== roc-obj-extract via URIs"; /opt/rocm/bin/roc-obj-ls "$obj" | grep -v host | while read -r n id uri; do echo "$id $uri"; /opt/rocm/bin/roc-obj-extract "$uri"; done; echo "exit=$?"; ls -l *.co 2>/dev/null
-          for f in *.co; do [ -f "$f" ] && { echo "== nm $f"; $L/llvm-nm "$f" | grep -i chunk_decode | $L/llvm-cxxfilt | cut -c1-200; }; done
-          true
+          host=$(find build-hip -name 'version.c.o' | head -1)
+          tools=$(dirname "$(grep '^CMAKE_HIP_COMPILER:' build-hip/CMakeCache.txt | cut -d= -f2)")
+          echo "tools=$tools obj=$obj host=$host"
+          ! bash $s /nonexistent "gfx90a" "$obj" 2>&1 | tee leg1.log; grep -q 'no executable llvm-objdump' leg1.log
+          ! bash $s "$tools" "" "$obj" 2>&1 | tee leg2.log; grep -q 'no offload architectures' leg2.log
+          ! bash $s "$tools" "gfx90a" "$host" 2>&1 | tee leg3.log; grep -q 'no object yielded a code object' leg3.log
+          ! bash $s "$tools" "gfx90a;gfx1234" "$obj" 2>&1 | tee leg4.log; grep -q 'MISSING' leg4.log
+          ! bash $s "$tools" "gfx90a" "/nonexistent.o" 2>&1 | tee leg5.log; grep -q 'object does not exist' leg5.log
+          echo "PASS: five fail-closed legs red for their own reasons"
+
+      - name: Negative, the 64-wide arm compiled out of the batch entry
+        run: |
+          sed -i 's/launch_decode<Parser, cudec_detail::kWaveWidth64>/launch_decode<Parser, cudec_detail::kWaveWidth32>/' src/batch.cu
+          grep -c 'kWaveWidth64>' src/batch.cu || true
+          cmake --build build-hip -j --target cudec
+          if ctest --test-dir build-hip -R '^hip_wave_instantiations$' --no-tests=error --output-on-failure > neg.log 2>&1; then
+            echo "FAIL: the check stayed green with the 64-wide instantiation removed"; cat neg.log; exit 1
+          fi
+          grep -q 'MISSING:Lz4Parser<64>' neg.log && grep -q 'MISSING:SnappyParser<64>' neg.log && ! grep -q 'MISSING:Lz4Parser<32>' neg.log
+          cat neg.log
+          git checkout -- src/batch.cu
