@@ -1,0 +1,56 @@
+# TEMPORARY, issue #244: runs the README's HIP build command AS WRITTEN - the
+# `sh -c` body is read out of README.md by this job, not retyped here - inside
+# the very image the README names, so "documented and works as written" is a
+# run and not a sentence. Removed before the pull request merges; the standing
+# container job is issue #210's.
+name: hip-readme-probe
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  readme:
+    name: hip-readme-probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: rocm/dev-ubuntu-24.04:7.2.4@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # git only, and only for the checkout action: the README's own command
+      # installs cmake itself, and this job must not do that for it.
+      - name: Install git
+        run: >-
+          apt-get update -q -o Acquire::Retries=3 &&
+          apt-get install -yq -o Acquire::Retries=3 --no-install-recommends git
+
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The README names the image this job runs in
+        run: >-
+          grep -c 'rocm/dev-ubuntu-24.04:7.2.4@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054'
+          README.md
+
+      - name: Run the README's HIP command body, verbatim
+        run: |
+          body="$(awk '/^  rocm\/dev-ubuntu-24.04:7.2.4@/{f=1; next} f && /^```/{exit} f{print}' README.md \
+                 | sed -e 's/^ *sh -c "//' -e 's/^ *//' -e 's/ *\\$//' -e 's/"$//' \
+                 | tr '\n' ' ')"
+          echo "README body: $body"
+          test -n "$body"
+          case "$body" in *"cmake -B build-hip -DCUDEC_ENABLE_HIP=ON"*) ;; *) echo "FAIL: the extracted body is not the HIP build"; exit 1;; esac
+          sh -c "$body"
+          test -x build-hip/tests/smoke &&
+          test -x build-hip/bench/bench_lz4 &&
+          test -x build-hip/examples/example_decode_frame &&
+          ctest --test-dir build-hip -N | tail -1
