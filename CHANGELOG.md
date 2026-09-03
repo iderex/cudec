@@ -9,12 +9,16 @@ recorded numbers can observe. Internal refactors, test-net work and process
 changes stay in the git history and in their issues, where they are already
 readable.
 
-No version has been released yet. `include/cudec.h` reports 0.1.0 and no tag
-exists, so the entry below sits under Unreleased rather than under a number and
-a date this project has not chosen: the released heading is the release's to
-write (#82). Everything in it is in the tree today.
+0.1.0 is the first release, cut on 2026-09-03: releases were authorised that
+day (#82), and the tag `v0.1.0` is set on the merge commit of the release pull
+request, which carries the gate readings this entry summarises under Known
+gaps. Everything in the entry is in the tree at that commit.
 
 ## [Unreleased]
+
+Nothing yet.
+
+## [0.1.0] - 2026-09-03
 
 ### Added
 
@@ -153,8 +157,16 @@ write (#82). Everything in it is in the tree today.
 - **Termination.** Every parser call consumes at least one byte, asserted per
   call over the truncation ladder, the mutant corpus and the crafted streams, so
   a decode loop cannot hang the device on any input.
+- **Fuzz-tested, read from a run rather than from a status.** Ten libFuzzer
+  differential targets under `fuzz/` - LZ4 block and frame, Snappy block,
+  GDeflate page, tables and tile stream, Zstd frame, FSE, literals and decode -
+  replay a hash-pinned seed corpus bounded on every pull request and long on a
+  schedule (`.github/workflows/fuzz.yml`). That workflow is not a required
+  check, so the claim is cut from the run on the release pull request's head,
+  which that pull request names with its conclusion and its link, and never
+  from a run older than the commit it is made about.
 - **Structural invariants locked as tests rather than as prose.** The C ABI
-  carries no dependency beyond the CUDA runtime, the decode path is
+  carries no dependency beyond the device runtime, the decode path is
   integer-only, warp collectives may not take their participation metadata from
   parsed input, no bare wave-width literal is allowed outside the line that
   names it, and every ctest entry carries a timeout. These are configure-time
@@ -172,9 +184,16 @@ measured and **rejected**, which is the part a changelog usually loses.
 
 ### Known gaps
 
-- Compute Sanitizer cannot attach to the device on my machine, so
-  the four-tool sweep has never produced a clean run there. The runner script is
-  in the tree and the blocker is tracked; nothing in this release is claimed to
-  have passed it.
-- The GPU tests run on my hardware, not in CI, which has no GPU.
-  CI builds both configurations and runs the host-side subset.
+- **The sanitizer block is empty, and says so.** Compute Sanitizer cannot
+  attach to the device on my machine, which #258 closed with as its negative
+  result, so the four-tool sweep has never produced a run there. The gate is
+  parked and owed, not waived: the runner script is in the tree, #127 holds the
+  block, and nothing in this release is claimed to have passed it. The release
+  pull request records that absence with this reason rather than a coverage no
+  run backs.
+- **The GPU tests run on my hardware, not in CI.** CI builds the host-only,
+  CUDA and HIP configurations and runs the host-side subset on the GPU-less
+  runner; the device gate is a local run. At this release's commit the device
+  was not reachable from the build environment (#418), so the device gate this
+  release stands on is the last one recorded on #82, from 2026-08-25, and not a
+  run on this commit; the release pull request says so in the same words.
