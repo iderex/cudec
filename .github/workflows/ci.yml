@@ -294,6 +294,7 @@ jobs:
           test -x build-cuda/tests/termination_gpu &&
           test -x build-cuda/tests/determinism_gpu &&
           test -x build-cuda/tests/snappy_block_device &&
+          test -x build-cuda/tests/gdeflate_device &&
           test -x build-cuda/examples/example_decode_frame &&
           test -x build-cuda/examples/example_decode_batch
 
@@ -393,7 +394,8 @@ jobs:
           grep -E ': stream_twin$' gpu-deferred.txt &&
           grep -E ': termination_gpu$' gpu-deferred.txt &&
           grep -E ': determinism_gpu$' gpu-deferred.txt &&
-          grep -E ': snappy_block_device$' gpu-deferred.txt
+          grep -E ': snappy_block_device$' gpu-deferred.txt &&
+          grep -E ': gdeflate_device$' gpu-deferred.txt
 
   hip:
     # The job name is the required-check context the ruleset will name once
@@ -451,6 +453,7 @@ jobs:
           test -x build-hip/tests/termination_gpu &&
           test -x build-hip/tests/determinism_gpu &&
           test -x build-hip/tests/snappy_block_device &&
+          test -x build-hip/tests/gdeflate_device &&
           test -x build-hip/tests/wave_width_gpu &&
           test -x build-hip/bench/bench_lz4 &&
           test -x build-hip/bench/bench_snappy &&
@@ -489,6 +492,7 @@ jobs:
           grep -E ': termination_gpu$' hip-gpu-deferred.txt &&
           grep -E ': determinism_gpu$' hip-gpu-deferred.txt &&
           grep -E ': snappy_block_device$' hip-gpu-deferred.txt &&
+          grep -E ': gdeflate_device$' hip-gpu-deferred.txt &&
           grep -E ': wave_width_gpu$' hip-gpu-deferred.txt
 
   sanitize:

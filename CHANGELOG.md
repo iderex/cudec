@@ -16,7 +16,20 @@ gaps. Everything in the entry is in the tree at that commit.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **GDeflate page batch decode on the GPU.** `cudec_gdeflate_decompress_batch`
+  decodes N independent raw GDeflate pages in one launch, one warp per page
+  with the 32 lanes as the format's 32 substreams, into caller-provided tiles
+  with a per-page `cudec_chunk_result`. The symbol, the signature and every
+  argument-reject class are the ones frozen in 0.1.0; only the answer to an
+  accepted batch moved, from `CUDEC_ERR_NOT_IMPLEMENTED` to the decode. A page
+  the decoder refuses reports `CUDEC_ERR_CORRUPT_INPUT`, or
+  `CUDEC_ERR_OUTPUT_TOO_SMALL` where the refusal is against the supplied
+  capacity, with `bytes_written` zero. The kernel runs the same block loop the
+  CPU twin runs, so the oracle parity and the reject ladder recorded for the
+  twin hold for the kernel by construction; the device test holds both to it,
+  page for page. No throughput is claimed for it yet.
 
 ## [0.1.0] - 2026-09-03
 

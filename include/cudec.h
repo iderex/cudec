@@ -35,9 +35,10 @@ typedef enum cudec_status {
      * in this build. It is what a declared-but-unbuilt entry answers a
      * batch it has already accepted, so the freeze on that entry's symbol
      * and signature never depends on a build configuration:
-     * cudec_gdeflate_decompress_batch returns it today, and the value is
-     * fixed so a caller's switch stays exhaustive across the build that
-     * stops returning it. */
+     * cudec_zstd_decompress_batch returns it today, and the value is fixed
+     * so a caller's switch stays exhaustive across the build that stops
+     * returning it - which cudec_gdeflate_decompress_batch did when its
+     * kernel landed, with the symbol and every reject class unmoved. */
     CUDEC_ERR_NOT_IMPLEMENTED = 5,
     /* A well-formed frame that uses a feature cudec does not decode, or a
      * legal frame type it declines (block-linked mode, a dictionary id, a
@@ -183,17 +184,14 @@ cudec_status cudec_snappy_decompress_batch(const void* const* d_src_ptrs,
  * malformed page, CUDEC_ERR_OUTPUT_TOO_SMALL when the decode would pass
  * the supplied capacity, bytes_written == 0 on either, and the
  * destination contents then unspecified but never presented as a valid
- * decode.
+ * decode. A page is decoded by one warp, its 32 lanes being the format's
+ * 32 substreams, and a page that overlaps another chunk's destination is
+ * the caller's error exactly as it is for the two entries above.
  *
- * THIS BUILD CARRIES NO GDEFLATE KERNEL, AND THAT IS A DEFINED STATUS
- * RATHER THAN AN ABSENT SYMBOL. A batch that passes the validation above
- * returns CUDEC_ERR_NOT_IMPLEMENTED, having made no CUDA call at all - so
- * this entry, unlike the two above, also leaves the thread's pending CUDA
- * error state untouched on a call it accepts. The symbol, the signature
- * and every reject class above are frozen now and do not move when the
- * kernel lands; only the answer to an accepted batch does. A symbol that
- * was absent instead would make the freeze conditional on a build
- * configuration, which is two contracts wearing one name. */
+ * The contract was frozen before the kernel stood behind it, and the
+ * freeze held: the symbol, the signature and every reject class above did
+ * not move when the kernel landed; only the answer to an accepted batch
+ * did, from CUDEC_ERR_NOT_IMPLEMENTED to the launch. */
 cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
                                              const size_t* d_src_sizes,
                                              void* const* d_dst_ptrs,

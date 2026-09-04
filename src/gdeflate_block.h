@@ -28,6 +28,20 @@
  * thirty-two rounds after end-of-block exist to drain the copies still
  * outstanding when the block ended.
  *
+ * ONE ROUND BODY FOR BOTH RESIDENCIES (issue #214). The loop below is written
+ * over the team contract at GDeflateHostTeam in src/gdeflate_tables.h: every
+ * lane resolves its symbol speculatively, the team names the first lane that
+ * hit end-of-block, and each lane commits only if it sits at or below that
+ * lane - a lane that must not have consumed keeps the bits it entered the
+ * round with, which is a select rather than a rollback (masterplan 13.2). The
+ * lanes above the end-of-block lane take the drain's first steps in the same
+ * round, and one more round over the lanes below it takes the rest, which is
+ * the reference's thirty-two drain steps starting at the end-of-block lane
+ * and read off in that order. Output positions come from the team in lane
+ * order, and the copies of one round are performed in lane order, because a
+ * copy's source lies before its own reservation and a lower lane's
+ * reservation of the same round may be what it reads.
+ *
  * FAIL-CLOSED, AND WHERE THE BOUNDS COME FROM. Every length is checked against
  * the output that remains before any byte is written, every distance is
  * checked against the output already produced before any byte is read, and the
@@ -114,11 +128,16 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflateDistExtra(uint32_t sym) {
  * DEFLATE64 divergences, which move bases and extra bits rather than codeword
  * lengths). Built through the same construction every other table goes
  * through, so a static block and a dynamic block share one decoder. */
-CUDEC_HOST_DEVICE inline bool GDeflateStaticTables(GDeflateLitLenTable& litlen,
+CUDEC_HOST_DEVICE inline bool GDeflateStaticTables(GDeflateCodeLengths& scratch,
+                                                   GDeflateLitLenTable& litlen,
                                                    GDeflateDistTable& dist,
                                                    GDeflateReject* why =
                                                        nullptr) {
-    unsigned char lens[kGDeflateNumLitLenSyms];
+    /* The fixed lengths are written into the team's code-length buffer rather
+     * than a local array: on the device a local array of the alphabet's size
+     * is a per-thread stack frame paid on every page, static block or not,
+     * and the buffer is idle during a static block by construction. */
+    unsigned char* lens = scratch.lens;
     for (uint32_t i = 0; i < kGDeflateNumLitLenSyms; i++) {
         if (i < 144) {
             lens[i] = 8;
@@ -133,109 +152,145 @@ CUDEC_HOST_DEVICE inline bool GDeflateStaticTables(GDeflateLitLenTable& litlen,
     if (!GDeflateBuildTable(lens, kGDeflateNumLitLenSyms, litlen, why)) {
         return false;
     }
-    unsigned char dist_lens[kGDeflateNumDistSyms];
+    unsigned char* dist_lens = scratch.lens + kGDeflateNumLitLenSyms;
     for (uint32_t i = 0; i < kGDeflateNumDistSyms; i++) {
         dist_lens[i] = 5;
     }
     return GDeflateBuildTable(dist_lens, kGDeflateNumDistSyms, dist, why);
 }
 
-/* One lane's outstanding match: the length it reserved and where in the output
- * that reservation starts. Held per lane for the reason GDeflateSchedule holds
- * all 32 bit buffers - the CPU twin runs the lanes sequentially in one thread,
- * while in the warp kernel each lane owns its own copy state in registers. The
- * reference keeps the same thing as a rotating 32-bit mask beside a per-lane
- * array; a mask and a flag per lane are the same set, and the flag is the
- * shape that reads correctly in both residencies. */
-struct GDeflateDeferredCopy {
-    uint64_t out_pos;
-    uint32_t length;
-    bool pending;
+/* What a page turned out to hold: how many blocks, of which types, producing
+ * how many bytes each. It is what the decode produced rather than
+ * bookkeeping: a page is one block or several and nothing outside says which,
+ * so without this the multi-block case cannot be told from the single-block
+ * one by anything that reads a decode. A block boundary inside a page is not
+ * findable by scanning (docs/MASTERPLAN.md section 11.3), so a decode that
+ * walked to a block is the only thing that can attribute a byte to its type,
+ * and without this the attribution is unreadable from outside (issue #206).
+ * Written only on a successful decode. */
+struct GDeflateCensus {
+    uint32_t blocks;
+    uint32_t type_blocks[kGDeflateBlockTypeCount];
+    uint64_t type_bytes[kGDeflateBlockTypeCount];
 };
 
-/* Everything a page decode carries: the schedule, the two live tables, and the
- * 32 deferred copies. */
+/* Everything a sequential page decode carries: the schedule, the two live
+ * tables, the code-length vector, and the census. The deferred copies live in
+ * the team. */
 struct GDeflatePageState {
     GDeflateSchedule s;
     GDeflateLitLenTable litlen;
     GDeflateDistTable dist;
     GDeflateCodeLengths lens;
-    GDeflateDeferredCopy copies[kGDeflateNumStreams];
-    /* How many blocks the page turned out to hold. It is what the decode
-     * produced rather than bookkeeping: a page is one block or several and
-     * nothing outside says which, so without this the multi-block case cannot
-     * be told from the single-block one by anything that reads a decode. */
+    /* The census, flattened into this struct for the readers that had it
+     * here before the rounds moved into the team. */
     uint32_t blocks;
-    /* What the page turned out to be MADE OF, in the same sense `blocks` is
-     * what it turned out to hold: how many blocks of each type it carried and
-     * how many output bytes each type produced, indexed by the BTYPE
-     * constants above. A block boundary inside a page is not findable by
-     * scanning (docs/MASTERPLAN.md section 11.3), so a decode that walked to
-     * a block is the only thing that can attribute a byte to its type, and
-     * without this the attribution is unreadable from outside (issue #206).
-     * Written only on a successful decode, like `blocks`. */
     uint32_t type_blocks[kGDeflateBlockTypeCount];
     uint64_t type_bytes[kGDeflateBlockTypeCount];
 };
 
-/* Perform the copy the current lane reserved: decode the distance symbol off
- * this lane, add its extra bits, and move the bytes. */
-CUDEC_HOST_DEVICE inline bool GDeflateDoCopy(GDeflatePageState& st,
-                                             unsigned char* out) {
-    GDeflateSchedule& s = st.s;
-    GDeflateDeferredCopy& c = st.copies[s.idx];
-    const uint32_t sym = GDeflateDecodeSymbol(s, st.dist);
-    if (sym == kGDeflateNoSymbol) {
-        return false;
+/* What one lane resolved for the round ahead of it, before anything is
+ * committed: the symbol, how many bits it and its extra field span, the length
+ * or offset those extra bits complete, and the rung the read refused on. */
+struct GDeflateLaneStep {
+    GDeflateLaneRead read;
+    uint32_t sym;
+    uint32_t value;
+};
+
+/* Resolve the current lane's next literal/length symbol and, for a length,
+ * the extra bits behind it, consuming nothing. */
+template <class Team>
+CUDEC_HOST_DEVICE inline GDeflateLaneStep GDeflateResolveLitLen(Team& lane) {
+    GDeflateLaneStep step;
+    step.read.consumed = 0;
+    step.read.why = kGDeflateRejectNone;
+    step.value = 0;
+    const uint64_t buf = lane.Bits().Buf();
+    const uint32_t left = lane.Bits().Left();
+    step.sym = GDeflateResolveSymbol(lane.LitLen(), buf, left, step.read);
+    if (step.read.why == kGDeflateRejectNone &&
+        step.sym >= kGDeflateFirstLengthSym) {
+        const uint32_t index = step.sym - kGDeflateFirstLengthSym;
+        step.value = GDeflateLengthBase(index) +
+                     GDeflateReadAhead(buf, left, step.read,
+                                       GDeflateLengthExtra(index));
     }
-    const uint32_t offset = GDeflateDistBase(sym) +
-                            GDeflatePop(s, GDeflateDistExtra(sym));
-    if (s.failed) {
-        return false;
+    return step;
+}
+
+/* Resolve the current lane's distance symbol and its extra bits, which
+ * together are the offset of the copy this lane reserved, consuming nothing. */
+template <class Team>
+CUDEC_HOST_DEVICE inline GDeflateLaneStep GDeflateResolveDist(Team& lane) {
+    GDeflateLaneStep step;
+    step.read.consumed = 0;
+    step.read.why = kGDeflateRejectNone;
+    step.value = 0;
+    const uint64_t buf = lane.Bits().Buf();
+    const uint32_t left = lane.Bits().Left();
+    step.sym = GDeflateResolveSymbol(lane.Dist(), buf, left, step.read);
+    if (step.read.why == kGDeflateRejectNone) {
+        step.value = GDeflateDistBase(step.sym) +
+                     GDeflateReadAhead(buf, left, step.read,
+                                       GDeflateDistExtra(step.sym));
     }
+    return step;
+}
+
+/* What one lane does in a symbol round, decided after the team has named the
+ * end-of-block lane. */
+enum GDeflateLaneMode {
+    kGDeflateLaneIdle = 0,
+    kGDeflateLaneLiteral,
+    kGDeflateLaneReserve,
+    kGDeflateLaneEndOfBlock,
+    kGDeflateLaneCopy
+};
+
+/* Retire the current lane's reservation: commit the distance read, check the
+ * source against the output this page has produced, and hand the copy to the
+ * team. One function because the symbol round and the drain round both retire
+ * copies, and a rung named at two sites is what the ladder lock refuses. */
+template <class Team>
+CUDEC_HOST_DEVICE inline bool GDeflateRetireCopy(Team& lane,
+                                                 const GDeflateLaneStep& step,
+                                                 GDeflateDeferredCopy& c) {
+    auto& b = lane.Bits();
+    if (step.read.why != kGDeflateRejectNone) {
+        return GDeflateRefuseAs(b, step.read.why);
+    }
+    GDeflateRemove(b, step.read.consumed);
     /* The match source may not begin before this page's output. Compared in
      * the 64-bit width the output position is carried in, so the comparison
-     * cannot be the place a narrowing hides: `offset` is at most 65536 and
+     * cannot be the place a narrowing hides: the offset is at most 65536 and
      * `c.out_pos` is where the reservation started. */
-    if (static_cast<uint64_t>(offset) > c.out_pos) {
-        return GDeflateRefuse(s, kGDeflateRejectMatchBeforeOutput);
-    }
-    const uint64_t src = c.out_pos - offset;
-    /* Byte by byte, forwards, which is what an overlapping match MEANS: a
-     * distance below the length is a run that repeats what this copy is itself
-     * writing. A word-at-a-time copy would have to special-case that; this
-     * does not, and it is the same order on both residencies, which is what
-     * makes the output bit-identical (docs/DETERMINISM.md). */
-    for (uint32_t n = 0; n < c.length; n++) {
-        out[c.out_pos + n] = out[src + n];
+    if (static_cast<uint64_t>(step.value) > c.out_pos) {
+        return GDeflateRefuse(b, kGDeflateRejectMatchBeforeOutput);
     }
     c.pending = false;
     return true;
 }
 
-/* Decode one page into `out`, which is the tile it belongs to. Returns false
- * with the schedule failed for every page this decoder refuses; `*out_len` is
- * written only on success.
+/* Decode one page into `out`, which is the tile it belongs to, over the team
+ * `t`. Returns false with the team failed for every page this decoder refuses;
+ * `*out_len` and `census` are written only on success.
  *
  * `out_cap` is the caller's capacity and is the only bound the output is
  * checked against. It is never derived from the page: the format states no
  * uncompressed size anywhere inside a page, which is why the tile size lives
  * in the stream header that src/tilestream.h parses. */
-CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
-                                                 const unsigned char* page,
-                                                 uint64_t page_bytes,
-                                                 unsigned char* out,
-                                                 uint64_t out_cap,
-                                                 uint64_t* out_len) {
-    GDeflateSchedule& s = st.s;
-    if (!GDeflateInit(s, page, page_bytes)) {
+template <class Team>
+CUDEC_HOST_DEVICE inline bool GDeflateDecodePageRounds(Team& t,
+                                                       uint64_t page_bytes,
+                                                       unsigned char* out,
+                                                       uint64_t out_cap,
+                                                       uint64_t* out_len,
+                                                       GDeflateCensus* census) {
+    if (!t.Prime(page_bytes)) {
         return false;
     }
-    for (uint32_t n = 0; n < kGDeflateNumStreams; n++) {
-        st.copies[n].pending = false;
-        st.copies[n].length = 0;
-        st.copies[n].out_pos = 0;
-    }
+    t.ClearCopies();
     uint64_t out_pos = 0;
 
     /* A block costs lane 0 at least the three bits of its own header, and a
@@ -245,7 +300,7 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
      * therefore generous by a wide margin and exists to make termination a
      * property of the code rather than of an argument about the input. */
     const uint64_t block_fuel =
-        (s.word_count + 1u) * (kGDeflateMaxLaneBits / kGDeflateMinMatchLen);
+        (t.WordCount() + 1u) * (kGDeflateMaxLaneBits / kGDeflateMinMatchLen);
     bool final_block = false;
     uint32_t blocks_read = 0;
     uint32_t type_blocks[kGDeflateBlockTypeCount] = {0, 0, 0};
@@ -253,16 +308,29 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
     for (uint64_t block = 0; block < block_fuel && !final_block; block++) {
         blocks_read++;
         const uint64_t block_out_start = out_pos;
-        GDeflateReset(s);
-        final_block = GDeflatePop(s, 1) != 0;
-        const uint32_t block_type = GDeflatePop(s, 2);
-        if (s.failed) {
+        t.Reset();
+        /* BFINAL and BTYPE ride lane 0 and every lane needs them, packed into
+         * one word for one broadcast. */
+        uint32_t header = 0;
+        t.Lane0([&](Team& lane0) {
+            auto& b = lane0.Bits();
+            const uint32_t bfinal = GDeflatePop(b, 1);
+            const uint32_t type = GDeflatePop(b, 2);
+            header = bfinal | (type << 1);
+        });
+        header = t.Broadcast(header);
+        if (t.Failed()) {
             return false;
         }
-        GDeflateEnsure(s, page);
+        final_block = (header & 1u) != 0;
+        const uint32_t block_type = header >> 1;
+        t.EnsureLane0();
+        if (t.Failed()) {
+            return false;
+        }
 
         if (block_type == kGDeflateBlockReserved) {
-            return GDeflateRefuse(s, kGDeflateRejectBlockTypeReserved);
+            return GDeflateRefuse(t.Bits(), kGDeflateRejectBlockTypeReserved);
         }
 
         if (block_type == kGDeflateBlockStored) {
@@ -279,10 +347,14 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
              * check on this side could not be reached by any page and a guard
              * that cannot bite proves nothing. */
             const uint64_t reachable =
-                (s.word_count - s.cursor) * (kGDeflateBitsPerPacket / 8u) +
-                (GDeflateBufferedBits(s) + 7u) / 8u;
-            const uint32_t len = GDeflatePop(s, 16);
-            if (s.failed) {
+                (t.WordCount() - t.Cursor()) * (kGDeflateBitsPerPacket / 8u) +
+                (t.BufferedBits() + 7u) / 8u;
+            uint32_t len = 0;
+            t.Lane0([&](Team& lane0) {
+                len = GDeflatePop(lane0.Bits(), 16);
+            });
+            len = t.Broadcast(len);
+            if (t.Failed()) {
                 return false;
             }
             /* Two rungs rather than one condition, for the reason the pop
@@ -291,113 +363,195 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
              * can still supply are different defects, and a single rung would
              * let a negative for either stand in for the other. */
             if (len > out_cap - out_pos) {
-                return GDeflateRefuse(s, kGDeflateRejectStoredPastCap);
+                return GDeflateRefuse(t.Bits(), kGDeflateRejectStoredPastCap);
             }
             if (len > reachable) {
-                return GDeflateRefuse(s, kGDeflateRejectStoredPastPage);
+                return GDeflateRefuse(t.Bits(), kGDeflateRejectStoredPastPage);
             }
-            for (uint32_t n = 0; n < len; n++) {
-                out[out_pos] = static_cast<unsigned char>(GDeflatePop(s, 8));
-                out_pos++;
-                GDeflateAdvance(s, page);
-            }
-            if (s.failed) {
-                return false;
+            /* One byte per lane per round, lane order, each byte's lane
+             * refilled behind it: the reference's byte loop, thirty-two at a
+             * time. */
+            for (uint32_t done = 0; done < len;) {
+                const uint32_t batch = (len - done < kGDeflateNumStreams)
+                                           ? (len - done)
+                                           : kGDeflateNumStreams;
+                t.Round(batch, [&](Team& lane) -> bool {
+                    if (!lane.Active()) {
+                        return false;
+                    }
+                    const uint32_t byte = GDeflatePop(lane.Bits(), 8);
+                    if (!lane.Bits().failed) {
+                        out[out_pos + lane.Lane()] =
+                            static_cast<unsigned char>(byte);
+                    }
+                    return true;
+                });
+                if (t.Failed()) {
+                    return false;
+                }
+                out_pos += batch;
+                done += batch;
             }
         } else {
             if (block_type == kGDeflateBlockStatic) {
-                GDeflateReject static_why = kGDeflateRejectNone;
-                if (!GDeflateStaticTables(st.litlen, st.dist, &static_why)) {
-                    return GDeflateRefuseAs(s, static_why);
+                t.Build([&](Team& one) {
+                    GDeflateReject static_why = kGDeflateRejectNone;
+                    if (!GDeflateStaticTables(one.Lens(), one.LitLen(),
+                                              one.Dist(), &static_why)) {
+                        GDeflateRefuseAs(one.Bits(), static_why);
+                    }
+                });
+                if (t.Failed()) {
+                    return false;
                 }
-            } else if (!GDeflateReadDynamicTables(s, page, st.lens, st.litlen,
-                                                  st.dist)) {
+            } else if (!GDeflateReadDynamicTableRounds(t)) {
                 return false;
             }
 
-            GDeflateReset(s);
-            /* Every round either writes a byte, reserves a match of at least
-             * the minimum length, or retires a reservation an earlier round
-             * made - so the capacity bounds the reserving rounds and the
-             * retiring rounds alike, and the end-of-block round and the drain
-             * are the constant beside them. */
-            const uint64_t round_fuel = 2u * (out_cap + 1u) + kGDeflateNumStreams;
+            t.Reset();
+            /* Every step either writes a byte, reserves a match of at least
+             * the minimum length, or retires a reservation an earlier step
+             * made - so the capacity bounds the reserving steps and the
+             * retiring steps alike, and the end-of-block step and the drain
+             * are the constant beside them. A round is up to a lane's worth
+             * of steps, so the same cap counted in rounds is wider still. */
+            const uint64_t round_fuel =
+                (out_cap > (UINT64_MAX - kGDeflateNumStreams) / 2u - 1u)
+                    ? UINT64_MAX
+                    : 2u * (out_cap + 1u) + kGDeflateNumStreams;
             bool block_done = false;
             for (uint64_t round = 0; round < round_fuel && !block_done;
                  round++) {
-                if (st.copies[s.idx].pending) {
-                    if (!GDeflateDoCopy(st, out)) {
-                        return false;
+                uint32_t eob_lane = kGDeflateNoLane;
+                t.Round(kGDeflateNumStreams, [&](Team& lane) -> bool {
+                    GDeflateDeferredCopy& c = lane.Copy();
+                    const bool active = lane.Active();
+                    const bool pending = active && c.pending;
+                    GDeflateLaneStep step;
+                    step.read.consumed = 0;
+                    step.read.why = kGDeflateRejectNone;
+                    step.sym = kGDeflateNoSymbol;
+                    step.value = 0;
+                    if (pending) {
+                        step = GDeflateResolveDist(lane);
+                    } else if (active) {
+                        step = GDeflateResolveLitLen(lane);
                     }
-                    GDeflateAdvance(s, page);
-                    if (s.failed) {
-                        return false;
+                    /* The end-of-block lane is the lowest lane that resolved
+                     * code 256 while holding no reservation; a lane above it
+                     * must not have consumed, so it takes a drain step
+                     * instead, and the reference leaves the loop AT that lane
+                     * without advancing, so the drain starts there. */
+                    const bool hit_eob = !pending && active &&
+                                         step.read.why == kGDeflateRejectNone &&
+                                         step.sym == kGDeflateEndOfBlock;
+                    const uint32_t first_eob = lane.FirstLane(hit_eob);
+                    eob_lane = first_eob;
+                    GDeflateLaneMode mode = kGDeflateLaneIdle;
+                    if (pending) {
+                        mode = kGDeflateLaneCopy;
+                    } else if (active && lane.Lane() < first_eob) {
+                        mode = (step.read.why != kGDeflateRejectNone ||
+                                step.sym < kGDeflateEndOfBlock)
+                                   ? kGDeflateLaneLiteral
+                                   : kGDeflateLaneReserve;
+                    } else if (active && lane.Lane() == first_eob) {
+                        mode = kGDeflateLaneEndOfBlock;
                     }
-                    continue;
-                }
-                const uint32_t sym = GDeflateDecodeSymbol(s, st.litlen);
-                if (sym == kGDeflateNoSymbol) {
+                    /* The reservation, not the copy: the distance symbol this
+                     * match needs arrives on this same lane one round of its
+                     * own later, and the output cursor moves past the hole
+                     * now so the rounds in between write after it. A literal
+                     * claims its one byte the same way. */
+                    uint64_t claim = 0;
+                    if (mode == kGDeflateLaneLiteral) {
+                        claim = 1;
+                    } else if (mode == kGDeflateLaneReserve &&
+                               step.read.why == kGDeflateRejectNone) {
+                        claim = step.value;
+                    }
+                    const uint64_t pos = lane.Claim(out_pos, claim);
+                    bool copy_now = false;
+                    if (mode == kGDeflateLaneCopy) {
+                        copy_now = GDeflateRetireCopy(lane, step, c);
+                    } else if (mode != kGDeflateLaneIdle) {
+                        auto& b = lane.Bits();
+                        if (step.read.why != kGDeflateRejectNone) {
+                            GDeflateRefuseAs(b, step.read.why);
+                        } else {
+                            GDeflateRemove(b, step.read.consumed);
+                            if (mode == kGDeflateLaneLiteral) {
+                                if (pos >= out_cap) {
+                                    GDeflateRefuse(b, kGDeflateRejectLiteralPastCap);
+                                } else {
+                                    out[pos] =
+                                        static_cast<unsigned char>(step.sym);
+                                }
+                            } else if (mode == kGDeflateLaneReserve) {
+                                /* `pos` can exceed the capacity only on the
+                                 * warp, behind a lower lane that refused in
+                                 * this round and whose claim still moved the
+                                 * base; the team fails at the round's end,
+                                 * but the reservation must not be recorded
+                                 * past the tile even for that one round. */
+                                if (pos > out_cap ||
+                                    step.value > out_cap - pos) {
+                                    GDeflateRefuse(b, kGDeflateRejectMatchPastCap);
+                                } else {
+                                    c.pending = true;
+                                    c.length = step.value;
+                                    c.out_pos = pos;
+                                }
+                            }
+                        }
+                    }
+                    lane.CopyBytes(copy_now && !lane.Bits().failed, out,
+                                   c.out_pos, c.out_pos - step.value,
+                                   c.length);
+                    /* Every lane of the round steps, drain steps included:
+                     * the reference advances after each of the thirty-two
+                     * drain iterations whether or not that lane held a
+                     * reservation. */
+                    return active;
+                });
+                if (t.Failed()) {
                     return false;
                 }
-                if (sym < kGDeflateEndOfBlock) {
-                    if (out_pos == out_cap) {
-                        return GDeflateRefuse(s, kGDeflateRejectLiteralPastCap);
-                    }
-                    out[out_pos] = static_cast<unsigned char>(sym);
-                    out_pos++;
-                    GDeflateAdvance(s, page);
-                    if (s.failed) {
+                if (eob_lane != kGDeflateNoLane) {
+                    /* The rest of the drain: the lanes below the end-of-block
+                     * lane, in order, each retiring what it still holds. */
+                    t.Round(eob_lane, [&](Team& lane) -> bool {
+                        GDeflateDeferredCopy& c = lane.Copy();
+                        const bool active = lane.Active();
+                        const bool pending = active && c.pending;
+                        GDeflateLaneStep step;
+                        step.read.consumed = 0;
+                        step.read.why = kGDeflateRejectNone;
+                        step.sym = kGDeflateNoSymbol;
+                        step.value = 0;
+                        if (pending) {
+                            step = GDeflateResolveDist(lane);
+                        }
+                        bool copy_now = false;
+                        if (pending) {
+                            copy_now = GDeflateRetireCopy(lane, step, c);
+                        }
+                        lane.CopyBytes(copy_now && !lane.Bits().failed, out,
+                                       c.out_pos, c.out_pos - step.value,
+                                       c.length);
+                        return active;
+                    });
+                    if (t.Failed()) {
                         return false;
                     }
-                    continue;
-                }
-                if (sym == kGDeflateEndOfBlock) {
-                    /* The reference leaves the loop here WITHOUT advancing:
-                     * the drain below starts on this lane, not the next. */
                     block_done = true;
-                    continue;
-                }
-                const uint32_t index = sym - kGDeflateFirstLengthSym;
-                const uint32_t length =
-                    GDeflateLengthBase(index) +
-                    GDeflatePop(s, GDeflateLengthExtra(index));
-                if (s.failed) {
-                    return false;
-                }
-                if (length > out_cap - out_pos) {
-                    return GDeflateRefuse(s, kGDeflateRejectMatchPastCap);
-                }
-                /* The reservation, not the copy. The distance symbol this
-                 * match needs arrives on this same lane one round of its own
-                 * later, and the output cursor moves past the hole now so the
-                 * rounds in between write after it. */
-                st.copies[s.idx].pending = true;
-                st.copies[s.idx].length = length;
-                st.copies[s.idx].out_pos = out_pos;
-                out_pos += length;
-                GDeflateAdvance(s, page);
-                if (s.failed) {
-                    return false;
                 }
             }
             if (!block_done) {
                 /* The round cap was reached with no end-of-block. A page that
                  * ran that far has produced more rounds than its own capacity
                  * admits, so it is refused rather than reported as a decode. */
-                return GDeflateRefuse(s, kGDeflateRejectRoundFuelExhausted);
-            }
-
-            /* The drain: one round per lane, retiring whatever is still
-             * outstanding. A block that ends with copies pending is the normal
-             * case rather than an error - up to 31 lanes can hold one. */
-            for (uint32_t n = 0; n < kGDeflateNumStreams; n++) {
-                if (st.copies[s.idx].pending && !GDeflateDoCopy(st, out)) {
-                    return false;
-                }
-                GDeflateAdvance(s, page);
-                if (s.failed) {
-                    return false;
-                }
+                return GDeflateRefuse(t.Bits(), kGDeflateRejectRoundFuelExhausted);
             }
         }
 
@@ -411,14 +565,35 @@ CUDEC_HOST_DEVICE inline bool GDeflateDecodePage(GDeflatePageState& st,
         type_bytes[block_type] += out_pos - block_out_start;
     }
     if (!final_block) {
-        return GDeflateRefuse(s, kGDeflateRejectNoFinalBlock);
+        return GDeflateRefuse(t.Bits(), kGDeflateRejectNoFinalBlock);
     }
-    st.blocks = blocks_read;
+    census->blocks = blocks_read;
     for (uint32_t n = 0; n < kGDeflateBlockTypeCount; n++) {
-        st.type_blocks[n] = type_blocks[n];
-        st.type_bytes[n] = type_bytes[n];
+        census->type_blocks[n] = type_blocks[n];
+        census->type_bytes[n] = type_bytes[n];
     }
     *out_len = out_pos;
+    return true;
+}
+
+/* The sequential entry point, which the twins, the fuzz targets and the bench
+ * drive: the rounds above over the host team, and the census copied into the
+ * state where those readers find it. */
+inline bool GDeflateDecodePage(GDeflatePageState& st,
+                               const unsigned char* page, uint64_t page_bytes,
+                               unsigned char* out, uint64_t out_cap,
+                               uint64_t* out_len) {
+    GDeflateHostTeam t(st.s, page, &st.lens, &st.litlen, &st.dist);
+    GDeflateCensus census;
+    if (!GDeflateDecodePageRounds(t, page_bytes, out, out_cap, out_len,
+                                  &census)) {
+        return false;
+    }
+    st.blocks = census.blocks;
+    for (uint32_t n = 0; n < kGDeflateBlockTypeCount; n++) {
+        st.type_blocks[n] = census.type_blocks[n];
+        st.type_bytes[n] = census.type_bytes[n];
+    }
     return true;
 }
 
