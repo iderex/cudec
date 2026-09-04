@@ -243,6 +243,16 @@ target_include_directories(gdeflate_departure_lock
 # src/ for the twin it compares against.
 cudec_add_test(gdeflate_device SOURCES gdeflate_device.cu GPU LIBS
                gdeflate_oracle)
+# The standing device gate set for the GDeflate path (issue #218): determinism
+# across launch geometries and concurrent streams, two-directional mutant
+# reject parity against the reference, the crafted reject ladder driven through
+# the host twin and the kernel on the same bytes, and the capacity
+# adversarials at and beyond the format's 64 KiB tile. Every decode in it is
+# fenced with an event and a wall-clock deadline, so a page that held a launch
+# is reported rather than waited on. GPU-labelled and linking gdeflate_oracle,
+# for the reasons its neighbour above gives.
+cudec_add_test(gdeflate_gate_gpu SOURCES gdeflate_gate_gpu.cu GPU LIBS
+               gdeflate_oracle)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.
