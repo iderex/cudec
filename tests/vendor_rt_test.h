@@ -15,12 +15,21 @@
  * line of it, and is the single exemption of the tests/-side rule that
  * mirrors #240's (issue #243).
  *
- * WHAT THIS FILE DOES NOT CLAIM. No hipcc has compiled the HIP arm below, for
- * the same reason src/vendor_rt.h states about its own: no ROCm toolchain
- * exists on the machine this landed from. The two arms are proven CONSISTENT
- * - the configure-time rule in tests/CMakeLists.txt reds when one arm carries
- * an entry the other does not - and are NOT proven CORRECT. Issue #210 is the
- * route to the compiler that would decide it.
+ * WHAT THIS FILE DOES NOT CLAIM, AND THE FIRST HALF OF IT HAS EXPIRED. It
+ * said no hipcc had compiled the HIP arm below. One does now, on every pull
+ * request: the CI hip job builds this harness in a digest-pinned ROCm image
+ * (issue #210), so the arm typechecks under a HIP compiler and a name this
+ * table spells wrongly enough to break compilation reds there.
+ *
+ * WHAT THE COMPILER DID NOT DECIDE IS THE PART THAT MATTERS, and the note it
+ * replaces was right about it. The two arms are proven CONSISTENT - the
+ * configure-time rule in tests/CMakeLists.txt reds when one arm carries an
+ * entry the other does not - and are still NOT proven CORRECT: a name mapped
+ * to the WRONG HIP entry point of the right shape compiles clean on both
+ * backends and reds only where the call runs. No AMD device has ever executed
+ * any of it, which is issue #415 and the runbook at docs/AMD-VALIDATION.md,
+ * and #210 is no longer the route to that answer because a compiler was never
+ * going to be one.
  *
  * INTERNAL to the test harness; nothing here is part of the public C ABI. */
 #ifndef CUDEC_TESTS_VENDOR_RT_TEST_H
