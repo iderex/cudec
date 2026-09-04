@@ -1,0 +1,124 @@
+# No AMD GPU has ever executed this project, so every AMD result comes from
+# somebody else's hardware and arrives once. A throughput number in a comment
+# with the hardware unstated cannot be recorded and cannot be asked back for
+# reliably, which is why the four axes a result is worthless without are
+# required fields rather than a request in prose.
+#
+# The field set is docs/AMD-VALIDATION.md's section 6 and nothing else: that
+# document is the instruction and this form is the intake, so a field here that
+# the runbook never told a reporter to capture would be asking for something
+# they were never told to keep. Two things a reader might expect are therefore
+# absent - the driver version and the commit built - because the runbook does
+# not ask for either. That is a gap in the runbook, recorded on issue #246, and
+# not one this form may close on its own.
+name: AMD validation result
+description:
+  Output from running the suite or the benchmarks on an AMD GPU, following
+  docs/AMD-VALIDATION.md.
+labels: ["area:tests", "area:build"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. You are running something nobody here can run.
+
+        This form is the end of
+        [docs/AMD-VALIDATION.md](https://github.com/iderex/cudec/blob/main/docs/AMD-VALIDATION.md).
+        If you have not worked through it, start there - it is a clean clone to
+        a pasteable result in one sitting, and every field below is something
+        one of its steps printed.
+
+        **A failure is a result.** A red `ctest`, a build that does not
+        compile, a benchmark that refuses its own self-check: paste it exactly
+        as it happened. Do not fix it and do not leave it out. The point of
+        this exercise is to find out what happens, and the first run of
+        anything is where that is decided.
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and gfx target
+      description:
+        Both, from step 2 - `rocminfo | grep -E 'Marketing Name|^\s+Name:\s+gfx|Wavefront Size'`.
+        The `gfx` target is what the build was told to target and the marketing
+        name is what a later reader recognises.
+      placeholder: AMD Instinct MI210, gfx90a
+    validations:
+      required: true
+
+  - type: dropdown
+    id: wave-width
+    attributes:
+      label: Wave width
+      description:
+        The wavefront size step 2 printed. This is the axis the port is
+        parameterized on - both instantiations ship in one binary and a wave64
+        device reaches an arm a wave32 device never does - so it is the axis a
+        result is indexed by rather than a detail.
+      options:
+        - "32 (RDNA, gfx1100, gfx1201)"
+        - "64 (CDNA, gfx90a, gfx942)"
+    validations:
+      required: true
+
+  - type: input
+    id: rocm
+    attributes:
+      label: ROCm version
+      description:
+        7.2.4 if you used the pinned image from step 3 unchanged; otherwise the
+        version you actually built with.
+      placeholder: 7.2.4
+    validations:
+      required: true
+
+  - type: textarea
+    id: invocation
+    attributes:
+      label: The container invocation you used
+      description:
+        Step 3's `docker run` line as you actually ran it. The runbook's
+        `--device` flags have never been exercised by anybody here, so if yours
+        differed, this field is the most valuable thing in the report after the
+        output itself.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: ctest
+    attributes:
+      label: The whole ctest output
+      description:
+        Step 4, unedited and complete, passes included - `ctest --test-dir
+        build-hip --no-tests=error --output-on-failure`. Which entries ran is
+        as much of the result as which ones passed, so a summary line on its
+        own cannot be recorded.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: bench
+    attributes:
+      label: The benchmark report blocks
+      description:
+        Step 5, every block whole and unedited, one per invocation. The harness
+        prints its methodology inseparably from its numbers on purpose
+        (docs/BENCHMARK-METHODOLOGY.md), so an edited or summarised block will
+        not be recorded. Leave this empty if you ran the tests and not the
+        benchmarks - that is a complete result of its own.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything the runbook got wrong
+      description:
+        It is meant to be executable without correspondence. A step that did
+        not work on your machine is a defect in that document, and saying so
+        here is worth as much as the numbers.
+    validations:
+      required: false
