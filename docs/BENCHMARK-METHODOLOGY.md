@@ -427,10 +427,13 @@ been run.
 1. **One device, one container, one session.** Both libraries are built and
    run inside the same ROCm container image, pinned by `sha256` digest, on the
    same GPU, in one sitting. Two runs on the same model of card on different
-   days are not a same-hardware comparison. The digest is deliberately **not**
-   written here, because no ROCm image is pinned in this repository yet - that
-   pin arrives with the HIP CI job and this section takes it from there rather
-   than inventing a second one.
+   days are not a same-hardware comparison. The image is the one the HIP CI
+   job pins, and this section takes it from there rather than inventing a
+   second one - read the digest out of `.github/workflows/ci.yml` at the
+   commit you are running, because a digest restated in prose here is a second
+   pin the moment the job moves. `docs/AMD-VALIDATION.md` does write it out,
+   because a runbook has to be copy-pasteable; it is the same digest, taken
+   from the same line.
 
 2. **The same corpora, hash-pinned.** `sh bench/get-corpora.sh`, which refuses
    any file whose SHA-256 does not match its pin. Both sides read the same
