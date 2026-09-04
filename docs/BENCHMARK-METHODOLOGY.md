@@ -1,6 +1,7 @@
 # Benchmark methodology
 
-The performance write-up for cudec's LZ4 decode path: what is measured, on
+The performance write-up for cudec's decode paths - LZ4 throughout, and the
+GDeflate rows added under issue #228: what is measured, on
 what hardware, how to reproduce it, and how to read the numbers honestly.
 The raw baseline record - every number with the full methodology block the
 harness emits - lives in [BENCHMARKS.md](BENCHMARKS.md); this page is the
@@ -232,6 +233,49 @@ kernel throughput. Read it plainly:
   decode against the decoded-**output** readback, not the input - a change
   for those milestones, with its own test when it lands.
 
+### GDeflate (M4, one warp per 64 KiB page)
+
+The first recorded device numbers for the GDeflate path, on the same platform
+and the same protocol as the rows above. The full blocks are in
+[BENCHMARKS.md](BENCHMARKS.md) under "M4: the first recorded GDeflate GPU
+baselines"; this is the summary and it adds nothing that was not measured.
+
+| Corpus, level             | Ratio  | CPU oracle | GPU decode   | Relative |
+| ------------------------- | ------ | ---------- | ------------ | -------- |
+| Silesia, level 6          | 0.3343 | 0.327 GB/s | 8.056 GB/s   | ~24.7×   |
+| Silesia, level 0 (stored) | 1.0021 | 0.660 GB/s | 106.412 GB/s | ~161×    |
+| asset-like, level 6       | 0.7029 | 0.275 GB/s | 5.930 GB/s   | ~21.6×   |
+| worst-headers             | 2.8103 | 0.055 GB/s | 0.497 GB/s   | ~9.0×    |
+
+**Read the level-0 row as the copy path and not as GDeflate.** The reference
+emits uncompressed blocks by construction at level 0, so a page is a memcpy
+with a header; 106 GB/s at a ratio of 1.0021 is the ceiling the copy engine
+imposes on this kernel and says nothing about entropy decoding.
+
+**The working number is the level-6 row, 8.06 GB/s at a ratio of 0.334.**
+Against the LZ4 rows above that is roughly half the throughput at roughly half
+the size, which is the trade the format exists for; the two are not comparable
+as a single figure and no ratio between them is quoted here.
+
+**`worst-headers` is the margin, at 0.497 GB/s.** That corpus emits one
+dynamic block per group of matches, so a page pays a whole header decode for a
+handful of decoded bytes and the kernel spends its time in table construction
+rather than in the round loop. It is two orders of magnitude below the
+headline row and it is the number a denial-of-service argument is made from.
+
+**There is no parse-only ceiling for this path**, and its absence is a result.
+The LZ4 and Snappy rows get one from a template flag that elides the copies
+while running the identical parse; the GDeflate round loop's next round reads
+bytes the previous round's copies produced, so a variant with the copies
+elided would decode different symbols and ceiling nothing. Where the time
+actually goes inside this kernel is therefore not settled by these numbers,
+and the layout question that would move it is issue #204.
+
+**No perf conclusion is drawn about the kernel's shape from this run.** The
+achieved occupancy of the kernel these numbers were taken on is 24 of 48 warps
+per SM on sm_86, recorded on #214 against the design panel's prediction of 32;
+whether that costs throughput is a measurement nobody has taken.
+
 ## The design rationale (single-pass)
 
 cudec's LZ4 kernel is a single-pass, warp-cooperative design: each chunk is
@@ -319,6 +363,29 @@ and locked against rot by the `bench_worst4b_selfcheck` ctest on the GPU-less
 runner, so the adversarial number cannot silently drift. The asset-like corpus
 is held the same way by `bench_assetlike_selfcheck`, over the four quantities
 that define its regime rather than over validity alone.
+
+4. **The GDeflate rows** come out of a second binary with the same flag
+   vocabulary, and every one of its corpora is compressed by the pinned
+   reference or emitted by the harness itself - never by a second compressor:
+
+   | Invocation                            | What it measures                            |
+   | ------------------------------------- | ------------------------------------------- |
+   | `bench_gdeflate <files...>`           | CPU oracle denominator over the given files |
+   | `bench_gdeflate --gpu <files...>`     | + device-resident GPU decode per level      |
+   | `bench_gdeflate --gpu --assetlike`    | the game-asset model, per level             |
+   | `bench_gdeflate --gpu --blocktypes`   | the forced-block-type coverage rows         |
+   | `bench_gdeflate --gpu --worstrounds`  | the refill-bound adversarial corpus         |
+   | `bench_gdeflate --gpu --worstheaders` | the header-bound adversarial corpus         |
+   | `bench_gdeflate --selfcheck`          | the CI rot check (CPU-only, digest-locked)  |
+
+   `--gpu` is refused together with `--selfcheck` and with `--blockmix`: the
+   first runs on the GPU-less runner and the second times no decode, so in
+   both cases the flag would be accepted and do nothing, which reads
+   afterwards as a measurement that was taken.
+
+   The device rows print under the same methodology block as the CPU rows of
+   the same run, so the two cannot be quoted apart, and the harness refuses to
+   time a batch whose pages did not all decode to their original size.
 
 ## The nvCOMP comparison (not published)
 

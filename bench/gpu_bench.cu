@@ -10,6 +10,7 @@
 #include "bench_stats.h"
 #include "cudec.h"
 #include "chunk_decode.cuh"
+#include "gdeflate_decode.cuh"
 #include "lz4_block.h"
 #include "snappy_block.h"
 #include "vendor_rt_test.h"
@@ -111,6 +112,14 @@ cudec_status LaunchFullSnappy(const void* const* s, const size_t* ss,
                               cudec_rt::stream_t stream) {
     return cudec_snappy_decompress_batch(s, ss, d, dc, n, r,
                                          cudec_rt::abi_stream(stream));
+}
+
+cudec_status LaunchFullGDeflate(const void* const* s, const size_t* ss,
+                                void* const* d, const size_t* dc, size_t n,
+                                cudec_chunk_result* r,
+                                cudec_rt::stream_t stream) {
+    return cudec_gdeflate_decompress_batch(s, ss, d, dc, n, r,
+                                           cudec_rt::abi_stream(stream));
 }
 
 double Median(std::vector<double>* t) {
@@ -261,7 +270,12 @@ bool BenchBatch(LaunchFn full, LaunchFn parse_only,
                     &full_ms)) {
         return false;
     }
-    if (!TimeKernel(parse_only, d_s, d_ss, d_d, d_dc, n, d_r, stream, warmup,
+    /* A format whose kernel has no parse-only variant passes none, and the
+     * two fields carry the sentinel rather than a number nothing measured.
+     * The alternative - timing the full decode twice and calling one of them
+     * a ceiling - is the shape of dishonesty this harness exists against. */
+    if (parse_only != nullptr &&
+        !TimeKernel(parse_only, d_s, d_ss, d_d, d_dc, n, d_r, stream, warmup,
                     runs, &parse_ms)) {
         return false;
     }
@@ -270,10 +284,13 @@ bool BenchBatch(LaunchFn full, LaunchFn parse_only,
     out->chunks = n;
     out->output_bytes = total_out;
     out->full_ms_p50 = full_ms;
-    out->parse_only_ms_p50 = parse_ms;
+    out->parse_only_ms_p50 =
+        parse_only != nullptr ? parse_ms : kCudecBenchNoParseOnly;
     /* GbpsFromMs carries the sub-microsecond guard (bench/bench_stats.h). */
     out->full_gbps_p50 = cudec_bench::GbpsFromMs(gb, full_ms);
-    out->parse_only_gbps_p50 = cudec_bench::GbpsFromMs(gb, parse_ms);
+    out->parse_only_gbps_p50 =
+        parse_only != nullptr ? cudec_bench::GbpsFromMs(gb, parse_ms)
+                              : kCudecBenchNoParseOnly;
     /* Buffers are reclaimed at process exit; the bench is a short-lived
      * one-shot, like the test harness. */
     return true;
@@ -326,6 +343,14 @@ bool cudec_bench_gpu_snappy(const unsigned char* const* comp,
     return BenchBatch(LaunchFullSnappy,
                       LaunchParseOnly<cudec_detail::SnappyParser>, comp,
                       comp_sizes, orig_sizes, n, warmup, runs, out);
+}
+
+bool cudec_bench_gpu_gdeflate(const unsigned char* const* comp,
+                              const size_t* comp_sizes,
+                              const size_t* orig_sizes, size_t n, int warmup,
+                              int runs, cudec_gpu_result* out) {
+    return BenchBatch(LaunchFullGDeflate, nullptr, comp, comp_sizes,
+                      orig_sizes, n, warmup, runs, out);
 }
 
 bool cudec_bench_gpu_stream_ctx(const unsigned char* const* comp,

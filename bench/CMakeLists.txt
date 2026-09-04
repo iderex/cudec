@@ -131,16 +131,23 @@ add_test(NAME bench_snappy_worst_selfcheck COMMAND bench_snappy --worst
 add_test(NAME bench_snappy_worstlit_selfcheck COMMAND bench_snappy --worstlit
                                                       --selfcheck)
 
-# The GDeflate CPU denominator (issue #224). No CUDA in it at all: there is
-# no GDeflate kernel yet, so the reference decodes on the host and the binary
-# needs neither a device nor a cudec entry point. When the kernel lands, the
-# device rows join this binary the way they joined bench_snappy.
+# The GDeflate CPU denominator and, since issue #228, the device rows beside
+# it. The sentence that stood here said the binary needs neither a device nor
+# a cudec entry point because no GDeflate kernel existed, and said the device
+# rows would join it the way they joined bench_snappy when one landed. One
+# landed under #214 and they have, in exactly that way: gpu_bench.cu is
+# compiled in, --gpu adds the rows, and without the flag this is the
+# denominator alone as it always was.
 #
-# It links gdeflate_oracle alone - the same target tests/ pins - because the
+# It links gdeflate_oracle - the same target tests/ pins - because the
 # GDeflate streams in this project have ONE provenance, and a bench that
-# reached for a second compressor would be a second one nobody reconciles.
-add_executable(bench_gdeflate bench_gdeflate.cpp)
-target_link_libraries(bench_gdeflate PRIVATE gdeflate_oracle)
+# reached for a second compressor would be a second one nobody reconciles. It
+# links cudec because the device rows go through the shipped batch entry and
+# through nothing else.
+add_executable(bench_gdeflate bench_gdeflate.cpp gpu_bench.cu)
+target_link_libraries(
+  bench_gdeflate PRIVATE cudec gdeflate_oracle
+                         ${CUDEC_DEVICE_RUNTIME_TARGET})
 # ../src for the corpus digest, which reads src/xxhash64.h - the hash already
 # in the tree rather than a new dependency for a bench.
 #
@@ -172,10 +179,15 @@ target_compile_definitions(
   bench_gdeflate PRIVATE CUDEC_GDEFLATE_COMMIT="${CUDEC_GDEFLATE_COMMIT}")
 set_target_properties(bench_gdeflate PROPERTIES CXX_STANDARD 17
                                                 CXX_STANDARD_REQUIRED ON)
+cudec_device_target(bench_gdeflate)
 # -O2 unconditionally for the reason bench_lz4 gives above: the documented
 # container command sets no CMAKE_BUILD_TYPE, and an -O0 reference decoder
-# would be timed instead of the reference decoder.
-target_compile_options(bench_gdeflate PRIVATE -Wall -Wextra -Werror -O2)
+# would be timed instead of the reference decoder. The host flags are scoped
+# to the host language now that this target carries a device translation
+# unit, exactly as bench_lz4 and bench_snappy scope theirs; the device path
+# carries the project's strict device flags through cudec_device_target.
+target_compile_options(
+  bench_gdeflate PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-O2>)
 
 # Same rot protection as the entries above. The selfcheck builds the whole
 # level set from a fixed source and asserts the digest of each, so a moved

@@ -51,12 +51,19 @@
  * the ratio is half the pitch, and a throughput-only table would misreport
  * what the format is for.
  *
- * No CUDA in this binary at all: the reference decodes on the host, and there
- * is no cudec GDeflate path to launch.
+ * THIS PARAGRAPH SAID THERE WAS NO CUDA IN THIS BINARY AT ALL, because no
+ * cudec GDeflate path existed to launch. One landed under #214 and `--gpu`
+ * times it (issue #228): the reference still decodes on the host and is still
+ * the denominator, the device rows are printed under the same methodology
+ * block so the two cannot be quoted apart, and without the flag this binary
+ * is what it always was. The device rows go through
+ * `cudec_gdeflate_decompress_batch` and through nothing else.
  *
  * Bench-only. Nothing here is compiled into the library. */
 #include "assetlike_source.h"
 #include "bench_stats.h"
+#include "cudec.h"
+#include "gpu_bench.h"
 
 #include <libdeflate.h>
 
@@ -1264,7 +1271,7 @@ bool CheckBlocksPerPage(const char* name, const RefillDensity& density,
  * not exist. */
 void PrintReport(const Corpus& corpus, int level,
                  const std::vector<double>& sorted, size_t warmup, size_t runs,
-                 const RefillDensity* density, double floor) {
+                 const RefillDensity* density, double floor, bool gpu) {
     std::vector<size_t> sizes;
     sizes.reserve(corpus.originals.size());
     for (const auto& original : corpus.originals) {
@@ -1273,13 +1280,23 @@ void PrintReport(const Corpus& corpus, int level,
     std::sort(sizes.begin(), sizes.end());
     const double gb = static_cast<double>(corpus.original_bytes) / 1e9;
 
+    char device[256];
+    (void)cudec_bench_gpu_device_line(device, sizeof(device));
+
     std::printf("## bench_gdeflate report\n");
     std::printf("- decoder: CPU oracle, libdeflate_gdeflate_decompress (the "
                 "pinned NVIDIA/libdeflate gdeflate fork, commit %s), single "
-                "thread. cudec has no GDeflate kernel yet, so this report is "
-                "the denominator and carries no cudec number\n",
-                CUDEC_GDEFLATE_COMMIT);
+                "thread%s\n",
+                CUDEC_GDEFLATE_COMMIT,
+                gpu ? ". The GPU rows below time cudec's own decoder through "
+                      "cudec_gdeflate_decompress_batch, and the CPU rows are "
+                      "the denominator they are read against"
+                    : ". This run timed no cudec kernel - it is the "
+                      "denominator alone, and --gpu is what adds the device "
+                      "rows");
     std::printf("- host CPU: %s\n", cudec_bench::HostCpuName().c_str());
+    std::printf("- CUDA device: %s\n", device);
+    std::printf("- cudec: %d\n", cudec_version());
     /* The ratio is taken over the STREAM and never over the buffer: a
      * hand-emitted page carries a zero tail no decoder reads, and counting it
      * would attest bytes that are not stream. It is disclosed on its own line
@@ -1403,13 +1420,72 @@ bool TimeCorpus(const Corpus& corpus, size_t warmup, size_t runs,
     return true;
 }
 
+/* The device rows for one corpus, printed under the same methodology block as
+ * the CPU rows above them so the two cannot be quoted apart. The GPU decode is
+ * device-resident (H2D and D2H excluded) and CUDA-event timed, and
+ * cudec_bench_gpu_gdeflate refuses to time a batch whose pages did not all
+ * decode to their original size - so a number here is never from an unverified
+ * decode.
+ *
+ * THE PAGE HANDED TO THE KERNEL IS THE ONE IN THE CORPUS, TAIL AND ALL. A
+ * hand-emitted corpus carries a zero tail per page for the reference's
+ * unchecked refill, and the ratio line above holds that apart from the stream.
+ * The kernel is handed the whole buffer with its own size, and its refills are
+ * bounded by that size rather than by a convention, so the tail is words it
+ * never reads. What it does affect is nothing in the number below: throughput
+ * here is per DECODED byte, which the tail does not touch.
+ *
+ * NO PARSE-ONLY ROW, AND THE REASON RATHER THAN A SILENT OMISSION. #228 asks
+ * for the split variant if the design admits one. It does not: the two chunk
+ * formats get a parse-only ceiling from a template flag in
+ * src/chunk_decode.cuh that elides the copies while running the identical
+ * parse, and the GDeflate round loop's next round depends on bytes the
+ * previous round's copies produced, so eliding them would decode different
+ * symbols and ceiling nothing. */
+bool PrintGpuRows(const Corpus& corpus, double cpu_p50_seconds, size_t warmup,
+                  size_t runs) {
+    std::vector<const unsigned char*> comp_ptrs(corpus.compressed.size());
+    std::vector<size_t> comp_sizes(corpus.compressed.size());
+    std::vector<size_t> orig_sizes(corpus.originals.size());
+    for (size_t i = 0; i < corpus.compressed.size(); i++) {
+        comp_ptrs[i] = corpus.compressed[i].data();
+        comp_sizes[i] = corpus.compressed[i].size();
+        orig_sizes[i] = corpus.originals[i].size();
+    }
+    cudec_gpu_result g;
+    if (!cudec_bench_gpu_gdeflate(comp_ptrs.data(), comp_sizes.data(),
+                                  orig_sizes.data(), corpus.originals.size(),
+                                  static_cast<int>(warmup),
+                                  static_cast<int>(runs), &g)) {
+        std::fprintf(stderr, "GPU bench failed\n");
+        return false;
+    }
+    std::printf("- GPU decode (device-resident, CUDA-event timed, %zu warmup "
+                "+ %zu runs, %zu pages, every page verified to its original "
+                "size before timing): p50 %.3f ms, %.3f GB/s\n",
+                warmup, runs, g.chunks, g.full_ms_p50, g.full_gbps_p50);
+    std::printf("- GPU parse-only ceiling: not instantiable for this format - "
+                "the round loop's next round reads bytes the previous round's "
+                "copies produced, so a variant with the copies elided decodes "
+                "different symbols and ceilings nothing. The row is absent "
+                "rather than filled with the full decode timed twice\n");
+    /* The ratio the milestone is read on: the device number against this
+     * report's own CPU denominator, computed from the two rows above rather
+     * than from a number quoted out of another run. */
+    std::printf("- GPU vs the CPU denominator in this report: %.2fx (CPU p50 "
+                "%.3f ms, GPU p50 %.3f ms)\n",
+                cpu_p50_seconds * 1e3 / g.full_ms_p50, cpu_p50_seconds * 1e3,
+                g.full_ms_p50);
+    return true;
+}
+
 /* Reports the digest of the corpus it built through `digest_out` rather than
  * judging it here, so the caller can walk every level and name all of the
  * ones that moved. Stopping at the first would report one drifted level and
  * leave the rest unexamined, which reads as "only that one moved". */
 bool RunLevel(const std::vector<unsigned char>& source, const std::string& name,
               const std::string& provenance, int level, int want_block_type,
-              size_t warmup, size_t runs, uint64_t* digest_out) {
+              size_t warmup, size_t runs, bool gpu, uint64_t* digest_out) {
     Corpus corpus;
     corpus.name = name;
     corpus.provenance = provenance;
@@ -1435,7 +1511,11 @@ bool RunLevel(const std::vector<unsigned char>& source, const std::string& name,
         return false;
     }
     PrintReport(corpus, level, times, warmup, runs, /*density=*/nullptr,
-                /*floor=*/0.0);
+                /*floor=*/0.0, gpu);
+    if (gpu && !PrintGpuRows(corpus, cudec_bench::Percentile(times, 50),
+                             warmup, runs)) {
+        return false;
+    }
     return true;
 }
 
@@ -1564,7 +1644,7 @@ bool ParseCount(const char* text, size_t lo, size_t hi, size_t* out) {
 
 void Usage(const char* argv0) {
     std::fprintf(stderr,
-                 "usage: %s [--warmup N] [--runs N] [--assetlike] "
+                 "usage: %s [--gpu] [--warmup N] [--runs N] [--assetlike] "
                  "[--blocktypes] [--blockmix] [--worstrounds] "
                  "[--worstheaders] [--selfcheck] "
                  "[corpus files...]\n",
@@ -1574,7 +1654,7 @@ void Usage(const char* argv0) {
 /* The forced-block-type path. Each family is its own corpus at its own
  * level, so this walks the family table instead of the level list the
  * other paths sweep. */
-int RunBlocktypes(size_t warmup, size_t runs, bool selfcheck) {
+int RunBlocktypes(size_t warmup, size_t runs, bool selfcheck, bool gpu) {
     const size_t pages = selfcheck ? kSelfcheckPages : kBlocktypePages;
     bool ok = true;
     for (size_t i = 0; i < kForcedFamilyCount; i++) {
@@ -1582,7 +1662,7 @@ int RunBlocktypes(size_t warmup, size_t runs, bool selfcheck) {
         const std::vector<unsigned char> source = f.source(pages * kPageBytes);
         uint64_t digest = 0;
         if (!RunLevel(source, f.name, f.provenance, f.level,
-                      static_cast<int>(f.want_type), warmup, runs,
+                      static_cast<int>(f.want_type), warmup, runs, gpu,
                       &digest)) {
             return 1;
         }
@@ -1890,7 +1970,7 @@ static_assert(kWorstHeadersRefillFloor > kWorstRefillFloor,
 int RunWorstShape(const char* name, const std::string& provenance,
                   uint32_t blocks, double floor, uint64_t selfcheck_digest,
                   uint64_t full_digest, size_t warmup, size_t runs,
-                  bool selfcheck) {
+                  bool selfcheck, bool gpu) {
     const size_t pages = selfcheck ? kSelfcheckPages : kWorstRoundsPages;
     Corpus corpus;
     corpus.name = name;
@@ -1932,13 +2012,18 @@ int RunWorstShape(const char* name, const std::string& provenance,
     if (!TimeCorpus(corpus, warmup, runs, &times)) {
         return 1;
     }
-    PrintReport(corpus, /*level=*/-1, times, warmup, runs, &density, floor);
+    PrintReport(corpus, /*level=*/-1, times, warmup, runs, &density, floor,
+                gpu);
+    if (gpu && !PrintGpuRows(corpus, cudec_bench::Percentile(times, 50),
+                             warmup, runs)) {
+        return 1;
+    }
     return 0;
 }
 
 /* The three ingredients of MASTERPLAN section 13.5 that do not need a block
  * boundary, in a page that is one final dynamic block (issue #226). */
-int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck) {
+int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck, bool gpu) {
     return RunWorstShape(
         "worst-rounds",
         "HAND-CONSTRUCTED by this harness and validated by the pinned "
@@ -1951,14 +2036,14 @@ int RunWorstRounds(size_t warmup, size_t runs, bool selfcheck) {
         "with this harness's other corpora, which are recorded on their own "
         "invocations and are several times this one in pages",
         /*blocks=*/1, kWorstRefillFloor, kWorstRoundsSelfcheckDigest,
-        kWorstRoundsFullDigest, warmup, runs, selfcheck);
+        kWorstRoundsFullDigest, warmup, runs, selfcheck, gpu);
 }
 
 /* The same page with the fourth ingredient added (issue #430): the same
  * output, the same symbols and the same matches, cut into as many dynamic
  * blocks as whole groups of matches allow, so every group pays a block header
  * and the one-active-lane header rounds are a real share of the total. */
-int RunWorstHeaders(size_t warmup, size_t runs, bool selfcheck) {
+int RunWorstHeaders(size_t warmup, size_t runs, bool selfcheck, bool gpu) {
     return RunWorstShape(
         "worst-headers",
         "HAND-CONSTRUCTED by this harness and validated by the pinned "
@@ -1972,7 +2057,7 @@ int RunWorstHeaders(size_t warmup, size_t runs, bool selfcheck) {
         "and are several times this one in pages",
         WorstHeaderBlocks(), kWorstHeadersRefillFloor,
         kWorstHeadersSelfcheckDigest, kWorstHeadersFullDigest, warmup, runs,
-        selfcheck);
+        selfcheck, gpu);
 }
 
 }  // namespace
@@ -1986,11 +2071,14 @@ int main(int argc, char** argv) {
     bool blockmix = false;
     bool worstrounds = false;
     bool worstheaders = false;
+    bool gpu = false;
     std::vector<std::string> files;
 
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
-        if (arg == "--assetlike") {
+        if (arg == "--gpu") {
+            gpu = true;
+        } else if (arg == "--assetlike") {
             assetlike = true;
         } else if (arg == "--blocktypes") {
             blocktypes = true;
@@ -2066,6 +2154,28 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    /* The selfcheck is the rot check the GPU-less CI runner runs, so it stays
+     * CPU-only by refusal rather than by convention: a --gpu --selfcheck that
+     * quietly dropped the device rows would report green on a runner where
+     * nothing device-side ran, which is the shape of a check that has stopped
+     * checking. */
+    if (selfcheck && gpu) {
+        std::fprintf(stderr, "--gpu and --selfcheck are exclusive: the "
+                             "selfcheck runs on the GPU-less runner\n");
+        return 2;
+    }
+
+    /* --blockmix censuses the block types of a corpus and times no decode, so
+     * it has no row a device number would go beside. Refused rather than
+     * ignored, for the reason above: a flag that is accepted and does nothing
+     * is read afterwards as a measurement that was taken. */
+    if (blockmix && gpu) {
+        std::fprintf(stderr, "--gpu and --blockmix are exclusive: the census "
+                             "times no decode, so there is no row for a "
+                             "device number to go beside\n");
+        return 2;
+    }
+
     if (selfcheck) {
         /* Short and fixed, so the rot check stays fast on the GPU-less runner
          * and its verdict is a digest rather than a timing. */
@@ -2074,15 +2184,15 @@ int main(int argc, char** argv) {
     }
 
     if (blocktypes) {
-        return RunBlocktypes(warmup, runs, selfcheck);
+        return RunBlocktypes(warmup, runs, selfcheck, gpu);
     }
 
     if (worstrounds) {
-        return RunWorstRounds(warmup, runs, selfcheck);
+        return RunWorstRounds(warmup, runs, selfcheck, gpu);
     }
 
     if (worstheaders) {
-        return RunWorstHeaders(warmup, runs, selfcheck);
+        return RunWorstHeaders(warmup, runs, selfcheck, gpu);
     }
 
     std::vector<unsigned char> source;
@@ -2137,7 +2247,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < kLevelCount; i++) {
         uint64_t digest = 0;
         if (!RunLevel(source, name, provenance, kLevels[i],
-                      /*want_block_type=*/-1, warmup, runs, &digest)) {
+                      /*want_block_type=*/-1, warmup, runs, gpu, &digest)) {
             return 1;
         }
         if (selfcheck && !CheckDigest(digest, name, kLevels[i], expected[i])) {
