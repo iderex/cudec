@@ -595,6 +595,14 @@ jobs:
   format:
     name: format
     runs-on: ubuntu-latest
+    # A required check that hangs is worse than one that reds: a red gate is
+    # read and a pending one is waited on. Without this the job inherits
+    # GitHub's six-hour default, and the schema step below - which reaches the
+    # network - sat in progress for more than eleven minutes on two pull
+    # requests in one hour against a four-second norm (issue #443). The bound
+    # is generous against that norm on purpose; it is a ceiling on a hang, not
+    # a performance budget.
+    timeout-minutes: 15
     permissions:
       contents: read
       # Read-only, and needed by one step: a document may declare a path the

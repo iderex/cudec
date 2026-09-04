@@ -27,6 +27,22 @@
 # exactly like a clean one: an absent config file, a failed fetch, a hash
 # mismatch, an unparseable file, and a validator that cannot refuse a known
 # bad document are all hard errors here and never skips.
+#
+# EVERY CALL THAT LEAVES THIS MACHINE IS TIME-BOUNDED, AND EXCEEDING A BOUND
+# REDS RATHER THAN SKIPS. Three of them do: the schema fetch and the two npx
+# invocations, which resolve and install a package before they run it. Without
+# a bound this step inherits the job's, and the job inherited GitHub's six-hour
+# default - it sat in progress for more than eleven minutes on two pull
+# requests in one hour against a four-second norm, and both were ended by a
+# person cancelling the run rather than by anything here (issue #443). A
+# pending required check is worse than a red one, because a red one is read.
+#
+# The bound is a ceiling on a hang and not a performance budget, which is why
+# it is generous: a slow mirror must still pass. What it may never become is a
+# skip - a timeout takes the same route as an unreachable host, into die(),
+# because "upstream was slow" and "the config validates" are not the same
+# statement and this check exists to stop the second being inferred from the
+# first.
 set -eu
 
 cfg="${1:-.github/dependabot.yml}"
@@ -57,6 +73,14 @@ die() {
 command -v curl >/dev/null 2>&1 || die "curl is not on PATH"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum is not on PATH"
 command -v npx >/dev/null 2>&1 || die "npx is not on PATH"
+command -v timeout >/dev/null 2>&1 || die "timeout is not on PATH. It is what
+bounds the npx invocations below, so its absence would silently restore the
+unbounded wait rather than degrade it."
+
+# Seconds. One number for the fetch and one for a package install, named here
+# rather than spelled at each call site.
+fetch_timeout=60
+npx_timeout=300
 
 [ -f "$cfg" ] ||
     die "$cfg does not exist. Deleting or renaming the config is the silent
@@ -66,8 +90,14 @@ skipped."
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-curl -fsSL "$schema_url" -o "$work/schema.json" ||
-    die "could not fetch $schema_url"
+# --max-time bounds the whole transfer and --retry covers the transient this
+# is most often up against; three attempts of at most $fetch_timeout seconds
+# each is the worst case, and it reds rather than hanging.
+curl -fsSL --max-time "$fetch_timeout" --retry 3 --retry-connrefused \
+    "$schema_url" -o "$work/schema.json" ||
+    die "could not fetch $schema_url within ${fetch_timeout}s per attempt.
+The schema is what this check validates against, so an unreachable one is a
+run that would have checked nothing - refused rather than skipped."
 echo "$schema_sha256  $work/schema.json" | sha256sum -c - >/dev/null ||
     die "the schema at $schema_url does not match the recorded SHA-256.
 Read what changed upstream, then move the pin in this file deliberately."
@@ -75,13 +105,32 @@ Read what changed upstream, then move the pin in this file deliberately."
 # ajv reads JSON, the config is YAML, and js-yaml is the conversion. A parse
 # failure here is the malformed-file case and stops the run.
 to_json() {
-    npx --yes --package="$yaml_pkg" -- js-yaml "$1" >"$2" ||
-        die "$1 is not parseable as YAML"
+    timeout "$npx_timeout" npx --yes --package="$yaml_pkg" -- js-yaml "$1" \
+        >"$2" ||
+        die "$1 is not parseable as YAML, or the converter did not finish
+within ${npx_timeout}s"
 }
 
+# The verdict here is the caller's to read - the self-test below requires a
+# refusal and the real run requires an acceptance - so a timeout is separated
+# from a refusal instead of being returned as one. 124 is the status timeout
+# uses, and letting it through as an ordinary non-zero would read as "the
+# document was refused", which is the one misreading that turns a hang into a
+# green self-test.
+#
+# THE VALIDATOR OUTPUT IS CAPTURED RATHER THAN LET THROUGH, and the callers
+# print it when they need it. It used to be redirected at the self-test call
+# site, which swallowed this function's own refusal along with it: a hang
+# then reded the step with an empty log and no reason in it.
 validate() {
-    npx --yes --package="$ajv_pkg" -- ajv validate \
-        --spec=draft7 --strict=false -s "$work/schema.json" -d "$1"
+    timeout "$npx_timeout" npx --yes --package="$ajv_pkg" -- ajv validate \
+        --spec=draft7 --strict=false -s "$work/schema.json" -d "$1" \
+        >"$work/validate.log" 2>&1
+    validate_status=$?
+    if [ "$validate_status" -eq 124 ]; then
+        die "the validator did not finish within ${npx_timeout}s on $1"
+    fi
+    return "$validate_status"
 }
 
 # The validator proves itself on every run before it is trusted with the real
@@ -100,8 +149,8 @@ updates:
       default_days: 7
 EOF
 to_json "$work/self-test.yml" "$work/self-test.json"
-if validate "$work/self-test.json" >"$work/self-test.log" 2>&1; then
-    cat "$work/self-test.log" >&2
+if validate "$work/self-test.json"; then
+    cat "$work/validate.log" >&2
     die "the self-test document was accepted. It carries default_days where
 the schema takes default-days, so a validator that accepts it is not
 refusing anything and its verdict on the real config means nothing."
@@ -109,9 +158,11 @@ fi
 echo "PASS: self-test - the validator refuses a known-bad config"
 
 to_json "$cfg" "$work/config.json"
-validate "$work/config.json" ||
+validate "$work/config.json" || {
+    cat "$work/validate.log" >&2
     die "$cfg does not validate against the published Dependabot schema.
 The report above names the key. A config the schema refuses is one the
 platform is likely to reject, and a rejected config is not in force."
+}
 
 echo "PASS: $cfg validates against $schema_url"
