@@ -449,6 +449,20 @@ cudec_add_test(zstd_entropy_twin SOURCES zstd_entropy_twin.cpp zstd_corpus.cpp
 target_include_directories(zstd_entropy_twin
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(zstd_entropy_twin PRIVATE HUF_STATIC_LINKING_ONLY)
+# What a tile of 128 sequences carries across its own lanes (issue #203).
+# Host-side and GPU-less, and it is a MEASUREMENT the kernel's map rests on
+# rather than a twin of a unit: docs/MASTERPLAN.md section 14.8 stage D3 runs
+# one sequence per lane, and this counts how often a sequence's match - and,
+# under 14.3's placement, its literal run - reads inside the output the lower
+# lanes of its own tile write. It links zstd_full and compiles zstd_corpus.cpp
+# for the reason zstd_blocks_twin gives above: the #185 fixtures are what it
+# walks, and it diffs its own bytes against the reference for every one of
+# them, because a walk that mis-derived a destination would report a count
+# before it reported a wrong byte.
+cudec_add_test(zstd_tile_dependency SOURCES zstd_tile_dependency.cpp
+               zstd_corpus.cpp LIBS zstd_full)
+target_include_directories(zstd_tile_dependency
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
