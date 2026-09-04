@@ -116,8 +116,10 @@ It compiles for `gfx90a`, `gfx942`, `gfx1100` and `gfx1201` unless
 has been compiled, not run: no AMD GPU has executed this decoder, so the
 command below runs the host-side subset only, and the gpu-labeled tests exist
 in that build as binaries nothing has yet executed. On-device AMD validation
-is the community's to produce, and the runbook and result intake for it are
-not written yet (#245, #246).
+is the community's to produce:
+[docs/AMD-VALIDATION.md](docs/AMD-VALIDATION.md) is the runbook that takes an
+AMD GPU owner from a clean clone to a pasteable result, and the purpose-built
+result intake is still to come (#246).
 
 ```sh
 docker run --rm -v "$PWD:/w" -w /w \
