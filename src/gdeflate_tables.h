@@ -33,9 +33,15 @@
  * so it admits up to 288 and builds a table over all of them. Parity with the
  * reference is the rule the whole M4 ladder rests on, so the capacity follows
  * the reference. Two extra symbols are four bytes, and the two `kind` fields
- * are two more each: 3144 bytes per warp against the 3200-byte budget, where
- * 13.1 computed 3132. The margin narrows from 68 bytes to 56 and the occupancy
- * arithmetic is unmoved.
+ * are two more each: 3144 bytes per warp for the two live tables against the
+ * 3200-byte budget, where 13.1 computed 3132. What 13.1 did not cost is the
+ * rest of a dynamic block's table set, which every lane reads and therefore
+ * lives beside them in shared memory: the precode table, the code-length
+ * vector and the precode's own lengths, 691 bytes more (src/gdeflate_decode.cuh
+ * carries the set). Measured at the kernel (issue #214), 3832 bytes per warp
+ * and 77 registers put six blocks on an sm_86 multiprocessor, 24 resident
+ * warps against the 32 the budget was derived for; the perf pass (#204,
+ * #205) is where either number moves.
  *
  * FAIL-CLOSED, AND EXACTLY WHERE THE REFERENCE IS. `build_decode_table` in the
  * pinned fork refuses an over-subscribed vector, refuses an incomplete one,
@@ -50,7 +56,19 @@
  * a block whose distance code is empty decodes to a distance symbol that the
  * stream never encoded. Here that table refuses on use instead. A block that
  * declares no distances and uses none is unaffected, which is the only shape a
- * compressor produces. */
+ * compressor produces.
+ *
+ * THE ROUNDS ARE WRITTEN ONCE, OVER A TEAM (issue #214). The code-length rounds
+ * at the bottom of this file and the block loop in src/gdeflate_block.h are
+ * templates over a `Team`: the thing that says which lane is current, hands
+ * out output positions in lane order, finds the first lane that flagged, and
+ * refills the lanes that stepped. GDeflateHostTeam below is the sequential
+ * residency, one thread walking the 32 lanes in order over a GDeflateSchedule,
+ * and it is what every CPU twin runs. The warp residency in
+ * src/gdeflate_decode.cuh answers the same calls with a ballot, a prefix sum
+ * and a shuffle. What the rounds may assume of a team, and what a team may
+ * assume of the rounds, is written at GDeflateHostTeam, because that is the
+ * one that can be read without a device. */
 #ifndef CUDEC_GDEFLATE_TABLES_H
 #define CUDEC_GDEFLATE_TABLES_H
 
@@ -289,51 +307,62 @@ CUDEC_HOST_DEVICE inline bool GDeflateBuildTable(
  * caught by the flag on its next operation. */
 constexpr uint32_t kGDeflateNoSymbol = 0xFFFFu;
 
-/* Decode one symbol from the current lane. The accelerator is a peek, so a
- * miss has consumed nothing and the walk starts at length 1 rather than
- * part-way through a codeword.
+/* Resolve one symbol out of a lane's buffer WITHOUT consuming it. `r` carries
+ * how far ahead of the lane the read has gone and the rung it refused on, so a
+ * caller can resolve a codeword and the extra bits behind it as one
+ * speculative read and then remove `r.consumed` bits at once - or remove
+ * nothing, which is how a lane that must not have consumed after an
+ * end-of-block keeps the bits it entered the round with (docs/MASTERPLAN.md
+ * section 13.2). The accelerator is a peek, so a miss has cost nothing and the
+ * walk starts at length 1 rather than part-way through a codeword.
  *
- * EVERY EXIT THAT IS NOT A SYMBOL SETS THE SCHEDULE'S FAILURE FLAG. A lane
- * that cannot supply the bits a resolved codeword needs is refused by
- * GDeflateRemove rather than allowed to shift a buffer it does not hold, and a
- * walk that reaches the maximum length without matching has read a codeword
- * that the code does not contain, which on a complete code means the bits were
- * not produced by this table. */
+ * EVERY EXIT THAT IS NOT A SYMBOL NAMES A RUNG INTO `r.why`. A lane that cannot
+ * supply the bits a resolved codeword needs is refused by the occupancy check
+ * the sequential remove uses rather than allowed to shift a buffer it does not
+ * hold, and a walk that reaches the maximum length without matching has read a
+ * codeword that the code does not contain, which on a complete code means the
+ * bits were not produced by this table. */
 template <uint32_t kCapSyms, uint32_t kRootBits, uint32_t kMaxLen>
-CUDEC_HOST_DEVICE inline uint32_t GDeflateDecodeSymbol(
-    GDeflateSchedule& s,
-    const GDeflateHuffTable<kCapSyms, kRootBits, kMaxLen>& t) {
-    if (s.failed) {
+CUDEC_HOST_DEVICE inline uint32_t GDeflateResolveSymbol(
+    const GDeflateHuffTable<kCapSyms, kRootBits, kMaxLen>& t, uint64_t bitbuf,
+    uint32_t bitsleft, GDeflateLaneRead& r) {
+    if (r.why != kGDeflateRejectNone) {
         return kGDeflateNoSymbol;
     }
     if (t.kind == kGDeflateTableEmpty) {
         /* Stricter than the reference, deliberately: it hands back a symbol
          * the stream never encoded, and a distance built from that symbol is
          * indistinguishable from one the page asked for. */
-        GDeflateRefuse(s, kGDeflateRejectEmptyTableUsed);
+        GDeflateTableRefuse(&r.why, kGDeflateRejectEmptyTableUsed);
         return kGDeflateNoSymbol;
     }
     if (t.kind == kGDeflateTableSingle) {
-        GDeflateRemove(s, 1);
-        if (s.failed) {
+        if (!GDeflateRemoveCheck(bitsleft - r.consumed, 1u, &r.why)) {
             return kGDeflateNoSymbol;
         }
+        r.consumed += 1u;
         return t.sorted[0];
     }
-    const uint32_t probe = GDeflatePeek(s, kRootBits);
+    /* The probe reads the buffer past the lane's occupancy, as the sequential
+     * peek always did: the bits above `bitsleft` are zero by the schedule's
+     * invariant, so a short lane resolves to some entry and the occupancy
+     * check below is what refuses it. */
+    const uint64_t window = bitbuf >> r.consumed;
+    const uint32_t probe =
+        static_cast<uint32_t>(window & ((1u << kRootBits) - 1u));
     const uint16_t entry = t.root[probe];
     const uint32_t hit_len = entry & kGDeflateRootLenMask;
     if (hit_len != 0) {
-        GDeflateRemove(s, hit_len);
-        if (s.failed) {
+        if (!GDeflateRemoveCheck(bitsleft - r.consumed, hit_len, &r.why)) {
             return kGDeflateNoSymbol;
         }
+        r.consumed += hit_len;
         return entry >> kGDeflateRootLenBits;
     }
     uint32_t code = 0;
     for (uint32_t len = 1; len <= kMaxLen; len++) {
-        const uint32_t bit = GDeflatePop(s, 1);
-        if (s.failed) {
+        const uint32_t bit = GDeflateReadAhead(bitbuf, bitsleft, r, 1u);
+        if (r.why != kGDeflateRejectNone) {
             return kGDeflateNoSymbol;
         }
         code = (code << 1) | bit;
@@ -342,10 +371,29 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflateDecodeSymbol(
             return t.sorted[t.first_index[len] + (code - t.first_code[len])];
         }
     }
-    GDeflateRefuse(s, kGDeflateRejectCodewordNotInCode);
+    GDeflateTableRefuse(&r.why, kGDeflateRejectCodewordNotInCode);
     return kGDeflateNoSymbol;
 }
 
+/* Decode one symbol from the current lane, consuming it: the resolve above
+ * followed by the remove, with the rung the resolve named raised on the
+ * schedule. This is the sequential shape the twins drive; the rounds below
+ * resolve first and commit later, and go through the same resolve. */
+template <class S, uint32_t kCapSyms, uint32_t kRootBits, uint32_t kMaxLen>
+CUDEC_HOST_DEVICE inline uint32_t GDeflateDecodeSymbol(
+    S& s, const GDeflateHuffTable<kCapSyms, kRootBits, kMaxLen>& t) {
+    if (s.failed) {
+        return kGDeflateNoSymbol;
+    }
+    GDeflateLaneRead r = {0, kGDeflateRejectNone};
+    const uint32_t sym = GDeflateResolveSymbol(t, s.Buf(), s.Left(), r);
+    if (r.why != kGDeflateRejectNone) {
+        GDeflateRefuseAs(s, r.why);
+        return kGDeflateNoSymbol;
+    }
+    GDeflateRemove(s, r.consumed);
+    return sym;
+}
 
 /* THE DYNAMIC BLOCK'S CODE-LENGTH ROUNDS (issue #176). Everything above turns
  * a length vector into a table; this turns a page into the length vectors. It
@@ -360,7 +408,7 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflateDecodeSymbol(
  * expanded length - a repeat code and its extra bits together - is its own
  * round as well. An extra-bit field read in the round AFTER its code would
  * decode a different page and raise no error, which is why the extra bits are
- * popped before the Advance rather than after it.
+ * read before the lane steps rather than after it.
  *
  * WHERE THIS IS STRICTER THAN THE REFERENCE, STATED RATHER THAN LEFT TO BE
  * FOUND. A repeat run reaching past HLIT + HDIST is refused here. The
@@ -415,17 +463,222 @@ struct GDeflateCodeLengths {
     uint32_t num_dist;
 };
 
+/* One lane's outstanding match: the length it reserved and where in the output
+ * that reservation starts. Held per lane for the reason GDeflateSchedule holds
+ * all 32 bit buffers - the CPU twin runs the lanes sequentially in one thread,
+ * while in the warp kernel each lane owns its own copy state in registers. The
+ * reference keeps the same thing as a rotating 32-bit mask beside a per-lane
+ * array; a mask and a flag per lane are the same set, and the flag is the
+ * shape that reads correctly in both residencies. */
+struct GDeflateDeferredCopy {
+    uint64_t out_pos;
+    uint32_t length;
+    bool pending;
+};
+
+/* The answer FirstLane gives when no lane flagged. One past the last lane, so
+ * that `lane < first` is true of every lane and `lane == first` of none. */
+constexpr uint32_t kGDeflateNoLane = kGDeflateNumStreams;
+
+/* THE SEQUENTIAL TEAM, and the contract both residencies keep.
+ *
+ * What a team owes the rounds: Bits() is the calling lane's residency of the
+ * schedule primitives (buffer, occupancy, verdict, word count); Copy() its
+ * deferred match; Lane() its index; Active() whether it takes part in the
+ * round in progress. LitLen(), Dist(), Precode(), Lens() and PrecodeLens() are
+ * the block's table set, one per team. Round(n, f) runs f once per lane on the
+ * first n lanes and then refills every lane that STEPPED - f returns whether
+ * its lane did, because a lane that took no step is not refilled by the
+ * format: the code-length rounds stop mid-round when the vector is full and
+ * the lanes after that point keep their bits. Lane0(f) runs f on lane 0 alone
+ * with no refill, which is the block header and the stored length; EnsureLane0
+ * is the reference's ENSURE_BITS on lane 0 with no rotation. Build(f) runs f
+ * once for the team, which is the table construction. Reset() returns the
+ * sequential residency to lane 0 and is nothing on the warp.
+ *
+ * What the rounds owe a team, and it is the discipline that makes the warp
+ * residency sound: inside f, every collective - Claim, FirstLane, CopyBytes,
+ * Serial, Broadcast - is called exactly once per lane per round, at the same
+ * point, by every lane whether or not it is Active(), with a neutral argument
+ * from a lane that has nothing to contribute. The sequential residency does
+ * not need that, because it runs one lane at a time; the warp residency needs
+ * it because a collective is a point every lane of the wave must reach.
+ *
+ * The collectives are PREFIX operations by definition: Claim(base, len) hands
+ * this lane the position after every LOWER lane's claim and advances `base`
+ * past every lane's; FirstLane(flag) names the lowest flagging lane at or below
+ * this one, or kGDeflateNoLane. On the warp both are computed over the whole
+ * team at once, so FirstLane may name a HIGHER lane there; every comparison
+ * the rounds make against its answer - below it, at it, above it - reads the
+ * same on both, which is what lets one round body serve two residencies.
+ *
+ * CopyBytes(active, out, dst, src, len) performs the copies of every lane that
+ * asked, in lane order, and a copy reads only bytes that lie before the
+ * reservation it fills, so the order is the whole of what the deferred copy
+ * needs. Serial(active, f) runs f on the asking lanes in lane order with each
+ * one's writes visible to the next, which is what the code-length expansion
+ * needs for "repeat the previous length".
+ *
+ * On the sequential residency a refusal stops the round at the lane that
+ * refused, exactly as the reference's loop stops; on the warp every lane
+ * finishes the round and the lowest refusing lane's rung is the team's, which
+ * is the same verdict because no lane's step depends on a higher lane. */
+class GDeflateHostTeam {
+   public:
+    CUDEC_HOST_DEVICE GDeflateHostTeam(GDeflateSchedule& s,
+                                       const unsigned char* page,
+                                       GDeflateCodeLengths* lens,
+                                       GDeflateLitLenTable* litlen,
+                                       GDeflateDistTable* dist)
+        : s_(s),
+          page_(page),
+          lens_(lens),
+          litlen_(litlen),
+          dist_(dist),
+          first_(kGDeflateNoLane) {
+        for (uint32_t n = 0; n < kGDeflateNumStreams; n++) {
+            copies_[n].out_pos = 0;
+            copies_[n].length = 0;
+            copies_[n].pending = false;
+        }
+    }
+
+    CUDEC_HOST_DEVICE GDeflateSchedule& Bits() { return s_; }
+    CUDEC_HOST_DEVICE GDeflateDeferredCopy& Copy() { return copies_[s_.idx]; }
+    CUDEC_HOST_DEVICE uint32_t Lane() const { return s_.idx; }
+    CUDEC_HOST_DEVICE bool Active() const { return true; }
+    CUDEC_HOST_DEVICE bool Failed() const { return s_.failed; }
+    CUDEC_HOST_DEVICE uint64_t Cursor() const { return s_.cursor; }
+    CUDEC_HOST_DEVICE uint64_t WordCount() const { return s_.word_count; }
+    CUDEC_HOST_DEVICE const unsigned char* Page() const { return page_; }
+
+    CUDEC_HOST_DEVICE GDeflateLitLenTable& LitLen() { return *litlen_; }
+    CUDEC_HOST_DEVICE GDeflateDistTable& Dist() { return *dist_; }
+    CUDEC_HOST_DEVICE GDeflatePrecodeTable& Precode() { return precode_; }
+    CUDEC_HOST_DEVICE GDeflateCodeLengths& Lens() { return *lens_; }
+    CUDEC_HOST_DEVICE unsigned char* PrecodeLens() { return precode_lens_; }
+
+    /* The priming round is GDeflateInit's, so the sequential team primes by
+     * calling it: one word into each lane in lane order, refused before any
+     * lane is touched when the page cannot carry it. */
+    CUDEC_HOST_DEVICE bool Prime(uint64_t page_bytes) {
+        return GDeflateInit(s_, page_, page_bytes);
+    }
+
+    template <class F>
+    CUDEC_HOST_DEVICE void Round(uint32_t lanes, F f) {
+        first_ = kGDeflateNoLane;
+        for (uint32_t l = 0; l < lanes; l++) {
+            s_.idx = l;
+            const bool stepped = f(*this);
+            if (s_.failed) {
+                return;
+            }
+            if (stepped) {
+                GDeflateAdvance(s_, page_);
+                if (s_.failed) {
+                    return;
+                }
+            }
+        }
+    }
+
+    template <class F>
+    CUDEC_HOST_DEVICE void Lane0(F f) {
+        s_.idx = 0;
+        f(*this);
+    }
+
+    CUDEC_HOST_DEVICE void EnsureLane0() {
+        s_.idx = 0;
+        GDeflateEnsure(s_, page_);
+    }
+
+    CUDEC_HOST_DEVICE void Reset() { GDeflateReset(s_); }
+
+    template <class F>
+    CUDEC_HOST_DEVICE void Build(F f) {
+        f(*this);
+    }
+
+    template <class T>
+    CUDEC_HOST_DEVICE T Broadcast(T value) const {
+        return value;
+    }
+
+    CUDEC_HOST_DEVICE uint64_t Claim(uint64_t& base, uint64_t len) {
+        const uint64_t pos = base;
+        base += len;
+        return pos;
+    }
+
+    CUDEC_HOST_DEVICE uint32_t FirstLane(bool flag) {
+        if (flag && first_ == kGDeflateNoLane) {
+            first_ = s_.idx;
+        }
+        return first_;
+    }
+
+    /* Byte by byte, forwards, which is what an overlapping match MEANS: a
+     * distance below the length is a run that repeats what this copy is
+     * itself writing. The warp residency copies the same bytes through the
+     * closed-form gather the LZ4 kernel uses, and the two agree byte for byte
+     * because every source byte of an overlapping copy is a byte this copy
+     * wrote earlier in that same order (docs/DETERMINISM.md). */
+    CUDEC_HOST_DEVICE void CopyBytes(bool active, unsigned char* out,
+                                     uint64_t dst, uint64_t src,
+                                     uint64_t len) {
+        if (!active) {
+            return;
+        }
+        for (uint64_t n = 0; n < len; n++) {
+            out[dst + n] = out[src + n];
+        }
+    }
+
+    template <class F>
+    CUDEC_HOST_DEVICE void Serial(bool active, F f) {
+        if (active) {
+            f(*this);
+        }
+    }
+
+    CUDEC_HOST_DEVICE uint64_t BufferedBits() const {
+        return GDeflateBufferedBits(s_);
+    }
+
+    CUDEC_HOST_DEVICE void ClearCopies() {
+        for (uint32_t n = 0; n < kGDeflateNumStreams; n++) {
+            copies_[n].pending = false;
+            copies_[n].length = 0;
+            copies_[n].out_pos = 0;
+        }
+    }
+
+   private:
+    GDeflateSchedule& s_;
+    const unsigned char* page_;
+    GDeflateCodeLengths* lens_;
+    GDeflateLitLenTable* litlen_;
+    GDeflateDistTable* dist_;
+    GDeflatePrecodeTable precode_;
+    unsigned char precode_lens_[kGDeflateNumPrecodeSyms];
+    GDeflateDeferredCopy copies_[kGDeflateNumStreams];
+    uint32_t first_;
+};
+
 /* Read a dynamic block's code-length vectors, entered immediately after BTYPE
- * has been popped off lane 0. Returns false with the schedule failed for every
- * shape this decoder refuses, and `out` is not to be read in that case.
+ * has been popped off lane 0. Returns false with the team failed for every
+ * shape this decoder refuses, and the team's Lens() is not to be read in that
+ * case.
  *
  * NOTHING HERE IS SIZED FROM THE STREAM. HLIT and HDIST are five-bit fields
  * and HCLEN is four, so the three counts are bounded by the field widths
  * rather than by a check: the static assertions below say that the capacities
  * this file declares are exactly the values those fields reach, which is the
  * form that fails at compile time if a capacity is ever changed alone. */
-CUDEC_HOST_DEVICE inline bool GDeflateReadCodeLengths(
-    GDeflateSchedule& s, const unsigned char* page, GDeflateCodeLengths& out) {
+template <class Team>
+CUDEC_HOST_DEVICE inline bool GDeflateReadCodeLengthRounds(Team& t) {
     static_assert(kGDeflateNumLitLenSyms == 257 + ((1u << 5) - 1u),
                   "HLIT is five bits above 257, so the literal/length "
                   "capacity must be the highest value that field reaches");
@@ -439,100 +692,170 @@ CUDEC_HOST_DEVICE inline bool GDeflateReadCodeLengths(
     /* The reference's ENSURE_BITS after BTYPE. Idempotent - a lane at or above
      * the watermark is left alone - so a caller that ensured already is not
      * charged a second word for calling this. */
-    GDeflateEnsure(s, page);
-
-    const uint32_t num_litlen = GDeflatePop(s, 5) + 257u;
-    const uint32_t num_dist = GDeflatePop(s, 5) + 1u;
-    const uint32_t num_explicit = GDeflatePop(s, 4) + 4u;
-    if (s.failed) {
+    t.EnsureLane0();
+    if (t.Failed()) {
         return false;
     }
-    GDeflateEnsure(s, page);
+
+    /* The three counts ride lane 0 and every lane needs them, so they travel
+     * as one packed word: the two five-bit fields and the four-bit one fit in
+     * fourteen bits, and one broadcast is what a lane-0 read costs the team. */
+    uint32_t header = 0;
+    t.Lane0([&](Team& lane0) {
+        auto& b = lane0.Bits();
+        const uint32_t num_litlen = GDeflatePop(b, 5);
+        const uint32_t num_dist = GDeflatePop(b, 5);
+        const uint32_t num_explicit = GDeflatePop(b, 4);
+        header = num_litlen | (num_dist << 5) | (num_explicit << 10);
+    });
+    header = t.Broadcast(header);
+    if (t.Failed()) {
+        return false;
+    }
+    const uint32_t num_litlen = (header & 0x1Fu) + 257u;
+    const uint32_t num_dist = ((header >> 5) & 0x1Fu) + 1u;
+    const uint32_t num_explicit = ((header >> 10) & 0xFu) + 4u;
+    t.EnsureLane0();
+    if (t.Failed()) {
+        return false;
+    }
 
     /* Every precode length the header does not state is zero: HCLEN says how
      * many of the nineteen are present, and an absent one is absent from the
-     * code rather than undefined. */
-    unsigned char precode_lens[kGDeflateNumPrecodeSyms];
-    for (uint32_t i = 0; i < kGDeflateNumPrecodeSyms; i++) {
-        precode_lens[i] = 0;
-    }
-    for (uint32_t i = 0; i < num_explicit; i++) {
-        precode_lens[GDeflatePrecodeOrder(i)] =
-            static_cast<unsigned char>(GDeflatePop(s, 3));
-        GDeflateAdvance(s, page);
-    }
-    if (s.failed) {
+     * code rather than undefined. Each explicit one is its own round on its
+     * own lane, lane i holding the i-th in the permuted order. */
+    t.Build([&](Team& one) {
+        unsigned char* precode_lens = one.PrecodeLens();
+        for (uint32_t i = 0; i < kGDeflateNumPrecodeSyms; i++) {
+            precode_lens[i] = 0;
+        }
+    });
+    t.Round(num_explicit, [&](Team& lane) -> bool {
+        if (!lane.Active()) {
+            return false;
+        }
+        const uint32_t len = GDeflatePop(lane.Bits(), 3);
+        if (!lane.Bits().failed) {
+            lane.PrecodeLens()[GDeflatePrecodeOrder(lane.Lane())] =
+                static_cast<unsigned char>(len);
+        }
+        return true;
+    });
+    if (t.Failed()) {
         return false;
     }
 
-    GDeflatePrecodeTable precode;
-    GDeflateReject precode_why = kGDeflateRejectNone;
-    if (!GDeflateBuildTable(precode_lens, kGDeflateNumPrecodeSyms, precode,
-                            &precode_why)) {
-        /* The flag, not just the return. A precode that is not a code is bad
-         * input like any other refusal here, and this header's own contract
-         * says a caller that checks the sticky flag once at the end reads the
-         * same verdict as one that checks after every call - so a refusal that
-         * left the flag clear would break that contract silently. Found by
-         * fuzz/fuzz_gdeflate_tables.cpp on its first seed replay. */
-        return GDeflateRefuseAs(s, precode_why);
+    t.Build([&](Team& one) {
+        GDeflateReject precode_why = kGDeflateRejectNone;
+        if (!GDeflateBuildTable(one.PrecodeLens(), kGDeflateNumPrecodeSyms,
+                                one.Precode(), &precode_why)) {
+            /* The flag, not just the return. A precode that is not a code is
+             * bad input like any other refusal here, and this header's own
+             * contract says a caller that checks the sticky flag once at the
+             * end reads the same verdict as one that checks after every call
+             * - so a refusal that left the flag clear would break that
+             * contract silently. Found by fuzz/fuzz_gdeflate_tables.cpp on its
+             * first seed replay. */
+            GDeflateRefuseAs(one.Bits(), precode_why);
+        }
+    });
+    if (t.Failed()) {
+        return false;
     }
 
     /* The expansion starts at a reset exactly as the header did, so the first
      * length rides lane 0. */
-    GDeflateReset(s);
+    t.Reset();
     const uint32_t total = num_litlen + num_dist;
-    /* The increment lives in the body because a round writes one length or a
-     * run of them, and which it was is not known until the symbol is decoded.
-     * It terminates on every input all the same: each pass either writes at
-     * least one length or returns, and the run bound below is what keeps the
-     * write inside the alphabet. */
-    for (uint32_t i = 0; i < total;) {
-        const uint32_t presym = GDeflateDecodeSymbol(s, precode);
-        if (presym == kGDeflateNoSymbol) {
-            return false;
-        }
-        if (presym < kGDeflateRepeatPrev) {
-            out.lens[i++] = static_cast<unsigned char>(presym);
-            GDeflateAdvance(s, page);
-            continue;
-        }
-
-        unsigned char rep_val = 0;
-        uint32_t rep_count = 0;
-        if (presym == kGDeflateRepeatPrev) {
-            if (i == 0) {
-                /* Nothing to repeat. The reference refuses this as well, and
-                 * it is the one repeat-code refusal the two decoders share. */
-                return GDeflateRefuse(s, kGDeflateRejectRepeatNothingBefore);
+    /* One length or one run per lane per round, and a lane whose position is
+     * already past the vector takes no step at all: the reference's loop
+     * stops at that lane, and the lanes after it keep their bits. Every
+     * round either advances `filled` by at least one or refuses, and the run
+     * bound below is what keeps the write inside the alphabet; the round cap
+     * is the vector's own length, since a round that fills nothing refuses. */
+    uint64_t filled = 0;
+    for (uint32_t round = 0; round <= total && filled < total; round++) {
+        t.Round(kGDeflateNumStreams, [&](Team& lane) -> bool {
+            GDeflateLaneRead r = {0, kGDeflateRejectNone};
+            GDeflateReject extra_why = kGDeflateRejectNone;
+            uint32_t presym = kGDeflateNoSymbol;
+            uint64_t count = 0;
+            unsigned char value = 0;
+            bool repeat_prev = false;
+            if (lane.Active()) {
+                const uint64_t buf = lane.Bits().Buf();
+                const uint32_t left = lane.Bits().Left();
+                presym = GDeflateResolveSymbol(lane.Precode(), buf, left, r);
+                if (r.why == kGDeflateRejectNone) {
+                    if (presym < kGDeflateRepeatPrev) {
+                        count = 1;
+                        value = static_cast<unsigned char>(presym);
+                    } else {
+                        uint32_t extra = 0;
+                        if (presym == kGDeflateRepeatPrev) {
+                            repeat_prev = true;
+                            extra = 3u + GDeflateReadAhead(buf, left, r, 2);
+                        } else if (presym == kGDeflateRepeatZeroShort) {
+                            extra = 3u + GDeflateReadAhead(buf, left, r, 3);
+                        } else {
+                            extra = 11u + GDeflateReadAhead(buf, left, r, 7);
+                        }
+                        /* The codeword resolved; a shortage here is the extra
+                         * bits', which the reference refuses AFTER the
+                         * nothing-to-repeat check below, so it is held apart
+                         * from the codeword's rung and raised in that order. */
+                        extra_why = r.why;
+                        count = (extra_why == kGDeflateRejectNone) ? extra : 0;
+                    }
+                } else {
+                    count = 0;
+                }
             }
-            rep_val = out.lens[i - 1];
-            rep_count = 3u + GDeflatePop(s, 2);
-        } else if (presym == kGDeflateRepeatZeroShort) {
-            rep_count = 3u + GDeflatePop(s, 3);
-        } else {
-            rep_count = 11u + GDeflatePop(s, 7);
-        }
-        if (s.failed) {
+            const uint64_t start = lane.Claim(filled, count);
+            const bool commit = lane.Active() && start < total;
+            if (commit) {
+                auto& b = lane.Bits();
+                if (r.why != kGDeflateRejectNone) {
+                    GDeflateRefuseAs(b, r.why);
+                } else if (repeat_prev && start == 0) {
+                    /* Nothing to repeat. The reference refuses this as well,
+                     * and it is the one repeat-code refusal the two decoders
+                     * share. */
+                    GDeflateRefuse(b, kGDeflateRejectRepeatNothingBefore);
+                } else if (extra_why != kGDeflateRejectNone) {
+                    GDeflateRefuseAs(b, extra_why);
+                } else if (count > total - start) {
+                    /* See the block comment above: refused rather than
+                     * absorbed into slack this alphabet does not carry.
+                     * Written as a subtraction on the side that cannot
+                     * overflow - `start` is below `total` here, so
+                     * `total - start` is what is left rather than a sum that
+                     * could wrap. */
+                    GDeflateRefuse(b, kGDeflateRejectRepeatRunPastAlphabet);
+                } else {
+                    GDeflateRemove(b, r.consumed);
+                }
+            }
+            const bool writes = commit && !lane.Bits().failed;
+            lane.Serial(writes, [&](Team& one) {
+                unsigned char* lens = one.Lens().lens;
+                if (repeat_prev) {
+                    value = lens[start - 1];
+                }
+                for (uint64_t n = 0; n < count; n++) {
+                    lens[start + n] = value;
+                }
+            });
+            return commit;
+        });
+        if (t.Failed()) {
             return false;
         }
-        if (rep_count > total - i) {
-            /* See the block comment above: refused rather than absorbed into
-             * slack this alphabet does not carry. Written as a subtraction on
-             * the side that cannot overflow - `i` is below `total` here, so
-             * `total - i` is what is left rather than a sum that could wrap. */
-            return GDeflateRefuse(s, kGDeflateRejectRepeatRunPastAlphabet);
-        }
-        for (uint32_t n = 0; n < rep_count; n++) {
-            out.lens[i++] = rep_val;
-        }
-        GDeflateAdvance(s, page);
     }
-    if (s.failed) {
-        return false;
-    }
-    out.num_litlen = num_litlen;
-    out.num_dist = num_dist;
+    t.Build([&](Team& one) {
+        one.Lens().num_litlen = num_litlen;
+        one.Lens().num_dist = num_dist;
+    });
     return true;
 }
 
@@ -540,28 +863,51 @@ CUDEC_HOST_DEVICE inline bool GDeflateReadCodeLengths(
  * Split from the read so the code-length round is provable on its own - a
  * vector recovered wrongly and a vector that merely fails to build a table are
  * different failures, and one entry point would report them as one. */
-CUDEC_HOST_DEVICE inline bool GDeflateReadDynamicTables(
-    GDeflateSchedule& s, const unsigned char* page, GDeflateCodeLengths& lens,
-    GDeflateLitLenTable& litlen, GDeflateDistTable& dist) {
-    if (!GDeflateReadCodeLengths(s, page, lens)) {
+template <class Team>
+CUDEC_HOST_DEVICE inline bool GDeflateReadDynamicTableRounds(Team& t) {
+    if (!GDeflateReadCodeLengthRounds(t)) {
         return false;
     }
-    GDeflateReject why = kGDeflateRejectNone;
-    if (!GDeflateBuildTable(lens.lens, lens.num_litlen, litlen, &why)) {
-        /* A vector that is not a code is bad input, so the schedule carries
-         * the same verdict a bad round would leave: a caller that checks only
-         * the flag must not read this as a page still worth decoding. The rung
-         * is the one the construction named, not a second one saying which of
-         * the two vectors carried it: what refused is the property of the
-         * lengths, and a rung per call site would be two rungs one negative
-         * could not tell apart. */
-        return GDeflateRefuseAs(s, why);
-    }
-    if (!GDeflateBuildTable(lens.lens + lens.num_litlen, lens.num_dist, dist,
-                            &why)) {
-        return GDeflateRefuseAs(s, why);
-    }
-    return true;
+    t.Build([&](Team& one) {
+        GDeflateReject why = kGDeflateRejectNone;
+        const GDeflateCodeLengths& lens = one.Lens();
+        if (!GDeflateBuildTable(lens.lens, lens.num_litlen, one.LitLen(),
+                                &why)) {
+            /* A vector that is not a code is bad input, so the schedule
+             * carries the same verdict a bad round would leave: a caller that
+             * checks only the flag must not read this as a page still worth
+             * decoding. The rung is the one the construction named, not a
+             * second one saying which of the two vectors carried it: what
+             * refused is the property of the lengths, and a rung per call
+             * site would be two rungs one negative could not tell apart. */
+            GDeflateRefuseAs(one.Bits(), why);
+            return;
+        }
+        if (!GDeflateBuildTable(lens.lens + lens.num_litlen, lens.num_dist,
+                                one.Dist(), &why)) {
+            GDeflateRefuseAs(one.Bits(), why);
+        }
+    });
+    return !t.Failed();
+}
+
+/* The sequential entry points, which the twins and the fuzz targets drive:
+ * the rounds above over the host team, on a schedule positioned immediately
+ * after BTYPE has been popped off lane 0. */
+inline bool GDeflateReadCodeLengths(GDeflateSchedule& s,
+                                    const unsigned char* page,
+                                    GDeflateCodeLengths& out) {
+    GDeflateHostTeam t(s, page, &out, nullptr, nullptr);
+    return GDeflateReadCodeLengthRounds(t);
+}
+
+inline bool GDeflateReadDynamicTables(GDeflateSchedule& s,
+                                      const unsigned char* page,
+                                      GDeflateCodeLengths& lens,
+                                      GDeflateLitLenTable& litlen,
+                                      GDeflateDistTable& dist) {
+    GDeflateHostTeam t(s, page, &lens, &litlen, &dist);
+    return GDeflateReadDynamicTableRounds(t);
 }
 
 }  // namespace cudec_detail

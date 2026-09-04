@@ -129,17 +129,14 @@ int main(void) {
                                             aligned,
                                             0) == CUDEC_ERR_INVALID_ARGUMENT);
 
-    /* The ninth class, which exists on this entry and on neither of the
-     * others: a batch that PASSES validation while this build carries no
-     * GDeflate kernel is answered with the defined not-implemented status.
-     * Safe here for the same reason every call above is - the entry makes
-     * no CUDA call and dereferences none of these host pointers - and it is
-     * what freezes the contract: the day the kernel lands this line becomes
-     * an assertion about output, and until then it refuses both a silent
-     * CUDEC_OK over a batch nothing decoded and an absent symbol. */
-    REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 1,
-                                            aligned,
-                                            0) == CUDEC_ERR_NOT_IMPLEMENTED);
+    /* The ninth class this entry carried while it had no kernel - a
+     * validation-passing batch answered with the defined not-implemented
+     * status - is gone with the kernel (issue #214), and no call replaces it
+     * here: an accepted batch now reaches a launch, and these are host
+     * pointers this GPU-less test must never hand to one. What that class
+     * froze still holds and is asserted where a device can read it: the
+     * symbol and the eight reject classes above did not move, and
+     * tests/launch_fail.cpp holds the launch half on a GPU-less process. */
 
     /* The same nine classes on the Zstd entry (issue #427), written out call
      * for call for the reason the two blocks above are: a future entry wired

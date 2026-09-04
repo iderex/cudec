@@ -50,23 +50,20 @@ int main() {
     REQUIRE(cudec_snappy_decompress_batch(srcs, sizes, dsts, caps, 1, results,
                                           nullptr) == CUDEC_ERR_CUDA);
 
-    /* The GDeflate entry, whose second half is the OPPOSITE assertion and
-     * is why it belongs in this file at all (issue #216). With no visible
-     * device, any CUDA call this entry made would fail, so an entry that
-     * launched, or merely drained the pending error state, would answer
-     * CUDEC_ERR_CUDA here. Answering the defined not-implemented status
-     * instead is the evidence that a batch it accepts reaches the CUDA
-     * runtime not at all. Twice, for the reason the calls above are twice:
-     * a first-touch context init failing once would look the same. */
+    /* The GDeflate entry's two halves, the same shape as the two above now
+     * that its kernel stands behind the frozen contract (issues #216, #214).
+     * Until then the second half was the OPPOSITE assertion - the defined
+     * not-implemented status, as the evidence that an accepted batch reached
+     * the runtime not at all - and the day the kernel landed it flipped to
+     * the launch-failure answer, which is the cleanest record of the landing
+     * this file can hold. Twice, for the reason the calls above are twice. */
     REQUIRE(cudec_gdeflate_decompress_batch(nullptr, sizes, dsts, caps, 1,
                                             results, nullptr) ==
             CUDEC_ERR_INVALID_ARGUMENT);
     REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 1,
-                                            results, nullptr) ==
-            CUDEC_ERR_NOT_IMPLEMENTED);
+                                            results, nullptr) == CUDEC_ERR_CUDA);
     REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 1,
-                                            results, nullptr) ==
-            CUDEC_ERR_NOT_IMPLEMENTED);
+                                            results, nullptr) == CUDEC_ERR_CUDA);
 
     /* The Zstd entry, the same opposite assertion and for the same reason
      * (issue #427). Written out rather than folded into a loop over the two
@@ -80,8 +77,8 @@ int main() {
     REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 1, results,
                                         nullptr) == CUDEC_ERR_NOT_IMPLEMENTED);
 
-    std::printf("PASS: with zero visible devices the two kernel-backed batch "
-                "entries report CUDEC_ERR_CUDA and the GDeflate and Zstd "
-                "entries report CUDEC_ERR_NOT_IMPLEMENTED\n");
+    std::printf("PASS: with zero visible devices the three kernel-backed batch "
+                "entries report CUDEC_ERR_CUDA and the Zstd entry reports "
+                "CUDEC_ERR_NOT_IMPLEMENTED\n");
     return 0;
 }

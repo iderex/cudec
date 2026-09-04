@@ -234,6 +234,15 @@ cudec_add_test(gdeflate_departure_lock SOURCES gdeflate_departure_lock.cpp LIBS
                gdeflate_oracle)
 target_include_directories(gdeflate_departure_lock
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The GDeflate warp kernel on the device (issue #214): the reference's
+# compressor makes the pages, every page goes through the batch entry into a
+# poisoned tile, and the answer is held to the source and to the host twin -
+# bytes on a decode, rung on a refusal - so the oracle parity and the reject
+# ladder the twin established become the kernel's. GPU-labelled: it drives the
+# shipped kernel. It links gdeflate_oracle for the compressor, and reaches
+# src/ for the twin it compares against.
+cudec_add_test(gdeflate_device SOURCES gdeflate_device.cu GPU LIBS
+               gdeflate_oracle)
 # The reference's own decode behaviours, executed rather than read (issue
 # #155). Host-side and GPU-less on purpose: it is the oracle answering, and
 # the answers are what the M3 fail-closed matrix is allowed to lock against.

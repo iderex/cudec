@@ -1,6 +1,7 @@
 #include "cudec.h"
 #include "chunk_decode.cuh"
 #include "batch_limits.h"
+#include "gdeflate_decode.cuh"
 #include "lz4_block.h"
 #include "snappy_block.h"
 
@@ -8,29 +9,52 @@
 
 namespace {
 
-/* The launch, written once for both widths. The grid is a whole number of
- * blocks and each block is kBlockWarps waves at whichever width was selected,
- * so the geometry the kernel refuses - a block that is not a wave multiple -
- * cannot be produced by either arm. */
-template <class Parser, int WaveSize>
-void launch_decode(const void* const* d_src_ptrs, const size_t* d_src_sizes,
-                   void* const* d_dst_ptrs, const size_t* d_dst_capacities,
-                   size_t chunk_count, cudec_chunk_result* d_results,
-                   cudec_stream_t stream) {
-    cudec_detail::chunk_decode_batch<Parser, false, WaveSize>
-        <<<cudec_detail::decode_grid_blocks(chunk_count),
-           cudec_detail::kBlockThreadsFor<WaveSize>, 0,
-           cudec_rt::stream_from_abi(stream)>>>(
-            d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
-            d_results);
-}
-
-/* The two entries differ in one template argument and in nothing else, so
- * the body they share is written once. Templated rather than handed a
- * function pointer: a launch through an indirect call would put the kernel
- * address in device memory and cost the compiler the inlining the parser
- * depends on. */
+/* The launches, written once per kernel family and once for both widths.
+ * The grid is a whole number of blocks and each block is kBlockWarps waves at
+ * whichever width was selected, so the geometry the kernels refuse - a block
+ * that is not a wave multiple - cannot be produced by either arm. A launcher
+ * is a type with one static template rather than a function template,
+ * because the submission below is written once over the launcher and a
+ * function template cannot be a template argument. */
 template <class Parser>
+struct ChunkLaunch {
+    template <int WaveSize>
+    static void Run(const void* const* d_src_ptrs, const size_t* d_src_sizes,
+                    void* const* d_dst_ptrs, const size_t* d_dst_capacities,
+                    size_t chunk_count, cudec_chunk_result* d_results,
+                    cudec_stream_t stream) {
+        cudec_detail::chunk_decode_batch<Parser, false, WaveSize>
+            <<<cudec_detail::decode_grid_blocks(chunk_count),
+               cudec_detail::kBlockThreadsFor<WaveSize>, 0,
+               cudec_rt::stream_from_abi(stream)>>>(
+                d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities,
+                chunk_count, d_results);
+    }
+};
+
+/* One team per page rather than one lane-lockstep parse per chunk, and the
+ * same block shape: kBlockWarps teams to a block, so the grid arithmetic the
+ * chunk decoder settled serves the page decoder unchanged. */
+struct GDeflateLaunch {
+    template <int WaveSize>
+    static void Run(const void* const* d_src_ptrs, const size_t* d_src_sizes,
+                    void* const* d_dst_ptrs, const size_t* d_dst_capacities,
+                    size_t chunk_count, cudec_chunk_result* d_results,
+                    cudec_stream_t stream) {
+        cudec_detail::gdeflate_decode_batch<WaveSize>
+            <<<cudec_detail::decode_grid_blocks(chunk_count),
+               cudec_detail::kBlockThreadsFor<WaveSize>, 0,
+               cudec_rt::stream_from_abi(stream)>>>(
+                d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities,
+                chunk_count, d_results);
+    }
+};
+
+/* The entries differ in which launcher they name and in nothing else, so the
+ * body they share is written once. Templated rather than handed a function
+ * pointer: a launch through an indirect call would put the kernel address in
+ * device memory and cost the compiler the inlining the parser depends on. */
+template <class Launch>
 cudec_status submit_batch(const void* const* d_src_ptrs,
                           const size_t* d_src_sizes, void* const* d_dst_ptrs,
                           const size_t* d_dst_capacities, size_t chunk_count,
@@ -72,12 +96,12 @@ cudec_status submit_batch(const void* const* d_src_ptrs,
      * #212 holds the same property for the HIP binary. */
     switch (cudec_detail::select_wave_instantiation(reported_width)) {
         case cudec_detail::WaveInstantiation::kWave32:
-            launch_decode<Parser, cudec_detail::kWaveWidth32>(
+            Launch::template Run<cudec_detail::kWaveWidth32>(
                 d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities,
                 chunk_count, d_results, stream);
             break;
         case cudec_detail::WaveInstantiation::kWave64:
-            launch_decode<Parser, cudec_detail::kWaveWidth64>(
+            Launch::template Run<cudec_detail::kWaveWidth64>(
                 d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities,
                 chunk_count, d_results, stream);
             break;
@@ -97,7 +121,7 @@ cudec_status cudec_lz4_decompress_batch(const void* const* d_src_ptrs,
                                         size_t chunk_count,
                                         cudec_chunk_result* d_results,
                                         cudec_stream_t stream) {
-    return submit_batch<cudec_detail::Lz4Parser>(
+    return submit_batch<ChunkLaunch<cudec_detail::Lz4Parser> >(
         d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
         d_results, stream);
 }
@@ -109,18 +133,33 @@ cudec_status cudec_snappy_decompress_batch(const void* const* d_src_ptrs,
                                            size_t chunk_count,
                                            cudec_chunk_result* d_results,
                                            cudec_stream_t stream) {
-    return submit_batch<cudec_detail::SnappyParser>(
+    return submit_batch<ChunkLaunch<cudec_detail::SnappyParser> >(
         d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
         d_results, stream);
 }
 
-/* The GDeflate and Zstd entries are the frozen contracts without their
- * kernels behind them yet (issues #216 and #427). Each shares the validator
- * with the two above rather than growing its own, so the reject classes
- * cannot drift apart while they are being frozen, and then stops: no launch,
- * and deliberately no cudec_rt::get_last_error() drain either. Draining is how the entries above
- * buy a
- * post-launch check that reports their own submission; with nothing
+/* The GDeflate entry: the frozen contract with its kernel behind it (issues
+ * #216, #214). It shares the validator, the width query and the post-launch
+ * check with the two above, so the reject classes and the launch discipline
+ * cannot drift apart between the families. */
+cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
+                                             const size_t* d_src_sizes,
+                                             void* const* d_dst_ptrs,
+                                             const size_t* d_dst_capacities,
+                                             size_t chunk_count,
+                                             cudec_chunk_result* d_results,
+                                             cudec_stream_t stream) {
+    return submit_batch<GDeflateLaunch>(d_src_ptrs, d_src_sizes, d_dst_ptrs,
+                                        d_dst_capacities, chunk_count,
+                                        d_results, stream);
+}
+
+/* The Zstd entry is the frozen contract without its kernel behind it yet
+ * (issue #427). It shares the validator with the three above rather than
+ * growing its own, so the reject classes cannot drift apart while it is being
+ * frozen, and then stops: no launch, and deliberately no
+ * cudec_rt::get_last_error() drain either. Draining is how the entries above
+ * buy a post-launch check that reports their own submission; with nothing
  * submitted there is nothing to report, and consuming a caller's pending
  * error on the way to answering "not built here" would be this entry
  * altering CUDA state it never used.
@@ -130,26 +169,6 @@ cudec_status cudec_snappy_decompress_batch(const void* const* d_src_ptrs,
  * not-implemented answer there is the evidence that this path touches the
  * runtime at all only through the validator, which touches it not at
  * all. */
-cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
-                                             const size_t* d_src_sizes,
-                                             void* const* d_dst_ptrs,
-                                             const size_t* d_dst_capacities,
-                                             size_t chunk_count,
-                                             cudec_chunk_result* d_results,
-                                             cudec_stream_t stream) {
-    (void)stream;
-    const cudec_status valid = cudec_detail::validate_batch_args(
-        d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
-        d_results);
-    if (valid != CUDEC_OK) {
-        return valid;
-    }
-    return CUDEC_ERR_NOT_IMPLEMENTED;
-}
-
-/* The Zstd entry, the same shape and for the same reasons - the comment above
- * covers both, and the unit each accepts is the only thing that differs
- * between them. */
 cudec_status cudec_zstd_decompress_batch(const void* const* d_src_ptrs,
                                          const size_t* d_src_sizes,
                                          void* const* d_dst_ptrs,

@@ -66,6 +66,11 @@
 #define CUDEC_RT_DEVICE_GET_ATTRIBUTE hipDeviceGetAttribute
 #define CUDEC_RT_ATTR_WAVE_WIDTH hipDeviceAttributeWarpSize
 #define CUDEC_RT_FIXED_WAVE_WIDTH 0
+/* The mask that names every lane of a wave, in the width the backend's
+ * collectives take it: sixty-four bits here, where a wave may be sixty-four
+ * lanes wide. A kernel names its participants with this and never with a
+ * literal, so one spelling is right on both backends. */
+#define CUDEC_RT_WAVE_FULL_MASK 0xffffffffffffffffull
 
 #else
 #include <cuda_runtime.h>
@@ -98,6 +103,7 @@
 #define CUDEC_RT_DEVICE_GET_ATTRIBUTE cudaDeviceGetAttribute
 #define CUDEC_RT_ATTR_WAVE_WIDTH cudaDevAttrWarpSize
 #define CUDEC_RT_FIXED_WAVE_WIDTH 32
+#define CUDEC_RT_WAVE_FULL_MASK 0xffffffffu
 
 #endif
 

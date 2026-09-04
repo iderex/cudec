@@ -40,14 +40,25 @@
  * malformed. Nothing here ever sizes anything from the stream.
  *
  * THE HOST SHAPE AND THE DEVICE SHAPE ARE THE SAME FUNCTION, NOT THE SAME
- * LAYOUT. This struct holds all 32 lane buffers because the CPU twin runs the
- * lanes sequentially in one thread. In the warp kernel each lane owns its own
- * bit buffer and occupancy in registers while the lane index and the cursor
- * are warp-uniform, so the kernel instantiates the same arithmetic over a
- * different residency. What must not fork is the schedule itself, which is why
- * it lives in one place. The cursor is 64-bit for the reason the other parsers
- * give: the caller's sizes are size_t, and mixing widths in a bound comparison
- * is where an overflow hides. */
+ * LAYOUT. GDeflateSchedule holds all 32 lane buffers because the CPU twin runs
+ * the lanes sequentially in one thread. In the warp kernel each lane owns its
+ * own bit buffer and occupancy in registers while the cursor is warp-uniform,
+ * so the kernel instantiates the same arithmetic over a different residency
+ * (issue #214). That is why every primitive below is a template over the
+ * residency `S` rather than a function of GDeflateSchedule: `S` supplies the
+ * current lane's buffer and occupancy through Buf() and Left(), the sticky
+ * verdict through `failed` and `reject`, and the page's word count through
+ * `word_count`, and the arithmetic is written once. What must not fork is the
+ * schedule itself, which is why it lives in one place. The cursor is 64-bit
+ * for the reason the other parsers give: the caller's sizes are size_t, and
+ * mixing widths in a bound comparison is where an overflow hides.
+ *
+ * WHERE A RUNG IS NAMED. Each refusal below is named at exactly one site, and
+ * the sites that both residencies reach - the width checks of a read, the
+ * occupancy check of a remove, the bound of a refill, the shape of a page -
+ * name their rung into a caller's slot the way the table construction in
+ * src/gdeflate_tables.h does, so that a sequential Pop and a per-lane read on
+ * the device raise the same branch from the same line. */
 #ifndef CUDEC_GDEFLATE_SCHEDULE_H
 #define CUDEC_GDEFLATE_SCHEDULE_H
 
@@ -175,7 +186,7 @@ static_assert(kGDeflateRejectCount == kGDeflateRejectBlockLast + 1,
  * that libdeflate's GDeflate decompressor decodes, and each one is a decision
  * argued at its own refusal site rather than an accident:
  *
- *   - kGDeflateRejectRefillPastEnd, at GDeflateEnsure below: the reference
+ *   - kGDeflateRejectRefillPastEnd, at GDeflateRefillLane below: the reference
  *     reads a word past the last one the page holds, which the format's
  *     watermark discipline makes safe on a well-formed page and nothing makes
  *     safe on a hostile one.
@@ -217,7 +228,12 @@ CUDEC_HOST_DEVICE inline bool GDeflateRejectIsDeclaredDeparture(
 /* The 32 lane bit buffers, the current lane, and the one shared word cursor.
  * The failure flag is sticky: once set, every operation is a no-op, so a
  * caller that checks it once at the end reads the same verdict as one that
- * checks after every call. */
+ * checks after every call.
+ *
+ * This is the HOST residency of the schedule: one thread, every lane. Buf()
+ * and Left() are what the primitives below are written against, and here they
+ * select the current lane; the device residency in src/gdeflate_decode.cuh
+ * answers them with the one lane the calling thread owns. */
 struct GDeflateSchedule {
     uint64_t bitbuf[kGDeflateNumStreams];
     uint32_t bitsleft[kGDeflateNumStreams];
@@ -231,6 +247,11 @@ struct GDeflateSchedule {
      * a test asserting that its negative reached the branch it was written
      * for. Set only through the choke point below. */
     GDeflateReject reject;
+
+    CUDEC_HOST_DEVICE uint64_t& Buf() { return bitbuf[idx]; }
+    CUDEC_HOST_DEVICE const uint64_t& Buf() const { return bitbuf[idx]; }
+    CUDEC_HOST_DEVICE uint32_t& Left() { return bitsleft[idx]; }
+    CUDEC_HOST_DEVICE const uint32_t& Left() const { return bitsleft[idx]; }
 };
 
 /* THE ONE PLACE A REFUSAL IS RECORDED, for the reason SnappyRefuse is one in
@@ -244,8 +265,8 @@ struct GDeflateSchedule {
  * FIRST REFUSAL WINS. The flag is sticky and every operation is a no-op once
  * it is set, so a later call could only overwrite the branch with a
  * consequence of the first one. */
-CUDEC_HOST_DEVICE inline bool GDeflateRefuse(GDeflateSchedule& s,
-                                             GDeflateReject branch) {
+template <class S>
+CUDEC_HOST_DEVICE inline bool GDeflateRefuse(S& s, GDeflateReject branch) {
     if (!s.failed) {
         s.failed = true;
         s.reject = branch;
@@ -261,7 +282,8 @@ CUDEC_HOST_DEVICE inline bool GDeflateRefuse(GDeflateSchedule& s,
  * branch off the call site: a site passing a variable would have to be
  * exempted from that read, and an exemption spelled the same way as the rule
  * is how the rule stops being read. */
-CUDEC_HOST_DEVICE inline bool GDeflateRefuseAs(GDeflateSchedule& s,
+template <class S>
+CUDEC_HOST_DEVICE inline bool GDeflateRefuseAs(S& s,
                                                GDeflateReject already_named) {
     if (!s.failed) {
         s.failed = true;
@@ -294,28 +316,153 @@ CUDEC_HOST_DEVICE inline uint32_t GDeflateWordAt(const unsigned char* page,
            (static_cast<uint32_t>(p[3]) << 24);
 }
 
+/* A READ AHEAD OF THE LANE, WITHOUT CONSUMING. `consumed` is how many bits the
+ * caller has already read ahead and not yet removed, so a caller can resolve a
+ * codeword and the extra bits behind it as one speculative read and then
+ * remove the whole width at once - or remove nothing, which is how the warp
+ * kernel discards the lanes that must not have consumed after an end-of-block
+ * (docs/MASTERPLAN.md section 13.2). `why` is the rung the read refused on, and
+ * a read past a refusal returns zero and reads nothing more.
+ *
+ * The two refusals here are the two GDeflatePop always carried, in the same
+ * order: a width past the format's widest field is a caller asking for
+ * something no page encodes, while a lane that cannot serve a legal width is a
+ * page that ran out of bits where the schedule says it should not have. A
+ * single rung would let a negative for either satisfy the other. */
+struct GDeflateLaneRead {
+    uint32_t consumed;
+    GDeflateReject why;
+};
+
+CUDEC_HOST_DEVICE inline uint32_t GDeflateReadAhead(uint64_t bitbuf,
+                                                    uint32_t bitsleft,
+                                                    GDeflateLaneRead& r,
+                                                    uint32_t n) {
+    if (r.why != kGDeflateRejectNone) {
+        return 0;
+    }
+    if (n > kGDeflateMaxPopBits) {
+        GDeflateTableRefuse(&r.why, kGDeflateRejectPopWidthPastFormat);
+        return 0;
+    }
+    if (n > bitsleft - r.consumed) {
+        GDeflateTableRefuse(&r.why, kGDeflateRejectPopPastLane);
+        return 0;
+    }
+    /* `consumed + n` is at most `bitsleft`, which is below the buffer width,
+     * so neither shift can reach the undefined range; n == 0 reads nothing and
+     * the mask below is zero for it. */
+    const uint64_t window = bitbuf >> r.consumed;
+    const uint64_t mask = (static_cast<uint64_t>(1) << n) - 1u;
+    r.consumed += n;
+    return static_cast<uint32_t>(window & mask);
+}
+
+/* Whether a lane holding `bitsleft` bits can give up `n`. The occupancy is
+ * unsigned, so an unchecked subtraction would wrap to a lane that appears to
+ * hold four billion bits; this is the one site that names that rung, and both
+ * the sequential remove and the accelerator hit in src/gdeflate_tables.h ask it
+ * before they shift. */
+CUDEC_HOST_DEVICE inline bool GDeflateRemoveCheck(uint32_t bitsleft, uint32_t n,
+                                                  GDeflateReject* why) {
+    if (n > bitsleft) {
+        return GDeflateTableRefuse(why, kGDeflateRejectRemovePastLane);
+    }
+    return true;
+}
+
+/* Remove n bits from the current lane. Refuses rather than underflowing. */
+template <class S>
+CUDEC_HOST_DEVICE inline void GDeflateRemove(S& s, uint32_t n) {
+    if (s.failed) {
+        return;
+    }
+    GDeflateReject why = kGDeflateRejectNone;
+    if (!GDeflateRemoveCheck(s.Left(), n, &why)) {
+        GDeflateRefuseAs(s, why);
+        return;
+    }
+    s.Buf() >>= n;
+    s.Left() -= n;
+}
+
+/* Read n bits from the current lane without removing them. The width bound is
+ * not a policy: a shift of 64 or more is undefined, and this is a const read
+ * with no failure flag to set, so the only fail-closed answer available here
+ * is to hand back nothing. A caller reaching this is asking for a width the
+ * format has no field for, and the Remove that follows a peek carries the
+ * refusal that stops it going further. */
+template <class S>
+CUDEC_HOST_DEVICE inline uint32_t GDeflatePeek(const S& s, uint32_t n) {
+    if (n == 0 || n > kGDeflateMaxPopBits) {
+        return 0;
+    }
+    return static_cast<uint32_t>(s.Buf() &
+                                 ((static_cast<uint64_t>(1) << n) - 1));
+}
+
+/* Peek and remove. No refill: refills belong to Advance, and a read that
+ * quietly topped a lane up would move a word at a point the format does not,
+ * which is precisely the off-by-one this header exists to prevent. The width
+ * checks are GDeflateReadAhead's, so the sequential pop and the speculative
+ * per-lane read refuse from one site each. */
+template <class S>
+CUDEC_HOST_DEVICE inline uint32_t GDeflatePop(S& s, uint32_t n) {
+    if (s.failed) {
+        return 0;
+    }
+    GDeflateLaneRead r = {0, kGDeflateRejectNone};
+    const uint32_t value = GDeflateReadAhead(s.Buf(), s.Left(), r, n);
+    if (r.why != kGDeflateRejectNone) {
+        GDeflateRefuseAs(s, r.why);
+        return 0;
+    }
+    GDeflateRemove(s, n);
+    return value;
+}
+
+/* Hand the current lane the word at `word`. The bound is the page's word
+ * count, which came from the caller's compressed size and never from the
+ * bits; a well-formed page cannot reach past it, so this is a refusal and not
+ * a tail case: a decoder that carried on with a short buffer would be reading
+ * the lane's stale bits as if the stream had supplied them. The sequential
+ * Ensure below and the warp kernel's collective refill both take their word
+ * through here, so the rung has one site. */
+template <class S>
+CUDEC_HOST_DEVICE inline void GDeflateRefillLane(S& s,
+                                                 const unsigned char* page,
+                                                 uint64_t word) {
+    if (s.failed) {
+        return;
+    }
+    if (word >= s.word_count) {
+        GDeflateRefuse(s, kGDeflateRejectRefillPastEnd);
+        return;
+    }
+    s.Buf() |= static_cast<uint64_t>(GDeflateWordAt(page, word)) << s.Left();
+    s.Left() += kGDeflateBitsPerPacket;
+}
+
+/* Whether a lane is due a word: below the watermark, and not already failed,
+ * since a failed lane consumes nothing more. Named so the kernel's collective
+ * refill and the sequential one ask the same question. */
+template <class S>
+CUDEC_HOST_DEVICE inline bool GDeflateLaneNeedsRefill(const S& s) {
+    return !s.failed && s.Left() < kGDeflateLowWatermarkBits;
+}
+
 /* Refill the CURRENT lane if it has fallen below the watermark. Consumes at
  * most one word and never runs past the page. */
 CUDEC_HOST_DEVICE inline void GDeflateEnsure(GDeflateSchedule& s,
                                              const unsigned char* page) {
+    if (!GDeflateLaneNeedsRefill(s)) {
+        return;
+    }
+    GDeflateRefillLane(s, page, s.cursor);
     if (s.failed) {
         return;
     }
-    if (s.bitsleft[s.idx] >= kGDeflateLowWatermarkBits) {
-        return;
-    }
-    if (s.cursor >= s.word_count) {
-        /* The page has no word left to give this lane. A well-formed page
-         * cannot reach here, so this is a refusal and not a tail case: a
-         * decoder that carried on with a short buffer would be reading the
-         * lane's stale bits as if the stream had supplied them. */
-        GDeflateRefuse(s, kGDeflateRejectRefillPastEnd);
-        return;
-    }
-    s.bitbuf[s.idx] |= static_cast<uint64_t>(GDeflateWordAt(page, s.cursor))
-                       << s.bitsleft[s.idx];
     s.cursor += 1;
-    s.bitsleft[s.idx] += kGDeflateBitsPerPacket;
 }
 
 /* Ensure the current lane, then rotate. This order IS the schedule: the word a
@@ -343,6 +490,27 @@ CUDEC_HOST_DEVICE inline void GDeflateReset(GDeflateSchedule& s) {
     s.idx = 0;
 }
 
+/* The shape a page must have before a lane is primed: whole words only, and
+ * at least one word per lane. A trailing partial word is not a word this
+ * schedule could hand a lane, and rounding down would leave those bytes
+ * reachable by nothing while the page still claimed them; and draft section
+ * 5.3 says the first round always loads 32 consecutive words, so a stream
+ * below 128 bytes cannot be valid and is refused here rather than discovered
+ * part-way through the priming round. Both residencies prime through this, so
+ * each rung has one site. */
+CUDEC_HOST_DEVICE inline bool GDeflatePageShape(uint64_t page_bytes,
+                                                uint64_t* word_count,
+                                                GDeflateReject* why) {
+    *word_count = page_bytes / 4u;
+    if (page_bytes % 4u != 0u) {
+        return GDeflateTableRefuse(why, kGDeflateRejectPagePartialWord);
+    }
+    if (*word_count < kGDeflateNumStreams) {
+        return GDeflateTableRefuse(why, kGDeflateRejectPageBelowPrimingRound);
+    }
+    return true;
+}
+
 /* The priming round: one word into each lane, in lane order, leaving the
  * cursor at word 32 and the current lane back at 0. Returns false and leaves
  * the schedule failed if the page cannot carry it. */
@@ -357,79 +525,14 @@ CUDEC_HOST_DEVICE inline bool GDeflateInit(GDeflateSchedule& s,
     s.cursor = 0;
     s.failed = false;
     s.reject = kGDeflateRejectNone;
-    s.word_count = page_bytes / 4u;
-    /* Whole words only. A trailing partial word is not a word this schedule
-     * could hand a lane, and rounding down would leave those bytes reachable
-     * by nothing while the page still claimed them. */
-    if (page_bytes % 4u != 0u) {
-        return GDeflateRefuse(s, kGDeflateRejectPagePartialWord);
-    }
-    if (s.word_count < kGDeflateNumStreams) {
-        /* Draft section 5.3: the first round always loads 32 consecutive
-         * words, so a stream below 128 bytes cannot be valid. Refused here
-         * rather than discovered part-way through the priming round. */
-        return GDeflateRefuse(s, kGDeflateRejectPageBelowPrimingRound);
+    GDeflateReject why = kGDeflateRejectNone;
+    if (!GDeflatePageShape(page_bytes, &s.word_count, &why)) {
+        return GDeflateRefuseAs(s, why);
     }
     for (uint32_t n = 0; n < kGDeflateNumStreams; ++n) {
         GDeflateAdvance(s, page);
     }
     return !s.failed;
-}
-
-/* Read n bits from the current lane without removing them. The width bound is
- * not a policy: a shift of 64 or more is undefined, and this is a const read
- * with no failure flag to set, so the only fail-closed answer available here
- * is to hand back nothing. A caller reaching this is asking for a width the
- * format has no field for, and the Remove that follows a peek carries the
- * refusal that stops it going further. */
-CUDEC_HOST_DEVICE inline uint32_t GDeflatePeek(const GDeflateSchedule& s,
-                                               uint32_t n) {
-    if (n == 0 || n > kGDeflateMaxPopBits) {
-        return 0;
-    }
-    return static_cast<uint32_t>(s.bitbuf[s.idx] &
-                                 ((static_cast<uint64_t>(1) << n) - 1));
-}
-
-/* Remove n bits from the current lane. Refuses rather than underflowing: the
- * occupancy is unsigned, so an unchecked subtraction would wrap to a lane that
- * appears to hold four billion bits. */
-CUDEC_HOST_DEVICE inline void GDeflateRemove(GDeflateSchedule& s, uint32_t n) {
-    if (s.failed) {
-        return;
-    }
-    if (n > s.bitsleft[s.idx]) {
-        GDeflateRefuse(s, kGDeflateRejectRemovePastLane);
-        return;
-    }
-    s.bitbuf[s.idx] >>= n;
-    s.bitsleft[s.idx] -= n;
-}
-
-/* Peek and remove. No refill: refills belong to Advance, and a read that
- * quietly topped a lane up would move a word at a point the format does not,
- * which is precisely the off-by-one this header exists to prevent. */
-CUDEC_HOST_DEVICE inline uint32_t GDeflatePop(GDeflateSchedule& s, uint32_t n) {
-    if (s.failed) {
-        return 0;
-    }
-    /* Two refusals rather than one condition, because they are different
-     * failures and the ladder is what says so: a width past the format's
-     * widest field is a caller asking for something no page encodes, while a
-     * lane that cannot serve a legal width is a page that ran out of bits
-     * where the schedule says it should not have. A single rung would let a
-     * negative for either satisfy the other. */
-    if (n > kGDeflateMaxPopBits) {
-        GDeflateRefuse(s, kGDeflateRejectPopWidthPastFormat);
-        return 0;
-    }
-    if (n > s.bitsleft[s.idx]) {
-        GDeflateRefuse(s, kGDeflateRejectPopPastLane);
-        return 0;
-    }
-    const uint32_t value = GDeflatePeek(s, n);
-    GDeflateRemove(s, n);
-    return value;
 }
 
 /* The sum of every lane's occupancy. The reference computes exactly this to
