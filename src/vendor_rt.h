@@ -13,13 +13,24 @@
  * the columns by eye, and a configure-time rule (tests/CMakeLists.txt, issue
  * #240) reds the build when one column grows an entry the other does not.
  *
- * WHAT THIS HEADER DOES NOT CLAIM. No hipcc has ever compiled the HIP arm: no
- * ROCm toolchain exists on the machine this landed from, and CMakeLists.txt
- * refuses CUDEC_ENABLE_HIP fail-closed for the same reason. The mapping is
- * proven CONSISTENT (both arms define the same operations, the CUDA arm builds
- * and passes the whole gate) and is NOT proven CORRECT: a name mapped to the
- * wrong HIP entry point compiles clean on CUDA and reds only under a compiler
- * nobody here has. Issue #210 is the route to that compiler.
+ * WHAT THIS HEADER DOES NOT CLAIM, AND THE COMPILER HALF HAS EXPIRED. It said
+ * no hipcc had ever compiled the HIP arm, because no ROCm toolchain exists on
+ * the machine it landed from. A hipcc compiles this arm on every pull request
+ * now: the CI hip job configures CUDEC_ENABLE_HIP in a digest-pinned ROCm
+ * image and builds the library's translation units, which include this header
+ * (issue #210). So a name this table spells wrongly enough to break
+ * compilation reds there, and the absence of a toolchain on any one machine is
+ * no longer what decides it.
+ *
+ * WHAT THE COMPILER DID NOT DECIDE IS THE HALF THAT MATTERS. The mapping is
+ * proven CONSISTENT - both arms define the same operations, the CUDA arm
+ * builds and passes the whole gate, and a configure-time rule reds when one
+ * column grows an entry the other does not - and is still NOT proven CORRECT:
+ * a name mapped to the WRONG HIP entry point of the right shape compiles clean
+ * on both backends and reds only where the call runs. No AMD device has ever
+ * executed one line of it. That answer comes from hardware, which is issue
+ * #415 and the runbook at docs/AMD-VALIDATION.md; a compiler was never going
+ * to give it.
  *
  * INTERNAL - never part of the public C ABI in include/cudec.h. The public
  * status CUDEC_ERR_CUDA keeps its name on both backends: it is an ABI
