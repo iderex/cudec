@@ -11,8 +11,14 @@
  *  - the decoded container equals the SOURCE and equals what the reference's
  *    own decompressor produces from the same pages, byte for byte, in both
  *    memory spaces;
- *  - a poisoned destination keeps its poison past bytes_written;
- *  - the same context decodes the same stream twice to identical bytes;
+ *  - a poisoned destination keeps its poison past bytes_written, and the
+ *    reported range is the same bytes whatever the destination held first;
+ *  - the same context decodes the same stream twice to identical bytes, and
+ *    the one-shot entry answers exactly as the context entry does;
+ *  - a container that declares a tile size its page does NOT produce is
+ *    refused in BOTH directions - the page that over-produces and the page
+ *    that under-produces - because a short tile accepted would leave the gap
+ *    to the next tile's declared offset holding whatever was in `dst`;
  *  - ONE corrupted tile fails alone: its own defined status with
  *    bytes_written 0, its region of the destination left as it was, every
  *    sibling still byte-exact, and the whole-stream answer non-OK with
@@ -96,7 +102,8 @@ uint32_t Packed(uint32_t tile_size_idx, uint32_t last_tile_size) {
  * it keeps the page boundaries this test asserts about under this test's
  * control rather than the reference's paging. */
 bool BuildStream(int level, const Bytes& in, Bytes* stream,
-                 std::vector<Bytes>* pages) {
+                 std::vector<Bytes>* pages, size_t short_tile,
+                 size_t short_len) {
     const size_t tile = static_cast<size_t>(kTileStreamTileSize);
     const size_t n = (in.size() + tile - 1u) / tile;
     if (n == 0 || n > 65535u) {
@@ -105,7 +112,14 @@ bool BuildStream(int level, const Bytes& in, Bytes* stream,
     pages->clear();
     for (size_t i = 0; i < n; i++) {
         const size_t off = i * tile;
-        const size_t len = (in.size() - off < tile) ? (in.size() - off) : tile;
+        size_t len = (in.size() - off < tile) ? (in.size() - off) : tile;
+        /* The dishonest-container case: this tile's PAGE is compressed from
+         * fewer bytes than the envelope will declare for it. Every byte of the
+         * page is well-formed GDeflate - the reference compressor produced it -
+         * and the container is the thing that lies. */
+        if (i == short_tile) {
+            len = short_len;
+        }
         libdeflate_gdeflate_compressor* c =
             libdeflate_alloc_gdeflate_compressor(level);
         if (c == nullptr) {
@@ -228,7 +242,7 @@ int main(void) {
 
     Bytes stream;
     std::vector<Bytes> pages;
-    REQUIRE(BuildStream(6, source, &stream, &pages));
+    REQUIRE(BuildStream(6, source, &stream, &pages, n_tiles, 0));
     REQUIRE(pages.size() == n_tiles);
 
     /* ---- The envelope reads as declared, on the host, with no device. ---- */
@@ -367,6 +381,110 @@ int main(void) {
                 k, static_cast<int>(bres[1].status));
         }
         REQUIRE(refused);
+    }
+
+    /* ---- The container's declaration is a bound in BOTH directions. ----
+     *
+     * Both cases below are streams whose PAGES are all well-formed - the
+     * reference compressor made every byte of them - and whose ENVELOPE
+     * disagrees with them. Neither is reachable by corrupting a payload, which
+     * is why the corrupt-tile sweep above cannot stand in for them.
+     */
+    {
+        /* UNDER-production. Tile 1's page carries 100 bytes while the envelope
+         * declares the full 65536 for it. Accepted, this would report
+         * bytes_written spanning 65436 bytes of whatever `dst` held. */
+        Bytes short_stream;
+        std::vector<Bytes> short_pages;
+        REQUIRE(BuildStream(6, source, &short_stream, &short_pages, 1u, 100u));
+        std::vector<cudec_chunk_result> sres(n_tiles);
+        Bytes sout;
+        size_t swritten = 0;
+        cudec_status sst = CUDEC_OK;
+        DecodeHost(ctx, short_stream, source.size(), slack, &sout, &sres,
+                   &swritten, &sst);
+        REQUIRE(sst == CUDEC_ERR_CORRUPT_INPUT);
+        REQUIRE(swritten == 0);
+        REQUIRE(sres[1].status == CUDEC_ERR_CORRUPT_INPUT);
+        REQUIRE(sres[1].bytes_written == 0);
+        REQUIRE(sres[1].reserved == 0);
+        /* Its siblings decoded and say so; the refusal is the container's,
+         * not theirs. */
+        REQUIRE(sres[0].status == CUDEC_OK);
+        REQUIRE(sres[0].bytes_written == tile);
+        std::printf(
+            "tilestream_twin: a tile carrying 100 bytes under a 65536-byte "
+            "declaration is refused, siblings unaffected\n");
+    }
+    {
+        /* OVER-production, and the destination is deliberately LARGER than the
+         * envelope's total: the only shape in which laying tiles out at
+         * declared offsets differs from laying them out against the space
+         * left. A one-tile stream declaring 1000 bytes over a page that
+         * produces 65536 must be that tile's CUDEC_ERR_OUTPUT_TOO_SMALL. */
+        const Bytes one = MixedEntropy(0xB0B, tile);
+        Bytes over;
+        std::vector<Bytes> over_pages;
+        REQUIRE(BuildStream(6, one, &over, &over_pages, 99u, 0u));
+        REQUIRE(over_pages.size() == 1u);
+        /* Re-declare the single tile as producing 1000 bytes. */
+        over[4] = static_cast<unsigned char>(Packed(1u, 1000u) & 0xFFu);
+        over[5] = static_cast<unsigned char>((Packed(1u, 1000u) >> 8) & 0xFFu);
+        over[6] = static_cast<unsigned char>((Packed(1u, 1000u) >> 16) & 0xFFu);
+        over[7] = static_cast<unsigned char>((Packed(1u, 1000u) >> 24) & 0xFFu);
+        size_t otiles = 0;
+        size_t ototal = 0;
+        REQUIRE(cudec_gdeflate_tilestream_info(over.data(), over.size(),
+                                               &otiles, &ototal) == CUDEC_OK);
+        REQUIRE(otiles == 1u && ototal == 1000u);
+        std::vector<cudec_chunk_result> ores(1);
+        Bytes oout(70000u, kDstPoison);
+        size_t owritten = 0;
+        const cudec_status ost = cudec_gdeflate_tilestream_decompress_ctx(
+            ctx, over.data(), over.size(), oout.data(), oout.size(),
+            CUDEC_MEM_HOST, ores.data(), ores.size(), &owritten);
+        REQUIRE(ost == CUDEC_ERR_OUTPUT_TOO_SMALL);
+        REQUIRE(owritten == 0);
+        REQUIRE(ores[0].status == CUDEC_ERR_OUTPUT_TOO_SMALL);
+        REQUIRE(ores[0].bytes_written == 0);
+        /* Nothing past the declared total was written, even though the
+         * destination had room for the whole page. */
+        for (size_t i = 1000u; i < oout.size(); i++) {
+            REQUIRE_CTX(oout[i] == kDstPoison, "over-run byte %zu", i);
+        }
+        std::printf(
+            "tilestream_twin: a page producing 65536 bytes under a 1000-byte "
+            "declaration is refused, nothing written past 1000\n");
+    }
+
+    /* ---- The reported range does not depend on what `dst` held. ---- */
+    {
+        std::vector<cudec_chunk_result> res3(n_tiles);
+        Bytes other(source.size() + slack, 0x5Cu);
+        size_t written3 = 0;
+        const cudec_status st3 = cudec_gdeflate_tilestream_decompress_ctx(
+            ctx, stream.data(), stream.size(), other.data(), other.size(),
+            CUDEC_MEM_HOST, res3.data(), res3.size(), &written3);
+        REQUIRE(st3 == CUDEC_OK);
+        REQUIRE(written3 == written);
+        REQUIRE(std::memcmp(other.data(), out.data(), written) == 0);
+    }
+
+    /* ---- The one-shot entry answers exactly as the context entry does. ---- */
+    {
+        std::vector<cudec_chunk_result> ores(n_tiles);
+        Bytes oout(source.size() + slack, kDstPoison);
+        size_t owritten = 0;
+        const cudec_status ost = cudec_gdeflate_tilestream_decompress(
+            stream.data(), stream.size(), oout.data(), oout.size(),
+            CUDEC_MEM_HOST, ores.data(), ores.size(), &owritten);
+        REQUIRE(ost == CUDEC_OK);
+        REQUIRE(owritten == written);
+        REQUIRE(std::memcmp(oout.data(), out.data(), out.size()) == 0);
+        for (size_t i = 0; i < n_tiles; i++) {
+            REQUIRE_CTX(ores[i].status == CUDEC_OK, "one-shot tile %zu", i);
+            REQUIRE(ores[i].bytes_written == res[i].bytes_written);
+        }
     }
 
     cudec_stream_ctx_destroy(ctx);

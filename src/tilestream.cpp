@@ -28,37 +28,14 @@
 #include "tilestream.h"
 
 #include <cstddef>
-#include <new>
 #include <vector>
 
 namespace {
 
+using cudec_detail::TileStreamDeclaredTileCount;
 using cudec_detail::TileStreamInfo;
 using cudec_detail::TileStreamParse;
-using cudec_detail::TileStreamRead16LE;
 using cudec_detail::TileStreamTile;
-using cudec_detail::kTileStreamHeaderBytes;
-
-/* How many tiles to make room for before the parser is asked anything.
- *
- * The parser writes the caller's array and refuses rather than allocating, so
- * something has to size that array first, and the only thing that knows the
- * count is the stream. This reads the declared count and NOTHING ELSE from the
- * header: it is a sizing hint, not a validated fact, and every use of it below
- * is either an allocation bounded by the field's own width or a value the
- * parser re-derives and checks for itself. The 8-byte guard is here for the
- * same reason it is in the parser - the count is two bytes at offset 2 and
- * reading them out of a shorter buffer is the over-read this whole layer
- * exists to prevent. A count this returns that the bytes do not support costs
- * an over-large allocation of at most 65535 entries and then a
- * CUDEC_ERR_CORRUPT_INPUT from the parser, which is the same answer the caller
- * would have got without the hint. */
-size_t DeclaredTileCount(const unsigned char* stream, size_t stream_size) {
-    if (stream == nullptr || stream_size < kTileStreamHeaderBytes) {
-        return 0;
-    }
-    return static_cast<size_t>(TileStreamRead16LE(stream + 2));
-}
 
 /* Parses the envelope into `tiles`/`info`, sizing `tiles` from the declared
  * count. Returns what the parser returns; on any non-OK status `tiles` and
@@ -71,15 +48,26 @@ size_t DeclaredTileCount(const unsigned char* stream, size_t stream_size) {
 cudec_status ParseEnvelope(const unsigned char* stream, size_t stream_size,
                            std::vector<TileStreamTile>* tiles,
                            TileStreamInfo* info) {
-    const size_t declared = DeclaredTileCount(stream, stream_size);
-    tiles->assign(declared + 1, TileStreamTile());
+    const size_t declared = static_cast<size_t>(TileStreamDeclaredTileCount(
+        stream, static_cast<uint64_t>(stream_size)));
+    /* EXACTLY the declared count, never a spare entry. The parser writes one
+     * entry per tile the stream declares, so an array with slack puts an
+     * off-by-one in that loop into allocator padding where the sanitizer
+     * cannot see it - which is the discipline fuzz/fuzz_gdeflate_tilestream.cpp
+     * states for its own array, and the library's own call has no business
+     * being the softer of the two. The zero case still needs a non-null
+     * data() to hand over, because a null one is the parser's
+     * caller-mistake branch rather than its refusal of these bytes. */
+    tiles->assign(declared != 0 ? declared : 1, TileStreamTile());
     return TileStreamParse(stream, static_cast<uint64_t>(stream_size),
                            tiles->data(), static_cast<uint64_t>(declared),
                            info);
 }
 
-/* The batch arrays an accepted call decodes with. */
+/* The batch arrays an accepted call decodes with, and the total the envelope
+ * declared them to produce. */
 struct TileStreamPlan {
+    size_t declared_total;
     std::vector<const void*> src_ptrs;
     std::vector<size_t> src_sizes;
     std::vector<void*> dst_ptrs;
@@ -133,10 +121,21 @@ cudec_status BuildTileStreamPlan(const void* stream, size_t stream_size,
     if (tile_results_capacity < n) {
         return CUDEC_ERR_INVALID_ARGUMENT;
     }
-    if (dst_capacity < static_cast<size_t>(info.total_uncompressed)) {
+    /* The narrowing is safe only because the container's ceiling is
+     * 65535 * 65536 = 4294901760, which is inside a 32-bit size_t by 65536
+     * bytes - the equality src/tilestream.h pins with a static_assert. It is
+     * re-checked rather than trusted, because the failure mode if that ceiling
+     * ever moves is a wrapped total comparing below dst_capacity and every
+     * bound after it being computed from the wrong number. */
+    if (info.total_uncompressed > static_cast<uint64_t>(SIZE_MAX)) {
+        return CUDEC_ERR_OUTPUT_TOO_SMALL;
+    }
+    const size_t total = static_cast<size_t>(info.total_uncompressed);
+    if (dst_capacity < total) {
         return CUDEC_ERR_OUTPUT_TOO_SMALL;
     }
 
+    plan->declared_total = total;
     plan->src_ptrs.resize(n);
     plan->src_sizes.resize(n);
     plan->dst_ptrs.resize(n);
@@ -159,6 +158,17 @@ cudec_status BuildTileStreamPlan(const void* stream, size_t stream_size,
     return CUDEC_OK;
 }
 
+/* A defined not-produced record in every tile slot the envelope declared.
+ * Used only once the call has been ACCEPTED, so the count is the parsed one
+ * and the caller's array is already known to be at least that long. */
+void StampTilesNotDecoded(cudec_chunk_result* results, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        results[i].status = static_cast<int32_t>(CUDEC_ERR_CUDA);
+        results[i].reserved = 0;
+        results[i].bytes_written = 0;
+    }
+}
+
 /* Runs an accepted plan on `ctx` and decides the whole-stream answer. */
 cudec_status RunTileStreamPlan(cudec_stream_ctx* ctx,
                                const TileStreamPlan& plan,
@@ -177,11 +187,53 @@ cudec_status RunTileStreamPlan(cudec_stream_ctx* ctx,
          * stream did not decode. */
         return st;
     }
+    /* THE ENVELOPE'S DECLARED TILE SIZE IS A TWO-SIDED BOUND, AND THIS IS THE
+     * SECOND SIDE. The capacity handed to the page decoder refuses a tile that
+     * produces MORE than it was declared to. Nothing in the page format
+     * refuses one that produces LESS: a GDeflate page ends at its final block
+     * and reports what it produced, with no comparison against the capacity it
+     * was given, so a valid page compressed from ten bytes decodes CUDEC_OK
+     * into a tile the container declared as 65536.
+     *
+     * Accepting that would be the worst answer this entry could give. The
+     * tiles are laid out at DECLARED offsets, so a short tile leaves the gap
+     * between what it wrote and where its neighbour starts holding whatever
+     * was in the caller's destination - prior contents on the host path,
+     * uninitialised device memory on the CUDEC_MEM_DEVICE path - and the
+     * summed bytes_written would hand the caller a range spanning it. That is
+     * output the decoder never produced, presented as a successful decode,
+     * and it is not even deterministic: the same stream would read back
+     * differently depending on what the destination held.
+     *
+     * So a tile that decoded must have decoded exactly what the container said
+     * it would. A disagreement between the two is the container being wrong
+     * about its own contents, which is CUDEC_ERR_CORRUPT_INPUT, and it is
+     * stamped onto the tile so the per-tile channel names which one. */
     size_t total = 0;
+    cudec_status short_status = CUDEC_OK;
     for (size_t i = 0; i < n; i++) {
-        total += static_cast<size_t>(h_tile_results[i].bytes_written);
+        if (h_tile_results[i].bytes_written !=
+            static_cast<uint64_t>(plan.dst_caps[i])) {
+            h_tile_results[i].status =
+                static_cast<int32_t>(CUDEC_ERR_CORRUPT_INPUT);
+            h_tile_results[i].reserved = 0;
+            h_tile_results[i].bytes_written = 0;
+            if (short_status == CUDEC_OK) {
+                short_status = CUDEC_ERR_CORRUPT_INPUT;
+            }
+            continue;
+        }
+        total += plan.dst_caps[i];
     }
-    *bytes_written = total;
+    if (short_status != CUDEC_OK) {
+        return short_status;
+    }
+    /* Derived from the envelope rather than summed from the device, now that
+     * the two are known to agree. A length a caller will read `dst` with is
+     * not a number to take from a device-written record when a validated host
+     * one says the same thing. */
+    *bytes_written = plan.declared_total;
+    (void)total;
     return CUDEC_OK;
 }
 
@@ -272,6 +324,13 @@ cudec_status cudec_gdeflate_tilestream_decompress(
     cudec_stream_ctx* ctx = nullptr;
     const cudec_status created = cudec_stream_ctx_create(&ctx);
     if (created != CUDEC_OK) {
+        /* The call was ACCEPTED and then a resource failed, which is the one
+         * class where this entry owes the per-tile channel a defined value:
+         * the caller has been told the stream is well-formed, and CUDEC_OK is
+         * zero, so a results array it zero-initialised would otherwise read
+         * as every tile having decoded nothing successfully. On a GPU-less
+         * host this is the ordinary path, not the exotic one. */
+        StampTilesNotDecoded(h_tile_results, plan.src_ptrs.size());
         return created;
     }
     const cudec_status st =

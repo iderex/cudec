@@ -387,6 +387,8 @@ jobs:
           grep -E ': gdeflate_schedule_twin$' host-selected.txt &&
           grep -E ': gdeflate_header_twin$' host-selected.txt &&
           grep -E ': gdeflate_block_twin$' host-selected.txt &&
+          grep -E ': envelope_out_of_device$' host-selected.txt &&
+          grep -E ': envelope_out_of_device_selfproof$' host-selected.txt &&
           echo "Deferred to the local GPU gate:" &&
           ctest --test-dir build-cuda -L gpu -N | tee gpu-deferred.txt &&
           grep -E ': smoke$' gpu-deferred.txt &&
@@ -397,7 +399,8 @@ jobs:
           grep -E ': determinism_gpu$' gpu-deferred.txt &&
           grep -E ': snappy_block_device$' gpu-deferred.txt &&
           grep -E ': gdeflate_device$' gpu-deferred.txt &&
-          grep -E ': gdeflate_gate_gpu$' gpu-deferred.txt
+          grep -E ': gdeflate_gate_gpu$' gpu-deferred.txt &&
+          grep -E ': tilestream_twin$' gpu-deferred.txt
 
   hip:
     # The job name is the required-check context the ruleset will name once

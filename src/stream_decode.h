@@ -30,6 +30,13 @@ namespace cudec_stream_detail {
 /* The shape of every batch entry in include/cudec.h. Spelled from the ABI
  * rather than from any one entry, so a signature change reds every format at
  * once instead of silently binding the wrong one. */
+extern "C" {
+/* C LANGUAGE LINKAGE, because the entries this points at have it. A pointer to
+ * a C++-linkage function and a pointer to a C-linkage one are different types
+ * ([dcl.link]/1), so a typedef written outside extern "C" and initialised from
+ * cudec_lz4_decompress_batch is ill-formed - accepted by every compiler this
+ * tree builds with, and still the wrong type on a boundary whose stated
+ * property is that it is the ABI's. */
 typedef cudec_status (*BatchEntry)(const void* const* d_src_ptrs,
                                    const size_t* d_src_sizes,
                                    void* const* d_dst_ptrs,
@@ -37,6 +44,7 @@ typedef cudec_status (*BatchEntry)(const void* const* d_src_ptrs,
                                    size_t chunk_count,
                                    cudec_chunk_result* d_results,
                                    cudec_stream_t stream);
+}
 
 /* Drives `entry` over the whole batch on `ctx`'s stream and staging. The
  * arguments after `entry` are the streaming ABI's, argument for argument, and

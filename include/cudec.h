@@ -361,9 +361,20 @@ void cudec_stream_ctx_destroy(cudec_stream_ctx* ctx);
  * CUDEC_ERR_INVALID_ARGUMENT for a NULL argument; CUDEC_ERR_CORRUPT_INPUT for
  * anything the bytes get wrong - a truncated header or table, an unknown tile
  * size index, a reserved bit set, a tile count of zero, a table whose offsets
- * do not strictly ascend, or a last tile running past the end. On any error
+ * do not strictly ascend, or a last tile running past the end; and
+ * CUDEC_ERR_CUDA for a HOST resource failure, since sizing the tile table is
+ * an allocation and a failed one must cross this boundary as a status rather
+ * than as a throw. That last one is named despite the entry making no CUDA
+ * call, because the enum's spelling is older than the distinction and a
+ * caller switching on the set below must not fall through. On any error
  * *tile_count and *uncompressed_size are 0. The container carries no optional
- * features, so nothing here returns CUDEC_ERR_UNSUPPORTED. */
+ * features, so nothing here returns CUDEC_ERR_UNSUPPORTED.
+ *
+ * THE CEILING IS WORTH KNOWING BEFORE SIZING ANYTHING FROM THE ANSWER. The
+ * count field is 16 bits and a tile is 65536 bytes, so a 320 KB envelope can
+ * legitimately report an uncompressed size of 4294901760. The number is the
+ * container's declaration, not a promise that the payload is there; the decode
+ * refuses a stream whose tiles do not produce exactly it. */
 cudec_status cudec_gdeflate_tilestream_info(const void* stream,
                                             size_t stream_size,
                                             size_t* tile_count,
@@ -389,18 +400,36 @@ cudec_status cudec_gdeflate_tilestream_info(const void* stream,
  * decoding many streams pays the allocation once; that is the whole reason
  * this entry takes a context rather than being one-shot only.
  *
+ * EVERY TILE MUST PRODUCE EXACTLY WHAT THE ENVELOPE DECLARED FOR IT. The
+ * declared size is a bound in both directions, and the second direction is the
+ * one nothing else enforces: a GDeflate page ends at its final block and
+ * reports what it produced without comparing that against the capacity it was
+ * given, so a page decoding to fewer bytes than its tile was declared to hold
+ * is a well-formed page inside a container that lied about it. Accepted, it
+ * would leave the gap up to the next tile's declared offset holding whatever
+ * was in `dst` - and a decoder whose output depends on that is neither
+ * fail-closed nor deterministic. Such a tile is CUDEC_ERR_CORRUPT_INPUT, the
+ * same as one that overruns.
+ *
  * A tile that fails to decode is isolated to itself: h_tile_results[i] carries
  * that tile's own defined status with bytes_written 0, its siblings decode
  * normally and report their own bytes, and nothing about the failed tile's
- * region of `dst` is presented as valid output.
+ * region of `dst` is presented as valid output. On CUDEC_MEM_DEVICE that
+ * region may hold bytes the kernel wrote before it refused; they are not
+ * presented - *bytes_written is 0 and the tile's status is not OK - and
+ * nothing promises they were left alone.
  *
  * THE WHOLE-STREAM ANSWER FOLLOWS THE FRAME PRECEDENT RATHER THAN THE BATCH
  * ONE, because this entry, like cudec_lz4f_decompress, produces ONE object out
  * of many pieces. A stream with any failed tile is not a partially decoded
  * file: *bytes_written is 0 and the return is non-OK - CUDEC_ERR_CUDA where a
- * device or host resource failed, otherwise the first non-OK tile's status in
- * tile order. *bytes_written is the sum of the tiles' output only when every
- * tile decoded.
+ * device or host resource failed, CUDEC_ERR_UNSUPPORTED where the page decoder
+ * declines the device it was asked to launch on, otherwise the first non-OK
+ * tile's status in tile order. *bytes_written equals the envelope's declared
+ * total, and is reported only when every tile decoded exactly its declared
+ * size - it is derived from the validated envelope rather than summed from the
+ * device-written records, because it is a length the caller will read `dst`
+ * with.
  *
  * Fail-closed, synchronously and with nothing launched: a NULL ctx, a NULL
  * `stream`, `bytes_written` or h_tile_results, a NULL `dst` with a non-zero
@@ -412,10 +441,23 @@ cudec_status cudec_gdeflate_tilestream_info(const void* stream,
  * from the parsed envelope, so both are content-dependent rejects and neither
  * writes a byte of `dst`.
  *
+ * WHERE h_tile_results IS WRITTEN, stated because CUDEC_OK is zero and a
+ * caller cannot otherwise tell an untouched array from a decoded one. Every
+ * reject above - the argument classes, CUDEC_ERR_CORRUPT_INPUT,
+ * CUDEC_ERR_OUTPUT_TOO_SMALL, the short results array - leaves it UNTOUCHED,
+ * because none of them has accepted the call. From the point the call is
+ * accepted onward every entry in [0, tile_count) holds a defined
+ * cudec_status: its own decode outcome, or CUDEC_ERR_CUDA for a tile the call
+ * did not produce. Entries past tile_count are never written.
+ *
  * A CUDA fault POISONS the context exactly as the LZ4 streaming entry
- * documents: every later decode on it returns CUDEC_ERR_CUDA without touching
- * the device, and only cudec_stream_ctx_destroy is valid on it thereafter.
- * Never throws across this boundary. */
+ * documents: only cudec_stream_ctx_destroy is valid on it thereafter, and
+ * every later decode on it refuses without touching the device. The refusal is
+ * CUDEC_ERR_CUDA once the envelope has been accepted - the envelope walk runs
+ * first and is pure host arithmetic, so a poisoned context handed malformed
+ * bytes answers for the bytes. Fail-closed either way, and worth knowing for a
+ * caller using the return value to detect poisoning. Never throws across this
+ * boundary. */
 cudec_status cudec_gdeflate_tilestream_decompress_ctx(
     cudec_stream_ctx* ctx, const void* stream, size_t stream_size, void* dst,
     size_t dst_capacity, cudec_mem_space dst_space,

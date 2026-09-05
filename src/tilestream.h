@@ -95,6 +95,40 @@ inline uint32_t TileStreamRead32LE(const unsigned char* p) {
            (static_cast<uint32_t>(p[3]) << 24);
 }
 
+/* How many tiles a caller must make room for before TileStreamParse is asked
+ * anything, or 0 when these bytes are not a TileStream this parser will look
+ * further into.
+ *
+ * The parser writes the caller's array and refuses rather than allocating, so
+ * something has to size that array first and the only thing that knows the
+ * count is the stream. That makes this a sizing hint rather than a validated
+ * fact, and it lives HERE, beside the parser, because it re-reads two of the
+ * parser's own rules - the eight-byte header bound and the id/magic
+ * complement - and a copy of those in a caller is the format layer leaking
+ * out of the one file that owns it.
+ *
+ * THE COMPLEMENT IS CHECKED BEFORE THE COUNT IS BELIEVED, and it is not
+ * redundancy with the parser. A caller sizes an array from this, so eight
+ * bytes that were never a TileStream would otherwise buy an allocation of up
+ * to 65535 entries before anything looked at them - the count field is
+ * sixteen bits and the caller pays for all of it. Refusing here makes that
+ * cost reachable only by bytes that at least claim to be this container.
+ *
+ * What it does NOT do is validate. A count these bytes cannot support still
+ * comes back, and the caller's over-large array then meets a
+ * CUDEC_ERR_CORRUPT_INPUT from the parse - the same answer it would have got
+ * without the hint. */
+inline uint64_t TileStreamDeclaredTileCount(const unsigned char* stream,
+                                            uint64_t stream_size) {
+    if (stream == nullptr || stream_size < kTileStreamHeaderBytes) {
+        return 0;
+    }
+    if (stream[0] != static_cast<unsigned char>(stream[1] ^ 0xFFu)) {
+        return 0;
+    }
+    return TileStreamRead16LE(stream + 2);
+}
+
 /* Parses and validates the envelope at `stream[0 .. stream_size)`.
  *
  * On CUDEC_OK: *info holds the tile count and the total uncompressed size,

@@ -335,6 +335,17 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx, BatchEntry entry,
      * owners (at context destruction) free the buffers it is still
      * reading/writing. WAVE_FAIL records the fault and stops the loop. */
     cudec_status wave_status = CUDEC_OK;
+    /* Whether the wave loop stopped on a SYNCHRONOUS refusal from the batch
+     * entry rather than on a CUDA fault. The two end the loop the same way and
+     * must not end the context the same way: an entry that refused before
+     * submitting anything - CUDEC_ERR_UNSUPPORTED for a wave width this build
+     * emits no kernel for, CUDEC_ERR_NOT_IMPLEMENTED from an entry whose
+     * kernel has not landed - made no CUDA call and damaged nothing, so
+     * poisoning would kill a healthy context and answer every later decode on
+     * it CUDEC_ERR_CUDA. That was unreachable while this loop was hardwired to
+     * one entry that cannot refuse; it is reachable the moment the loop takes
+     * the entry as an argument, which is what src/stream_decode.h does. */
+    bool entry_refused = false;
     bool have_pending_src = false; /* whether reuse has been recorded */
 #define WAVE_FAIL(st)       \
     {                       \
@@ -430,6 +441,7 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx, BatchEntry entry,
                                             d_res,
                                             cudec_rt::abi_stream(stream));
         if (launched != CUDEC_OK) {
+            entry_refused = true;
             WAVE_FAIL(launched);
         }
 
@@ -467,11 +479,15 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx, BatchEntry entry,
      * (the entry is synchronous), and surface any async fault as a defined
      * error. */
     cudec_status drain = wave_status;
-    if (cudec_rt::stream_synchronize(stream) != cudec_rt::success &&
-        drain == CUDEC_OK) {
-        drain = CUDEC_ERR_CUDA;
-    }
-    if (cudec_rt::get_last_error() != cudec_rt::success && drain == CUDEC_OK) {
+    /* Both are asked unconditionally and the answers are kept, because
+     * get_last_error CONSUMES the state: a second call below would report
+     * clean whatever the first one found, and the poisoning decision needs
+     * that answer. */
+    const bool sync_faulted =
+        cudec_rt::stream_synchronize(stream) != cudec_rt::success;
+    const bool async_faulted =
+        cudec_rt::get_last_error() != cudec_rt::success;
+    if ((sync_faulted || async_faulted) && drain == CUDEC_OK) {
         drain = CUDEC_ERR_CUDA;
     }
 
@@ -480,8 +496,13 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx, BatchEntry entry,
      * aggregate. */
     std::memcpy(h_results, ctx.p_results.p, results_bytes);
     if (drain != CUDEC_OK) {
-        /* A CUDA-level fault happened; the context is dead. */
-        ctx.poisoned = true;
+        /* A CUDA-level fault happened; the context is dead. A synchronous
+         * refusal from the batch entry is the one non-OK drain that is not
+         * one: it submitted nothing, the stream drained clean, and the
+         * buffers are exactly as they were. */
+        if (!entry_refused || sync_faulted || async_faulted) {
+            ctx.poisoned = true;
+        }
         return drain;
     }
 
