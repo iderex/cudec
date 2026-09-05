@@ -531,6 +531,108 @@ target_include_directories(frame_host_negative
 cudec_add_test(tilestream_host_negative SOURCES tilestream_host_negative.cpp)
 target_include_directories(tilestream_host_negative
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The whole-TileStream ABI entry against the reference (issue #177): the
+# envelope read on the host, the container decoded end to end in both memory
+# spaces, and one corrupted tile failing alone while its siblings stay
+# byte-exact. GPU-labelled - it drives the shipped page kernel through the
+# streaming context - and linking gdeflate_oracle for the compressor and the
+# reference decode it is compared against. The envelope constants it builds a
+# stream from come out of src/, on the include path every device test is
+# granted.
+cudec_add_test(tilestream_twin SOURCES tilestream_twin.cu GPU LIBS
+               gdeflate_oracle)
+# The other half of "the kernel stays envelope-ignorant" (issue #177), read off
+# the binary rather than the source. CUDA-only: it needs cuobjdump, and the HIP
+# build has its own symbol reader in check-hip-wave-instantiations.sh. The tool
+# is the one beside the nvcc that produced the objects, so the check cannot
+# pass by finding some other cuobjdump on the PATH.
+# The companion to that binary check, and neither subsumes the other (issue
+# #177). Everything in src/tilestream.h is `inline`, so the way the envelope
+# would actually reach device code is somebody marking the parser
+# CUDEC_HOST_DEVICE and calling it from a kernel - at which point nvcc very
+# likely inlines it whole and the cubin carries no symbol for the binary check
+# to find. This one reads the SOURCE of the device translation units and their
+# device headers and refuses the include, which is the route that failure takes;
+# the binary one covers the route this cannot see. Configure-time, so it runs on
+# every backend and on a machine with no device at all.
+function(cudec_scan_envelope_include _text _label _out)
+  set(_hits "")
+  if(_text MATCHES "#[ 	]*include[ 	]*\"tilestream\.h\"")
+    string(APPEND _hits "${_label}: a device translation unit includes "
+           "tilestream.h; the TileStream envelope is host-side and the "
+           "GDeflate kernel stays envelope-ignorant (issue #177)
+")
+  endif()
+  set(${_out} "${_hits}" PARENT_SCOPE)
+endfunction()
+cudec_scan_envelope_include("#include \"tilestream.h\"" "probe" _probe_hit)
+if(NOT _probe_hit)
+  message(FATAL_ERROR "the envelope-out-of-device source rule is dead: the "
+                      "planted include was not reported (issue #177)")
+endif()
+# The near-miss is the one worth reading: a device file may legitimately talk
+# ABOUT the envelope in prose, and a rule that reddened on that would be
+# switched off rather than repaired.
+foreach(_near "/* the TileStream envelope never reaches tilestream.h here */"
+              "#include \"gdeflate_decode.cuh\"")
+  cudec_scan_envelope_include("${_near}" "probe" _near_hit)
+  if(_near_hit)
+    message(FATAL_ERROR "the envelope-out-of-device source rule is over-wide: "
+                        "it reported '${_near}' (issue #177)")
+  endif()
+endforeach()
+file(GLOB _envelope_scan_device RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/../src
+     CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cu
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cuh)
+if(NOT _envelope_scan_device)
+  message(FATAL_ERROR "the envelope-out-of-device source scan found no device "
+                      "source under src/: a scan over nothing passes for the "
+                      "wrong reason (issue #177)")
+endif()
+foreach(_dev ${_envelope_scan_device})
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_dev} _dev_src)
+  cudec_scan_envelope_include("${_dev_src}" "src/${_dev}" _dev_hit)
+  if(_dev_hit)
+    message(FATAL_ERROR "${_dev_hit}")
+  endif()
+endforeach()
+
+if(CUDEC_DEVICE_LANGUAGE STREQUAL "CUDA")
+  get_filename_component(_cudec_cuda_tool_dir "${CMAKE_CUDA_COMPILER}"
+                         DIRECTORY)
+  add_test(
+    NAME envelope_out_of_device
+    COMMAND bash
+            ${PROJECT_SOURCE_DIR}/scripts/check-envelope-out-of-device.sh
+            "${_cudec_cuda_tool_dir}/cuobjdump" "$<TARGET_OBJECTS:cudec>")
+  # The refusal proven to bite, for the reason it names: the same run, the
+  # same objects, and a pattern that IS in the device code. Without this the
+  # check above would pass identically if the symbol listing were empty, if
+  # the pattern never matched anything, or if the grep were inverted.
+  add_test(
+    NAME envelope_out_of_device_selfproof
+    COMMAND bash
+            ${PROJECT_SOURCE_DIR}/scripts/check-envelope-out-of-device.sh
+            "${_cudec_cuda_tool_dir}/cuobjdump" "$<TARGET_OBJECTS:cudec>"
+            "gdeflate_decode_batch")
+  # WILL_FAIL alone asserts only a non-zero exit, which any breakage of the
+  # script would also produce - a wrong cuobjdump path, a missing bash, a
+  # mangled argument count. The regex pins the ONE refusal this proof is about,
+  # so a self-proof that goes green for the wrong reason reds.
+  # NOT WILL_FAIL. WILL_FAIL asserts only a non-zero exit, which any breakage
+  # of the script also produces - a wrong cuobjdump path, a missing bash, a
+  # mangled argument count - so it would go green for the wrong reason.
+  # PASS_REGULAR_EXPRESSION makes ctest ignore the exit code and pass only on
+  # the ONE refusal this proof is about, which is the stronger assertion and
+  # the reason the two must not be combined (with both set, a match would be
+  # inverted into a failure).
+  set_tests_properties(
+    envelope_out_of_device_selfproof
+    PROPERTIES PASS_REGULAR_EXPRESSION
+               "the envelope has reached device code")
+  set_tests_properties(envelope_out_of_device envelope_out_of_device_selfproof
+                       PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
+endif()
 # Termination as a tested invariant (issue #72): the parser's liveness
 # contract asserted per call over the truncation ladder, the mutant corpus,
 # the crafted hostile corpus, and the frame block-table walk - all of it
@@ -730,12 +832,31 @@ foreach(_owner DevBuf PinnedBuf StreamOwner EventOwner)
                         "'${_owner}' (issue #40)")
   endif()
 endforeach()
+# The include half stays a NAMED list, because only a TU that owns a device
+# resource can satisfy it: src/tilestream.cpp drives the streaming context and
+# owns nothing itself, so requiring the include of it would be requiring a
+# dead include.
 foreach(_tu frame.cpp stream.cpp)
   file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_tu} _tu_src)
   if(NOT _tu_src MATCHES "#include \"vendor_raii.h\"")
     message(FATAL_ERROR "src/${_tu} no longer includes vendor_raii.h: it must "
                         "reuse the shared RAII owners (issue #40)")
   endif()
+endforeach()
+# The re-copy half GLOBS, for the reason the vendor-seam rule gives about its
+# own scope: a host TU added tomorrow is covered on the day it lands rather
+# than on the day somebody remembers the list. src/tilestream.cpp was the third
+# such TU and arrived while this was a two-name list (issue #177).
+file(GLOB _raii_scan_tus RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/../src
+     CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cu)
+if(NOT _raii_scan_tus)
+  message(FATAL_ERROR "the RAII re-copy scan found no translation unit under "
+                      "src/: a scan over nothing passes for the wrong reason "
+                      "(issue #40)")
+endif()
+foreach(_tu ${_raii_scan_tus})
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/../src/${_tu} _tu_src)
   foreach(_owner DevBuf PinnedBuf StreamOwner EventOwner DevPtr)
     if(_tu_src MATCHES "struct ${_owner}")
       message(FATAL_ERROR "src/${_tu} defines a local 'struct ${_owner}': the "
