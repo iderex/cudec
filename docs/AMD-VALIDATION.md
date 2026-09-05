@@ -190,8 +190,10 @@ With it, six facts that no output above carries on its own:
 - the `docker run` invocation you actually used, if it differs from step 3.
 
 Open an issue on <https://github.com/iderex/cudec/issues> with all of it. The
-form built for exactly this, which cannot be submitted without the first three
-of those, is under "AMD validation result" in the New Issue chooser. A result
+form built for exactly this is under "AMD validation result" in the New Issue
+chooser, and it refuses to submit without five of the six - the driver version
+is the one it accepts empty, because it is the one you may genuinely be unable
+to read. A result
 from wave64 silicon has an address of its own, issue #415, which is open
 precisely because that dispatch arm has never executed anywhere.
 
