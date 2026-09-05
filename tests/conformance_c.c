@@ -221,6 +221,100 @@ int main(void) {
         cudec_stream_ctx_destroy(0);
     }
 
+    /* The TileStream entries resolve their C linkage here (issue #177). Every
+     * call below either rejects on an argument or refuses the bytes, and both
+     * happen before any CUDA call, so the whole block runs on the GPU-less
+     * runner.
+     *
+     * The envelope rejects are the interesting half: they are decided by the
+     * host walker, so this GPU-less test reaches the parse and not just the
+     * pointer checks. `env` is a well-formed one-tile envelope - id/magic
+     * complement, tileSizeIdx 1, one 4-byte table entry naming a 1-byte last
+     * tile, and that byte present - so the truncations below differ from an
+     * accepted stream by the bytes named and by nothing else. */
+    {
+        unsigned char env[13];
+        unsigned char out[16];
+        cudec_chunk_result tres[1];
+        size_t written = 123;
+        size_t tiles = 123;
+        size_t total = 123;
+
+        env[0] = 0x04;  /* id = magic ^ 0xFF */
+        env[1] = 0xFB;  /* magic */
+        env[2] = 1;     /* tile count, low byte */
+        env[3] = 0;
+        env[4] = (unsigned char)(1u | (1u << 2)); /* idx 1, last tile 1 byte */
+        env[5] = 0;
+        env[6] = 0;
+        env[7] = 0;
+        env[8] = 1; /* table entry 0: the last tile's compressed size */
+        env[9] = 0;
+        env[10] = 0;
+        env[11] = 0;
+        env[12] = 0xAB; /* the one payload byte the table accounts for */
+
+        REQUIRE(cudec_gdeflate_tilestream_info(0, sizeof env, &tiles, &total) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null stream */
+        REQUIRE(tiles == 0 && total == 0);
+        REQUIRE(cudec_gdeflate_tilestream_info(env, sizeof env, 0, &total) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null tile_count */
+        REQUIRE(cudec_gdeflate_tilestream_info(env, sizeof env, &tiles, 0) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null uncompressed_size */
+        REQUIRE(cudec_gdeflate_tilestream_info(env, 4, &tiles, &total) ==
+                CUDEC_ERR_CORRUPT_INPUT); /* header truncated */
+        REQUIRE(tiles == 0 && total == 0);
+        REQUIRE(cudec_gdeflate_tilestream_info(env, sizeof env, &tiles,
+                                               &total) == CUDEC_OK);
+        REQUIRE(tiles == 1 && total == 1);
+
+        /* The one-shot entry. Nothing here reaches cudec_stream_ctx_create:
+         * every case is refused above it. */
+        REQUIRE(cudec_gdeflate_tilestream_decompress(
+                    0, sizeof env, out, sizeof out, CUDEC_MEM_HOST, tres, 1,
+                    &written) == CUDEC_ERR_INVALID_ARGUMENT); /* null stream */
+        REQUIRE(written == 0);
+        REQUIRE(cudec_gdeflate_tilestream_decompress(
+                    env, sizeof env, out, sizeof out, CUDEC_MEM_HOST, tres, 1,
+                    0) == CUDEC_ERR_INVALID_ARGUMENT); /* null bytes_written */
+        REQUIRE(cudec_gdeflate_tilestream_decompress(
+                    env, sizeof env, out, sizeof out, CUDEC_MEM_HOST, 0, 1,
+                    &written) == CUDEC_ERR_INVALID_ARGUMENT); /* null results */
+        REQUIRE(cudec_gdeflate_tilestream_decompress(
+                    env, sizeof env, 0, sizeof out, CUDEC_MEM_HOST, tres, 1,
+                    &written) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* null dst, nonzero capacity */
+        REQUIRE(cudec_gdeflate_tilestream_decompress(
+                    env, sizeof env, out, sizeof out, (cudec_mem_space)7, tres,
+                    1, &written) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* unknown dst_space */
+        REQUIRE(written == 0);
+
+        /* A NULL ctx is the _ctx entry's own reject, and it is taken before
+         * the envelope is looked at, so no context exists on this runner. */
+        REQUIRE(cudec_gdeflate_tilestream_decompress_ctx(
+                    0, env, sizeof env, out, sizeof out, CUDEC_MEM_HOST, tres,
+                    1, &written) == CUDEC_ERR_INVALID_ARGUMENT);
+        REQUIRE(written == 0);
+
+        /* The two content-dependent rejects: they need the envelope parsed, so
+         * they prove the one-shot entry reaches the walker before it reaches a
+         * device. A one-tile stream declares 1 byte of output and 1 result. */
+        REQUIRE(cudec_gdeflate_tilestream_decompress(
+                    env, sizeof env, out, 0, CUDEC_MEM_HOST, tres, 1,
+                    &written) == CUDEC_ERR_OUTPUT_TOO_SMALL);
+        REQUIRE(written == 0);
+        REQUIRE(cudec_gdeflate_tilestream_decompress(
+                    env, sizeof env, out, sizeof out, CUDEC_MEM_HOST, tres, 0,
+                    &written) ==
+                CUDEC_ERR_INVALID_ARGUMENT); /* results array too short */
+        REQUIRE(written == 0);
+        REQUIRE(cudec_gdeflate_tilestream_decompress(
+                    env, 4, out, sizeof out, CUDEC_MEM_HOST, tres, 1,
+                    &written) == CUDEC_ERR_CORRUPT_INPUT); /* truncated */
+        REQUIRE(written == 0);
+    }
+
     printf("PASS: plain-C caller exercised every public symbol\n");
     return 0;
 }

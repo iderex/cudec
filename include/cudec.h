@@ -343,6 +343,98 @@ cudec_status cudec_lz4_decompress_stream_ctx(
  * and valid on a poisoned context. After it returns the pointer is dangling. */
 void cudec_stream_ctx_destroy(cudec_stream_ctx* ctx);
 
+/* Reads the GDeflate TileStream envelope at `stream[0 .. stream_size)` and
+ * reports what a decode of it would produce: the number of tiles it declares
+ * and the total uncompressed size those tiles decode to. Host-only - it makes
+ * no CUDA call, touches no device, and reads no tile payload - so a caller
+ * can size its destination and its per-tile result array on a machine with no
+ * GPU.
+ *
+ * THE ENVELOPE IS NOT THE PAGE FORMAT, AND THIS ENTRY IS THE SEAM. A
+ * TileStream is the DirectStorage-side container that records where a file's
+ * GDeflate pages are; the pages themselves are what
+ * cudec_gdeflate_decompress_batch decodes. Nothing about the container
+ * crosses into device code, which is why this entry can answer without one.
+ *
+ * On CUDEC_OK, *tile_count and *uncompressed_size hold the envelope's
+ * declaration, each already checked against the bytes actually present.
+ * CUDEC_ERR_INVALID_ARGUMENT for a NULL argument; CUDEC_ERR_CORRUPT_INPUT for
+ * anything the bytes get wrong - a truncated header or table, an unknown tile
+ * size index, a reserved bit set, a tile count of zero, a table whose offsets
+ * do not strictly ascend, or a last tile running past the end. On any error
+ * *tile_count and *uncompressed_size are 0. The container carries no optional
+ * features, so nothing here returns CUDEC_ERR_UNSUPPORTED. */
+cudec_status cudec_gdeflate_tilestream_info(const void* stream,
+                                            size_t stream_size,
+                                            size_t* tile_count,
+                                            size_t* uncompressed_size);
+
+/* Decodes a whole GDeflate TileStream on a reusable streaming context: the
+ * envelope is parsed on the host, and its tiles are driven through the
+ * GDeflate page batch decoder as independent pages. Synchronous - the work is
+ * drained before return, so `dst`, `*bytes_written` and every
+ * h_tile_results[i] are valid on return.
+ *
+ * `stream`/`stream_size` is the whole container in HOST memory. The decoded
+ * tiles are written back to back into `dst`, in tile order, in the space named
+ * by dst_space: CUDEC_MEM_DEVICE writes device memory directly, CUDEC_MEM_HOST
+ * reads the bytes back into host memory. `dst_capacity` must be at least the
+ * `uncompressed_size` cudec_gdeflate_tilestream_info reports for the same
+ * bytes, and h_tile_results must be a HOST array of at least that entry's
+ * `tile_count` records; both are checked against the parsed envelope and
+ * refused rather than truncated.
+ *
+ * THE STAGING IS THE STREAMING CONTEXT'S, NOT A SECOND ONE. The context owns
+ * the CUDA stream and the grow-only pinned/device staging, so a caller
+ * decoding many streams pays the allocation once; that is the whole reason
+ * this entry takes a context rather than being one-shot only.
+ *
+ * A tile that fails to decode is isolated to itself: h_tile_results[i] carries
+ * that tile's own defined status with bytes_written 0, its siblings decode
+ * normally and report their own bytes, and nothing about the failed tile's
+ * region of `dst` is presented as valid output.
+ *
+ * THE WHOLE-STREAM ANSWER FOLLOWS THE FRAME PRECEDENT RATHER THAN THE BATCH
+ * ONE, because this entry, like cudec_lz4f_decompress, produces ONE object out
+ * of many pieces. A stream with any failed tile is not a partially decoded
+ * file: *bytes_written is 0 and the return is non-OK - CUDEC_ERR_CUDA where a
+ * device or host resource failed, otherwise the first non-OK tile's status in
+ * tile order. *bytes_written is the sum of the tiles' output only when every
+ * tile decoded.
+ *
+ * Fail-closed, synchronously and with nothing launched: a NULL ctx, a NULL
+ * `stream`, `bytes_written` or h_tile_results, a NULL `dst` with a non-zero
+ * `dst_capacity`, an unknown dst_space, or an envelope this build refuses
+ * returns CUDEC_ERR_INVALID_ARGUMENT or CUDEC_ERR_CORRUPT_INPUT before any
+ * CUDA call. A `dst_capacity` below the envelope's total returns
+ * CUDEC_ERR_OUTPUT_TOO_SMALL, and an h_tile_results array shorter than the
+ * declared tile count returns CUDEC_ERR_INVALID_ARGUMENT; both are decided
+ * from the parsed envelope, so both are content-dependent rejects and neither
+ * writes a byte of `dst`.
+ *
+ * A CUDA fault POISONS the context exactly as the LZ4 streaming entry
+ * documents: every later decode on it returns CUDEC_ERR_CUDA without touching
+ * the device, and only cudec_stream_ctx_destroy is valid on it thereafter.
+ * Never throws across this boundary. */
+cudec_status cudec_gdeflate_tilestream_decompress_ctx(
+    cudec_stream_ctx* ctx, const void* stream, size_t stream_size, void* dst,
+    size_t dst_capacity, cudec_mem_space dst_space,
+    cudec_chunk_result* h_tile_results, size_t tile_results_capacity,
+    size_t* bytes_written);
+
+/* One-shot whole-TileStream decode: equivalent to cudec_stream_ctx_create,
+ * one cudec_gdeflate_tilestream_decompress_ctx, and
+ * cudec_stream_ctx_destroy. It pays the full staging allocation on every
+ * call; a caller decoding repeatedly should hold a context and call the _ctx
+ * entry instead. Same arguments, contract and fail-closed behavior as the
+ * _ctx entry, and every synchronous reject class above is answered here
+ * without a context ever being created. Never throws across this
+ * boundary. */
+cudec_status cudec_gdeflate_tilestream_decompress(
+    const void* stream, size_t stream_size, void* dst, size_t dst_capacity,
+    cudec_mem_space dst_space, cudec_chunk_result* h_tile_results,
+    size_t tile_results_capacity, size_t* bytes_written);
+
 /* One-shot streaming batch LZ4 block decode: equivalent to
  * cudec_stream_ctx_create, one cudec_lz4_decompress_stream_ctx, and
  * cudec_stream_ctx_destroy. It pays the full staging allocation on every call;

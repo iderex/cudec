@@ -531,6 +531,44 @@ target_include_directories(frame_host_negative
 cudec_add_test(tilestream_host_negative SOURCES tilestream_host_negative.cpp)
 target_include_directories(tilestream_host_negative
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The whole-TileStream ABI entry against the reference (issue #177): the
+# envelope read on the host, the container decoded end to end in both memory
+# spaces, and one corrupted tile failing alone while its siblings stay
+# byte-exact. GPU-labelled - it drives the shipped page kernel through the
+# streaming context - and linking gdeflate_oracle for the compressor and the
+# reference decode it is compared against. The envelope constants it builds a
+# stream from come out of src/, on the include path every device test is
+# granted.
+cudec_add_test(tilestream_twin SOURCES tilestream_twin.cu GPU LIBS
+               gdeflate_oracle)
+# The other half of "the kernel stays envelope-ignorant" (issue #177), read off
+# the binary rather than the source. CUDA-only: it needs cuobjdump, and the HIP
+# build has its own symbol reader in check-hip-wave-instantiations.sh. The tool
+# is the one beside the nvcc that produced the objects, so the check cannot
+# pass by finding some other cuobjdump on the PATH.
+if(CUDEC_DEVICE_LANGUAGE STREQUAL "CUDA")
+  get_filename_component(_cudec_cuda_tool_dir "${CMAKE_CUDA_COMPILER}"
+                         DIRECTORY)
+  add_test(
+    NAME envelope_out_of_device
+    COMMAND bash
+            ${PROJECT_SOURCE_DIR}/scripts/check-envelope-out-of-device.sh
+            "${_cudec_cuda_tool_dir}/cuobjdump" "$<TARGET_OBJECTS:cudec>")
+  # The refusal proven to bite, for the reason it names: the same run, the
+  # same objects, and a pattern that IS in the device code. Without this the
+  # check above would pass identically if the symbol listing were empty, if
+  # the pattern never matched anything, or if the grep were inverted.
+  add_test(
+    NAME envelope_out_of_device_selfproof
+    COMMAND bash
+            ${PROJECT_SOURCE_DIR}/scripts/check-envelope-out-of-device.sh
+            "${_cudec_cuda_tool_dir}/cuobjdump" "$<TARGET_OBJECTS:cudec>"
+            "gdeflate_decode_batch")
+  set_tests_properties(envelope_out_of_device_selfproof PROPERTIES WILL_FAIL
+                                                                   TRUE)
+  set_tests_properties(envelope_out_of_device envelope_out_of_device_selfproof
+                       PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
+endif()
 # Termination as a tested invariant (issue #72): the parser's liveness
 # contract asserted per call over the truncation ladder, the mutant corpus,
 # the crafted hostile corpus, and the frame block-table walk - all of it

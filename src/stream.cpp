@@ -28,6 +28,7 @@
  * lever. */
 #include "batch_limits.h"
 #include "cudec.h"
+#include "stream_decode.h"
 
 #include "vendor_raii.h"
 
@@ -229,13 +230,16 @@ void StampNotDecoded(cudec_chunk_result* results, size_t chunk_count,
     }
 }
 
-/* Decodes the whole batch on the context's single stream. Grows the staging to
- * this call's high-water mark first (reusing it when already large enough),
- * then stages and launches each wave in order. A CUDA-level fault (a failed
- * copy/launch/sync, or a grow allocation failure) poisons the context and
- * returns CUDEC_ERR_CUDA; per-chunk decode rejects are reported in h_results
- * and never poison. */
-cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
+/* Decodes the whole batch on the context's single stream, submitting each wave
+ * through `entry`. Grows the staging to this call's high-water mark first
+ * (reusing it when already large enough), then stages and launches each wave in
+ * order. A CUDA-level fault (a failed copy/launch/sync, or a grow allocation
+ * failure) poisons the context and returns CUDEC_ERR_CUDA; per-chunk decode
+ * rejects are reported in h_results and never poison.
+ *
+ * Nothing below names a format. `entry` is the only thing that does, and it is
+ * the seam src/stream_decode.h argues for. */
+cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx, BatchEntry entry,
                              const void* const* h_src_ptrs,
                              const size_t* h_src_sizes, void* const* dst_ptrs,
                              const size_t* dst_caps, size_t chunk_count,
@@ -422,9 +426,9 @@ cudec_status DecodeStreamCtx(cudec_stream_ctx& ctx,
          * satisfies the batch entry's 16-byte-alignment requirement. */
         cudec_chunk_result* d_res =
             static_cast<cudec_chunk_result*>(ctx.d_results.p) + begin;
-        const cudec_status launched = cudec_lz4_decompress_batch(
-            dd_src, dd_ssz, dd_dst, dd_cap, wn, d_res,
-            cudec_rt::abi_stream(stream));
+        const cudec_status launched = entry(dd_src, dd_ssz, dd_dst, dd_cap, wn,
+                                            d_res,
+                                            cudec_rt::abi_stream(stream));
         if (launched != CUDEC_OK) {
             WAVE_FAIL(launched);
         }
@@ -515,12 +519,15 @@ cudec_status cudec_stream_ctx_create(cudec_stream_ctx** out_ctx) {
     return CUDEC_OK;
 }
 
-cudec_status cudec_lz4_decompress_stream_ctx(
-    cudec_stream_ctx* ctx, const void* const* h_src_ptrs,
-    const size_t* h_src_sizes, void* const* dst_ptrs, const size_t* dst_caps,
-    size_t chunk_count, cudec_mem_space dst_space,
-    cudec_chunk_result* h_results) {
-    if (ctx == nullptr) {
+namespace cudec_stream_detail {
+
+cudec_status DecodeOnStreamCtx(cudec_stream_ctx* ctx, BatchEntry entry,
+                               const void* const* h_src_ptrs,
+                               const size_t* h_src_sizes,
+                               void* const* dst_ptrs, const size_t* dst_caps,
+                               size_t chunk_count, cudec_mem_space dst_space,
+                               cudec_chunk_result* h_results) {
+    if (ctx == nullptr || entry == nullptr) {
         return CUDEC_ERR_INVALID_ARGUMENT;
     }
     /* Argument rejects are synchronous, make no CUDA call, and never poison the
@@ -539,7 +546,7 @@ cudec_status cudec_lz4_decompress_stream_ctx(
         return CUDEC_ERR_CUDA;
     }
     try {
-        return DecodeStreamCtx(*ctx, h_src_ptrs, h_src_sizes, dst_ptrs,
+        return DecodeStreamCtx(*ctx, entry, h_src_ptrs, h_src_sizes, dst_ptrs,
                                dst_caps, chunk_count, dst_space, h_results);
     } catch (...) {
         /* A host allocation failed mid-decode; never let it cross the C ABI,
@@ -547,6 +554,18 @@ cudec_status cudec_lz4_decompress_stream_ctx(
         ctx->poisoned = true;
         return CUDEC_ERR_CUDA;
     }
+}
+
+}  // namespace cudec_stream_detail
+
+cudec_status cudec_lz4_decompress_stream_ctx(
+    cudec_stream_ctx* ctx, const void* const* h_src_ptrs,
+    const size_t* h_src_sizes, void* const* dst_ptrs, const size_t* dst_caps,
+    size_t chunk_count, cudec_mem_space dst_space,
+    cudec_chunk_result* h_results) {
+    return cudec_stream_detail::DecodeOnStreamCtx(
+        ctx, cudec_lz4_decompress_batch, h_src_ptrs, h_src_sizes, dst_ptrs,
+        dst_caps, chunk_count, dst_space, h_results);
 }
 
 void cudec_stream_ctx_destroy(cudec_stream_ctx* ctx) {

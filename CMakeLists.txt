@@ -382,7 +382,8 @@ if(CUDEC_DEVICE_LANGUAGE)
   endfunction()
 
   cudec_device_sources(src/batch.cu)
-  target_sources(cudec PRIVATE src/batch.cu src/frame.cpp src/stream.cpp)
+  target_sources(cudec PRIVATE src/batch.cu src/frame.cpp src/stream.cpp
+                              src/tilestream.cpp)
   target_link_libraries(cudec PRIVATE ${CUDEC_DEVICE_RUNTIME_TARGET})
   set_target_properties(cudec PROPERTIES CXX_STANDARD 17
                                          CXX_STANDARD_REQUIRED ON)
