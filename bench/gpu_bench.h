@@ -40,6 +40,29 @@ bool cudec_bench_gpu_snappy(const unsigned char* const* comp,
                             size_t n, int warmup, int runs,
                             cudec_gpu_result* out);
 
+/* The value the two parse-only fields carry when the format under measurement
+ * has no parse-only variant to time. Negative so it cannot be mistaken for a
+ * measurement and cannot be divided into: a zero would read as an
+ * infinitely fast parse, which is the wrong direction for a missing number to
+ * fail in. A caller prints the absence and its reason rather than the value. */
+const double kCudecBenchNoParseOnly = -1.0;
+
+/* GDeflate (issue #228): the shipped cudec_gdeflate_decompress_batch, one
+ * warp per 64 KiB page, timed by the identical protocol.
+ *
+ * NO PARSE-ONLY CEILING, AND THE ABSENCE IS THE MEASUREMENT'S RATHER THAN
+ * THIS FUNCTION'S. The two chunk formats get one because
+ * src/chunk_decode.cuh is templated on a ParseOnly flag that elides the
+ * copies while running the identical parse. The GDeflate kernel is not that
+ * shape: its parse is a warp-cooperative round loop whose next round depends
+ * on bytes the previous round's copies produced, so a variant with the copies
+ * elided would not decode the same symbols and would ceiling nothing. Both
+ * parse_only fields therefore come back as kCudecBenchNoParseOnly. */
+bool cudec_bench_gpu_gdeflate(const unsigned char* const* comp,
+                              const size_t* comp_sizes,
+                              const size_t* orig_sizes, size_t n, int warmup,
+                              int runs, cudec_gpu_result* out);
+
 struct cudec_stream_ctx_result {
     size_t chunks;
     size_t output_bytes;

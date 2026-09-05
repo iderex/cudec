@@ -1614,6 +1614,14 @@ There is no GDeflate kernel yet. This entry is the denominator a later device
 number will be read against, and the harness says so in its own report rather
 than leaving a reader to infer it from the absence of a GPU row.
 
+**THE SENTENCE ABOVE WAS TRUE WHEN THIS ENTRY WAS RECORDED AND IS NOT TRUE
+NOW.** A kernel landed under #214 and the device numbers it was the denominator
+for are the section immediately below, taken over these same corpora at these
+same digests. The sentence is left standing rather than edited because the
+blocks under it are a record of a run and the run said what it said; this
+paragraph is the pointer a reader needs so nobody plans work off an expired
+absence.
+
 Eight cells, two corpora crossed with the level set section 11.8 of the
 [MASTERPLAN](MASTERPLAN.md) records. Silesia is the general-purpose half;
 `asset-like` is the generated game-asset model (issue #139), which is the one
@@ -1780,6 +1788,377 @@ carries the methodology its own numbers were taken under.
 - block-type composition: not asserted here; reading it needs a walk over the emitted page and that lock is issue #225's
 - wall per run: p50 626.935 ms / p90 666.084 ms / p99 682.146 ms
 - decode throughput: p50 0.335 GB/s / p90 0.315 GB/s / p99 0.307 GB/s
+```
+
+## M4: the first recorded GDeflate GPU baselines (issue #228)
+
+The kernel that landed under #214 decodes one 64 KiB page per warp, its 32
+lanes being the format's 32 substreams. These are its first numbers. The CPU
+denominator above is the same corpus set at the same digests, so the two
+sections are one measurement read two ways rather than two measurements.
+
+**Ratio is printed beside throughput on every row, and that is not decoration.**
+GDeflate's pitch over LZ4 and Snappy is DEFLATE-class ratio; a throughput-only
+table would misreport what the format is for. The level-0 rows are the extreme
+case of that: the reference emits uncompressed blocks by construction there, so
+a page is a memcpy with a header and the decoder reaches 106 GB/s at a ratio of
+1.0021 - a number that says nothing about decoding and everything about the
+copy engine. Read it as the ceiling the copy path imposes and never as a
+GDeflate figure.
+
+**There is no parse-only row and the absence is a result rather than an
+omission.** The LZ4 and Snappy rows carry one because `src/chunk_decode.cuh` is
+templated on a `ParseOnly` flag that elides the copies while running the
+identical parse, so the two numbers bracket where the time goes. The GDeflate
+kernel is not that shape: its round loop's next round reads bytes the previous
+round's copies produced, so a variant with the copies elided would decode
+different symbols and ceiling nothing. The harness prints that sentence in
+place of the row rather than filling it with the full decode timed twice.
+
+**What was measured and what was not.** Every number below is a device-resident
+decode: the pages are already on the GPU, so H2D and D2H are excluded and the
+figure is kernel decode throughput. Timing is CUDA-event, 3 warmup plus 30
+measured runs, p50 nearest-rank - the same protocol and the same percentile
+definition the CPU rows above use, so the ratio column is a division of two
+numbers that mean the same thing. Before a single run is timed, every page is
+decoded by the shipped batch entry and its `bytes_written` compared against the
+page's original size; the harness refuses to time a batch that failed that, so
+no number here is from an unverified decode.
+
+Recorded 2026-09-05 in the Ubuntu-24.04 WSL distribution, on
+`NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3`, host CPU
+`AMD Ryzen 9 5950X 16-Core Processor`, against the gdeflate fork pinned at
+`8ba9502fb30d2bf728592d121f0d402e40c8cb05`, at `dfda2c7`. Reproduce with
+
+```
+bench_gdeflate --gpu --warmup 3 --runs 30 bench/corpora/silesia/*
+bench_gdeflate --gpu --warmup 3 --runs 30 --assetlike
+bench_gdeflate --gpu --warmup 3 --runs 30 --blocktypes
+bench_gdeflate --gpu --warmup 3 --runs 30 --worstrounds
+bench_gdeflate --gpu --warmup 3 --runs 30 --worstheaders
+```
+
+**Read the p50 and treat the CPU tail with the same suspicion the section above
+asks for.** The asset-like level-1 cell spreads from 724 ms at p50 to 1796 ms at
+p99, which is host contention rather than a property of either decoder. The GPU
+rows are event-timed on an otherwise idle device and their p50 is the figure;
+the harness prints no GPU tail, so nothing here claims one.
+
+### The headline rows
+
+| corpus     | level | ratio  | CPU p50    | GPU p50   | GPU throughput | GPU vs CPU | corpus digest      |
+| ---------- | ----- | ------ | ---------- | --------- | -------------- | ---------- | ------------------ |
+| Silesia    | 0     | 1.0021 | 0.660 GB/s | 1.992 ms  | 106.412 GB/s   | 161.14x    | `88ed82d5ec9df3ad` |
+| Silesia    | 1     | 0.3581 | 0.310 GB/s | 28.187 ms | 7.519 GB/s     | 24.26x     | `131124d155e6672b` |
+| Silesia    | 6     | 0.3343 | 0.327 GB/s | 26.308 ms | 8.056 GB/s     | 24.66x     | `042b2473240db0b0` |
+| Silesia    | 12    | 0.3198 | 0.348 GB/s | 26.810 ms | 7.905 GB/s     | 22.70x     | `4b88e13a215ed884` |
+| asset-like | 0     | 1.0021 | 0.637 GB/s | 1.995 ms  | 105.133 GB/s   | 165.06x    | `08ac6ec118b60189` |
+| asset-like | 1     | 0.7105 | 0.289 GB/s | 35.573 ms | 5.895 GB/s     | 20.37x     | `45690d97a5d3b054` |
+| asset-like | 6     | 0.7029 | 0.275 GB/s | 35.368 ms | 5.930 GB/s     | 21.58x     | `47dad3ea983dc577` |
+| asset-like | 12    | 0.6995 | 0.296 GB/s | 36.078 ms | 5.813 GB/s     | 19.63x     | `cb272ab3765d8378` |
+
+The digests are the ones the CPU section above recorded on 2026-08-26, cell for
+cell, so the two sections are attested against identical bytes.
+
+**What the level columns say.** Away from level 0 the decoder sits between 5.8
+and 8.1 GB/s and barely moves with the level: 7.52, 8.06 and 7.91 GB/s on
+Silesia at levels 1, 6 and 12. The table description gets denser as the level
+rises and the throughput does not fall with it, which is a reading about this
+corpus at this kernel and not a claim that table construction is free -
+whether it is, and whether a different table layout moves it, is #204's
+measurement and nothing here answers it.
+
+### Decode-path coverage rows, not headline numbers
+
+The forced-block-type corpora (#225) are here because a level list is a plan
+for coverage and not the coverage argument. Each family asserts the block type
+it actually reached by walking the emitted page's first block header. They are
+64 pages against the headline set's 3200, so their absolute figures carry the
+launch's fixed cost in a way the large corpora do not; they are coverage and a
+ratio, never a throughput claim.
+
+| family             | level | ratio  | CPU p50    | GPU p50  | GPU throughput | GPU vs CPU | corpus digest      |
+| ------------------ | ----- | ------ | ---------- | -------- | -------------- | ---------- | ------------------ |
+| stored-by-level    | 0     | 1.0021 | 0.610 GB/s | 0.730 ms | 5.745 GB/s     | 9.42x      | `c29d43ce8a158356` |
+| stored-by-input    | 6     | 1.0021 | 0.681 GB/s | 0.729 ms | 5.753 GB/s     | 8.45x      | `aa7dc860c5cb5db8` |
+| static-low-entropy | 1     | 0.0026 | 1.239 GB/s | 0.289 ms | 14.525 GB/s    | 11.72x     | `5a39a208be933f45` |
+
+### The adversarial rows
+
+The two hand-emitted corpora are the DoS-resistance margin, and under the #36
+rule they outrank an average-case win: a change that improves Silesia and
+regresses either of these is refused. Neither is produced by a compressor -
+both are emitted by the harness and validated against the reference before
+timing - and both are in the record so a later perf pass has a before.
+
+| corpus        | ratio  | CPU p50    | GPU p50   | GPU throughput | GPU vs CPU | corpus digest      |
+| ------------- | ------ | ---------- | --------- | -------------- | ---------- | ------------------ |
+| worst-rounds  | 2.4608 | 0.301 GB/s | 9.377 ms  | 3.578 GB/s     | 11.88x     | `6e2f2850f76891bb` |
+| worst-headers | 2.8103 | 0.055 GB/s | 67.579 ms | 0.497 GB/s     | 8.96x      | `c79e0a872dba2ca3` |
+
+`worst-headers` is the floor and it is two orders of magnitude below the
+headline: 0.497 GB/s against 8.056. That is the kernel spending its time in
+table construction rather than in the round loop, which is what the corpus is
+built to force - one block per group of matches, so a page pays a whole
+dynamic-header decode for a handful of decoded bytes. The margin the format's
+worst case leaves is this row and not the Silesia one.
+
+The tables above are a reading aid. The thirteen blocks below are the record,
+and each one carries the methodology its own numbers were taken under.
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, 212.38 MB compressed (ratio 1.0021), cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- granularity: 64 KiB pages, compression level 0
+- corpus digest: 88ed82d5ec9df3ad (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted on this path; the four-level sweep claims no block type, which is section 11.8's rule that a level list is a plan for coverage and not the coverage argument
+- wall per run: p50 320.933 ms / p90 348.782 ms / p99 359.458 ms
+- decode throughput: p50 0.660 GB/s / p90 0.608 GB/s / p99 0.590 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3234 pages, every page verified to its original size before timing): p50 1.992 ms, 106.412 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 161.14x (CPU p50 320.933 ms, GPU p50 1.992 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, 75.89 MB compressed (ratio 0.3581), cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- granularity: 64 KiB pages, compression level 1
+- corpus digest: 131124d155e6672b (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted on this path; the four-level sweep claims no block type, which is section 11.8's rule that a level list is a plan for coverage and not the coverage argument
+- wall per run: p50 683.930 ms / p90 713.092 ms / p99 743.880 ms
+- decode throughput: p50 0.310 GB/s / p90 0.297 GB/s / p99 0.285 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3234 pages, every page verified to its original size before timing): p50 28.187 ms, 7.519 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 24.26x (CPU p50 683.930 ms, GPU p50 28.187 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, 70.84 MB compressed (ratio 0.3343), cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- granularity: 64 KiB pages, compression level 6
+- corpus digest: 042b2473240db0b0 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted on this path; the four-level sweep claims no block type, which is section 11.8's rule that a level list is a plan for coverage and not the coverage argument
+- wall per run: p50 648.837 ms / p90 696.670 ms / p99 741.220 ms
+- decode throughput: p50 0.327 GB/s / p90 0.304 GB/s / p99 0.286 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3234 pages, every page verified to its original size before timing): p50 26.308 ms, 8.056 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 24.66x (CPU p50 648.837 ms, GPU p50 26.308 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, 3234 pages, 211.94 MB original, 67.77 MB compressed (ratio 0.3198), cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- granularity: 64 KiB pages, compression level 12
+- corpus digest: 4b88e13a215ed884 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 60692 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted on this path; the four-level sweep claims no block type, which is section 11.8's rule that a level list is a plan for coverage and not the coverage argument
+- wall per run: p50 608.638 ms / p90 673.915 ms / p99 793.415 ms
+- decode throughput: p50 0.348 GB/s / p90 0.314 GB/s / p99 0.267 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3234 pages, every page verified to its original size before timing): p50 26.810 ms, 7.905 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 22.70x (CPU p50 608.638 ms, GPU p50 26.810 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: asset-like, 3200 pages, 209.72 MB original, 210.15 MB compressed (ratio 1.0021), generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- granularity: 64 KiB pages, compression level 0
+- corpus digest: 08ac6ec118b60189 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted on this path; the four-level sweep claims no block type, which is section 11.8's rule that a level list is a plan for coverage and not the coverage argument
+- wall per run: p50 329.262 ms / p90 406.229 ms / p99 428.289 ms
+- decode throughput: p50 0.637 GB/s / p90 0.516 GB/s / p99 0.490 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3200 pages, every page verified to its original size before timing): p50 1.995 ms, 105.133 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 165.06x (CPU p50 329.262 ms, GPU p50 1.995 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: asset-like, 3200 pages, 209.72 MB original, 149.00 MB compressed (ratio 0.7105), generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- granularity: 64 KiB pages, compression level 1
+- corpus digest: 45690d97a5d3b054 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted on this path; the four-level sweep claims no block type, which is section 11.8's rule that a level list is a plan for coverage and not the coverage argument
+- wall per run: p50 724.627 ms / p90 799.562 ms / p99 1796.250 ms
+- decode throughput: p50 0.289 GB/s / p90 0.262 GB/s / p99 0.117 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3200 pages, every page verified to its original size before timing): p50 35.573 ms, 5.895 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 20.37x (CPU p50 724.627 ms, GPU p50 35.573 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: asset-like, 3200 pages, 209.72 MB original, 147.40 MB compressed (ratio 0.7029), generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- granularity: 64 KiB pages, compression level 6
+- corpus digest: 47dad3ea983dc577 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted on this path; the four-level sweep claims no block type, which is section 11.8's rule that a level list is a plan for coverage and not the coverage argument
+- wall per run: p50 763.128 ms / p90 816.742 ms / p99 849.770 ms
+- decode throughput: p50 0.275 GB/s / p90 0.257 GB/s / p99 0.247 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3200 pages, every page verified to its original size before timing): p50 35.368 ms, 5.930 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 21.58x (CPU p50 763.128 ms, GPU p50 35.368 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: asset-like, 3200 pages, 209.72 MB original, 146.70 MB compressed (ratio 0.6995), generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- granularity: 64 KiB pages, compression level 12
+- corpus digest: cb272ab3765d8378 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: not asserted on this path; the four-level sweep claims no block type, which is section 11.8's rule that a level list is a plan for coverage and not the coverage argument
+- wall per run: p50 708.035 ms / p90 740.773 ms / p99 758.982 ms
+- decode throughput: p50 0.296 GB/s / p90 0.283 GB/s / p99 0.276 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 3200 pages, every page verified to its original size before timing): p50 36.078 ms, 5.813 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 19.63x (CPU p50 708.035 ms, GPU p50 36.078 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: stored-by-level, 64 pages, 4.19 MB original, 4.20 MB compressed (ratio 1.0021), generated in-harness from a fixed PRNG and compressed at level 0, which the reference's own header says emits uncompressed blocks by construction; DECODE-PATH COVERAGE, not a throughput figure
+- granularity: 64 KiB pages, compression level 0
+- corpus digest: c29d43ce8a158356 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: every page opens with a stored block, and BFINAL is clear on it in every page, so every page carries at least one more block that this walk does not reach - a lower bound on the count, never a census (a later block in the same page is neither asserted nor denied, because reaching one means decoding to it)
+- wall per run: p50 6.874 ms / p90 7.331 ms / p99 8.081 ms
+- decode throughput: p50 0.610 GB/s / p90 0.572 GB/s / p99 0.519 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 64 pages, every page verified to its original size before timing): p50 0.730 ms, 5.745 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 9.42x (CPU p50 6.874 ms, GPU p50 0.730 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: stored-by-input, 64 pages, 4.19 MB original, 4.20 MB compressed (ratio 1.0021), generated in-harness from a xorshift PRNG, incompressible by construction, compressed at the DEFAULT level 6 - the stored block here is forced by the input and not by the level; DECODE-PATH COVERAGE, not a throughput figure
+- granularity: 64 KiB pages, compression level 6
+- corpus digest: aa7dc860c5cb5db8 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: every page opens with a stored block, and BFINAL is clear on it in every page, so every page carries at least one more block that this walk does not reach - a lower bound on the count, never a census (a later block in the same page is neither asserted nor denied, because reaching one means decoding to it)
+- wall per run: p50 6.162 ms / p90 6.827 ms / p99 6.979 ms
+- decode throughput: p50 0.681 GB/s / p90 0.614 GB/s / p99 0.601 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 64 pages, every page verified to its original size before timing): p50 0.729 ms, 5.753 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 8.45x (CPU p50 6.162 ms, GPU p50 0.729 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: static-low-entropy, 64 pages, 4.19 MB original, 0.01 MB compressed (ratio 0.0026), generated in-harness as a seven-byte repeating alphabet with no noise, compressed at level 1, where a dynamic table description costs more than the fixed code it would replace; DECODE-PATH COVERAGE, not a throughput figure
+- granularity: 64 KiB pages, compression level 1
+- corpus digest: 5a39a208be933f45 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: every page opens with a static block, and BFINAL is set on it in every page, so each page is that one block and this is the page's whole composition rather than its opening
+- wall per run: p50 3.386 ms / p90 3.688 ms / p99 4.567 ms
+- decode throughput: p50 1.239 GB/s / p90 1.137 GB/s / p99 0.918 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 64 pages, every page verified to its original size before timing): p50 0.289 ms, 14.525 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 11.72x (CPU p50 3.386 ms, GPU p50 0.289 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: worst-rounds, 512 pages, 33.55 MB original, 82.57 MB compressed (ratio 2.4608), HAND-CONSTRUCTED by this harness and validated by the pinned gdeflate fork, not produced by any compressor: one final dynamic block per page, every symbol in it at DEFLATE's maximum codeword length, and a body of minimum-length matches asked for through the sixteen-extra-bit length symbol, so the deferred-copy path runs once per three decoded bytes; ADVERSARIAL, the M4 security-posture row and never a headline throughput figure, and NOT scale-comparable with this harness's other corpora, which are recorded on their own invocations and are several times this one in pages
+- padding: 8.39 MB on top of the compressed figure above, a zero tail per page for the reference's unchecked refill; no decoder reads it and the ratio does not count it
+- granularity: 64 KiB pages, emitted by this harness - no compressor and therefore no compression level
+- corpus digest: 6e2f2850f76891bb (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: every page opens with a dynamic block, and BFINAL is set on it in every page, so each page is that one block and this is the page's whole composition rather than its opening
+- refill density: 0.6152 refills per decoded byte over 20642816 refills and 33554432 decoded bytes, worst page 0.6152, floor 0.6000 taken on the worst page rather than on the mean, counted by cudec's own schedule (src/gdeflate_schedule.h) on a decode required to reproduce the source and to fill a whole page; this is the quantity the corpus is locked on and not a timing
+- blocks per page: min 1 / max 1, 512 blocks over the corpus of which 512 dynamic, counted by cudec's own page decode (src/gdeflate_block.h) rather than by the construction that emitted them
+- deferred copies: 11124736, one per 3 decoded bytes past the opening literal run - the length round reserves and the distance round on the same lane retires. ARITHMETIC over the corpus's construction and not a count read out of the decode: no decoder in this tree reports a retirement
+- wall per run: p50 111.394 ms / p90 147.333 ms / p99 158.893 ms
+- decode throughput: p50 0.301 GB/s / p90 0.228 GB/s / p99 0.211 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 512 pages, every page verified to its original size before timing): p50 9.377 ms, 3.578 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 11.88x (CPU p50 111.394 ms, GPU p50 9.377 ms)
+```
+
+```
+## bench_gdeflate report
+- decoder: CPU oracle, libdeflate_gdeflate_decompress (the pinned NVIDIA/libdeflate gdeflate fork, commit 8ba9502fb30d2bf728592d121f0d402e40c8cb05), single thread. The GPU rows below time cudec's own decoder through cudec_gdeflate_decompress_batch, and the CPU rows are the denominator they are read against
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: worst-headers, 512 pages, 33.55 MB original, 94.30 MB compressed (ratio 2.8103), HAND-CONSTRUCTED by this harness and validated by the pinned gdeflate fork, not produced by any compressor: the worst-rounds page cut into one dynamic block per group of 32 minimum-length matches, so it carries that row's maximum-length codewords and its deferred-copy-per-three-bytes body AND a dynamic block header every 96 decoded bytes; ADVERSARIAL, the M4 security-posture row and never a headline throughput figure, and NOT scale-comparable with this harness's other corpora, which are recorded on their own invocations and are several times this one in pages
+- padding: 8.39 MB on top of the compressed figure above, a zero tail per page for the reference's unchecked refill; no decoder reads it and the ratio does not count it
+- granularity: 64 KiB pages, emitted by this harness - no compressor and therefore no compression level
+- corpus digest: c79e0a872dba2ca3 (XXH64 over per-page length and XXH64, little-endian, in corpus order)
+- page sizes: min 65536 / median 65536 / max 65536 bytes uncompressed
+- method: 3 warmup + 30 measured runs, wall clock per whole-batch decode; the timed region is libdeflate_gdeflate_decompress only (destinations allocated outside it); every page round-trip-verified against the source once before timing; percentiles are nearest-rank
+- block-type composition: every page opens with a dynamic block, and BFINAL is clear on it in every page, so every page carries at least one more block that this walk does not reach - a lower bound on the count, never a census (a later block in the same page is neither asserted nor denied, because reaching one means decoding to it)
+- refill density: 0.7026 refills per decoded byte over 23574528 refills and 33554432 decoded bytes, worst page 0.7026, floor 0.6600 taken on the worst page rather than on the mean, counted by cudec's own schedule (src/gdeflate_schedule.h) on a decode required to reproduce the source and to fill a whole page; this is the quantity the corpus is locked on and not a timing
+- blocks per page: min 679 / max 679, 347648 blocks over the corpus of which 347648 dynamic, counted by cudec's own page decode (src/gdeflate_block.h) rather than by the construction that emitted them
+- deferred copies: 11124736, one per 3 decoded bytes past the opening literal run - the length round reserves and the distance round on the same lane retires. ARITHMETIC over the corpus's construction and not a count read out of the decode: no decoder in this tree reports a retirement
+- wall per run: p50 605.236 ms / p90 700.178 ms / p99 883.518 ms
+- decode throughput: p50 0.055 GB/s / p90 0.048 GB/s / p99 0.038 GB/s
+- GPU decode (device-resident, CUDA-event timed, 3 warmup + 30 runs, 512 pages, every page verified to its original size before timing): p50 67.579 ms, 0.497 GB/s
+- GPU parse-only ceiling: not instantiable for this format - the round loop's next round reads bytes the previous round's copies produced, so a variant with the copies elided decodes different symbols and ceilings nothing. The row is absent rather than filled with the full decode timed twice
+- GPU vs the CPU denominator in this report: 8.96x (CPU p50 605.236 ms, GPU p50 67.579 ms)
 ```
 
 ## M4 perf lever: the block-type mix, retired on the census (issue #206)
