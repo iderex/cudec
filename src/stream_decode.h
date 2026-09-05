@@ -1,16 +1,32 @@
 /* The streaming decode core, shared by every format that drives the reusable
- * context (issue #177). Internal header, not part of the ABI.
+ * STREAMING context (issue #177). Internal header, not part of the ABI.
  *
- * WHY THIS SEAM EXISTS AT ALL. src/stream.cpp owns the only staging path in
- * the library that grows once and is reused: a pinned/device source pair, the
- * metadata pair, the host-output destination staging, the result buffer and
- * its pinned mirror, waved so a hostile chunk_count cannot drive per-wave
- * growth. Every one of those is format-blind - the only line in the wave loop
- * that names a format is the batch entry it launches. A second format that
- * copied the loop to change that one line would be a second staging path to
- * keep in agreement with this one, and the two would drift on exactly the
- * questions (poisoning, the not-produced seed, the drain) that are hardest to
- * notice going wrong.
+ * WHY THIS SEAM EXISTS AT ALL. src/stream.cpp owns the reusable staging path:
+ * a pinned/device source pair, the metadata pair, the host-output destination
+ * staging, the result buffer and its pinned mirror, grown once and waved so a
+ * hostile chunk_count cannot drive per-wave growth. Every one of those is
+ * format-blind - the only line in the wave loop that names a format is the
+ * batch entry it launches. A second format that copied the loop to change that
+ * one line would be a second staging path to keep in agreement with this one,
+ * and the two would drift on exactly the questions (poisoning, the
+ * not-produced seed, the drain) that are hardest to notice going wrong.
+ *
+ * THIS IS NOT A CLAIM THAT THE LIBRARY HAS ONE STAGING PATH, AND SAYING SO
+ * HERE IS DELIBERATE. src/frame.cpp is a second one: it gathers into its own
+ * host buffer, builds the same four-section metadata upload in a comment that
+ * admits the copy, launches the batch entry directly, and does its own
+ * readback and aggregate - with no poisoning, no not-produced seed and no wave
+ * loop. That is precisely the drift this paragraph warns about, already in the
+ * tree, and it is not migrated here: a frame's per-block output size is
+ * unknown before the decode, so it needs a block_max slab and a compaction
+ * pass that this core has no shape for. What is claimed is narrower and true -
+ * every format reaching the reusable CONTEXT comes through this one function.
+ *
+ * NOTHING REFUSES A THIRD PATH. The rule above is carried by this paragraph
+ * and by review, not by a check: whether a block of code is a re-copy of a
+ * wave loop is a judgement about meaning, and no reading of the tree makes it.
+ * A guard that grepped for the staging member names would refuse the honest
+ * caller and miss a re-copy under fresh ones.
  *
  * A FUNCTION POINTER RATHER THAN A TEMPLATE, deliberately, and the opposite of
  * what src/batch.cu does for its launchers. There the indirection would cost
