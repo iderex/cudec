@@ -7,10 +7,9 @@
 # The field set is docs/AMD-VALIDATION.md's section 6 and nothing else: that
 # document is the instruction and this form is the intake, so a field here that
 # the runbook never told a reporter to capture would be asking for something
-# they were never told to keep. Two things a reader might expect are therefore
-# absent - the driver version and the commit built - because the runbook does
-# not ask for either. That is a gap in the runbook, recorded on issue #246, and
-# not one this form may close on its own.
+# they were never told to keep. Two of the six arrived that way rather than
+# being invented here - the kernel driver version and the commit built, which
+# the runbook did not ask for until issue #451 put them in it, in that order.
 name: AMD validation result
 description:
   Output from running the suite or the benchmarks on an AMD GPU, following
@@ -82,6 +81,29 @@ body:
         differed, this field is the most valuable thing in the report after the
         output itself.
       render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: driver
+    attributes:
+      label: Kernel driver version
+      description:
+        Not the ROCm version - the userspace stack and the kernel module ship
+        separately. Step 6 has the line that prints it. "Not readable on this
+        host" is a complete answer.
+      placeholder: 6.10.5
+    validations:
+      required: false
+
+  - type: input
+    id: commit
+    attributes:
+      label: The commit you built
+      description:
+        Step 6's `git rev-parse HEAD`, inside the clone step 1 made. Without
+        it the result is pinned to a day rather than to a tree.
+      placeholder: dfda2c709124bdd763b0a852e6fbc092e2539f30
     validations:
       required: true
 

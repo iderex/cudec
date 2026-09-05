@@ -159,18 +159,43 @@ methodology inseparably from its numbers, on purpose
 hand-trimmed block is not a usable result and will not be recorded. The same
 goes for the `ctest` output - the whole thing, passes included.
 
-With it, four facts that no output above carries on its own:
+With it, six facts that no output above carries on its own:
 
 - the GPU's marketing name and its `gfx` target, from step 2;
 - the wave width, from step 2;
 - the ROCm version: 7.2.4 if you used the image above unchanged, otherwise
   the one you built with;
+- **the kernel driver version**, which is not the ROCm version and can differ
+  from it - the userspace stack and the kernel module ship separately, and
+  every CUDA number this project records carries its driver for the same
+  reason (`docs/BENCHMARKS.md`). One line, on the host rather than in the
+  container:
+
+  ```sh
+  cat /sys/module/amdgpu/version 2>/dev/null || modinfo amdgpu | grep ^version
+  ```
+
+  If neither prints anything, say so - "not readable on this host" is a
+  complete answer and better than a guess;
+
+- **the commit you built**, from inside the clone step 1 made:
+
+  ```sh
+  git rev-parse HEAD
+  ```
+
+  Without it a result is pinned to the day it was run rather than to a tree,
+  and a row in `docs/BENCHMARKS.md` that nobody can reproduce is not a row;
+
 - the `docker run` invocation you actually used, if it differs from step 3.
 
-Open an issue on <https://github.com/iderex/cudec/issues> with all of it. A
-result from wave64 silicon has an address of its own, issue #415, which is
-open precisely because that dispatch arm has never executed anywhere; the
-purpose-built intake form is #246.
+Open an issue on <https://github.com/iderex/cudec/issues> with all of it. The
+form built for exactly this is under "AMD validation result" in the New Issue
+chooser, and it refuses to submit without five of the six - the driver version
+is the one it accepts empty, because it is the one you may genuinely be unable
+to read. A result
+from wave64 silicon has an address of its own, issue #415, which is open
+precisely because that dispatch arm has never executed anywhere.
 
 ## What an hour buys, measured where it could be measured
 
