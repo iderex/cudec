@@ -182,7 +182,7 @@ static_assert(kGDeflateRejectBlockFirst == kGDeflateRejectTablesLast + 1,
 static_assert(kGDeflateRejectCount == kGDeflateRejectBlockLast + 1,
               "the block section must be the last one");
 
-/* THE DECLARED STRICTNESS DEPARTURES (issue #183). Three rungs refuse a page
+/* THE DECLARED STRICTNESS DEPARTURES (issue #183). Four rungs refuse a page
  * that libdeflate's GDeflate decompressor decodes, and each one is a decision
  * argued at its own refusal site rather than an accident:
  *
@@ -196,6 +196,28 @@ static_assert(kGDeflateRejectCount == kGDeflateRejectBlockLast + 1,
  *   - kGDeflateRejectRepeatRunPastAlphabet, in src/gdeflate_tables.h: the
  *     reference absorbs a code-length repeat run that overruns HLIT + HDIST
  *     into slack entries it then never reads.
+ *   - kGDeflateRejectPagePartialWord, at GDeflatePageShape below: a page whose
+ *     length is not a whole number of 32-bit words is not a page this schedule
+ *     can prime, and the argument for refusing it is at that function. The
+ *     reference decodes one anyway whenever the bytes that went missing are
+ *     bytes it never needed - it stops when the OUTPUT is full and this format
+ *     carries no checksum anywhere, so a real page with its last byte removed
+ *     still reproduces the original output there and is refused here.
+ *
+ * THE FOURTH ARRIVED FROM THE GPU GATE AND NOT FROM THE FUZZER, which is the
+ * reason it was undeclared for as long as it was (issue #453). The mutant
+ * parity in tests/gdeflate_gate_gpu.cu truncates real pages by single bytes
+ * and met it 48 times in one run; the differential target cannot meet it at
+ * all, because fuzz/fuzz_gdeflate_page.cpp masks every page length it hands
+ * either decoder down to a multiple of four:
+ *
+ *     const size_t chunk = (payload_size / npages) & ~static_cast<size_t>(3);
+ *
+ * and its structured mutator word-aligns its own page the same way. So this
+ * rung reaches the exemption below on the gate's route and on no other, and
+ * declaring it loosens that target's trap by nothing rather than by one rung -
+ * a measurement rather than a hope, and the reason this list could be extended
+ * without buying the silence the paragraph below is about.
  *
  * WHY THE LIST IS A PREDICATE AND NOT A SENTENCE IN A COMMENT. For a format
  * with no checksum anywhere, over-strictness is not a lesser cousin of
@@ -205,7 +227,7 @@ static_assert(kGDeflateRejectCount == kGDeflateRejectBlockLast + 1,
  * never measured in this direction drifts stricter one refusal at a time, and
  * every step of that drift reads as a bug fix. So the differential target
  * traps the reverse direction and consults this predicate for the exemption,
- * which makes a fourth departure a thing somebody writes down rather than a
+ * which makes a further departure a thing somebody writes down rather than a
  * thing a later reader discovers by finding data that will not decompress.
  *
  * WHAT HOLDS THE LIST TO REALITY IS tests/gdeflate_departure_lock.cpp, which
@@ -216,6 +238,7 @@ static_assert(kGDeflateRejectCount == kGDeflateRejectBlockLast + 1,
 CUDEC_HOST_DEVICE inline bool GDeflateRejectIsDeclaredDeparture(
     GDeflateReject branch) {
     switch (branch) {
+        case kGDeflateRejectPagePartialWord:
         case kGDeflateRejectRefillPastEnd:
         case kGDeflateRejectEmptyTableUsed:
         case kGDeflateRejectRepeatRunPastAlphabet:
@@ -497,7 +520,26 @@ CUDEC_HOST_DEVICE inline void GDeflateReset(GDeflateSchedule& s) {
  * 5.3 says the first round always loads 32 consecutive words, so a stream
  * below 128 bytes cannot be valid and is refused here rather than discovered
  * part-way through the priming round. Both residencies prime through this, so
- * each rung has one site. */
+ * each rung has one site.
+ *
+ * THE FIRST OF THE TWO IS A DECLARED STRICTNESS DEPARTURE, and this is the
+ * refusal site the declaration above points at (issue #453). The reference
+ * decodes a page whose last byte was removed whenever that byte was one it
+ * never read - it stops at a full output rather than at the end of the page,
+ * and this format has no checksum to disagree with it - so the refusal here
+ * is a page libdeflate reproduces the original bytes for. Nothing in that
+ * argues for accepting it: the missing byte makes the page's own length a lie
+ * about what it carries, the priming round has no word to give a lane, and
+ * the caller who wanted those bytes back is better served by a defined
+ * refusal than by an output that happens to be right. What the declaration
+ * buys is that the strictness is written down and executed by
+ * tests/gdeflate_departure_lock.cpp rather than discovered by somebody whose
+ * data will not decompress.
+ *
+ * NOTHING HERE SAYS THE SECOND RUNG IS OR IS NOT ONE. Whether the reference
+ * also decodes a page below the priming round is a separate measurement, no
+ * run has produced a page on which it does, and an absence over one corpus is
+ * not a declaration either way. */
 CUDEC_HOST_DEVICE inline bool GDeflatePageShape(uint64_t page_bytes,
                                                 uint64_t* word_count,
                                                 GDeflateReject* why) {

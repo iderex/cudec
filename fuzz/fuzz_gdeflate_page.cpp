@@ -41,7 +41,16 @@
  * refuses, or the two accepting and disagreeing on the bytes or on the size.
  * The reverse - the twin refusing a page the reference decodes - traps as
  * well, unless the rung the twin refused on is one src/gdeflate_schedule.h
- * declares a strictness departure, which today is three of the twenty-two.
+ * declares a strictness departure, which today is four of the twenty-two.
+ *
+ * ONE OF THOSE FOUR CANNOT ARISE HERE, AND SAYING SO IS THE POINT (issue
+ * #453). kGDeflateRejectPagePartialWord refuses a page whose length is not a
+ * whole number of 32-bit words, and this target masks every length it hands
+ * either decoder down to a multiple of four - `chunk` below, and the
+ * structured mutator's `room` above it - so no input this target can build
+ * reaches that exemption arm. Its population is the GPU gate's single-byte
+ * truncations, and reading the predicate here as the measure of what this
+ * target tolerates would overstate it by exactly that rung.
  *
  * THIS DIRECTION WAS UNTRAPPED UNTIL THE LADDER EXISTED, AND THE REASON IS
  * WORTH KEEPING. The decoder used to report only that it had refused, so a
@@ -59,12 +68,13 @@
  * anywhere in this format that failure reaches the caller as data the
  * reference decompresses and cudec calls corrupt, with nothing to appeal to.
  *
- * WHAT THE EXEMPTION COSTS, SAID RATHER THAN IMPLIED. Three rungs are silent
- * here, so an over-strictness that lands on one of those three is not
- * distinguishable by this target from the departure that rung was declared
- * for. What holds them is tests/gdeflate_departure_lock.cpp, which requires a
- * page the reference accepts for every declared rung, so a list grown to
- * silence a trap reds a test instead. The pages both sides accept are still
+ * WHAT THE EXEMPTION COSTS, SAID RATHER THAN IMPLIED. Three of the four rungs
+ * are silent here - the fourth is unreachable, per the paragraph above - so an
+ * over-strictness that lands on one of those three is not distinguishable by
+ * this target from the departure that rung was declared for. What holds them
+ * is tests/gdeflate_departure_lock.cpp, which requires a page the reference
+ * accepts for every declared rung, so a list grown to silence a trap reds a
+ * test instead. The pages both sides accept are still
  * watched by the byte parity below, and the sanitizers have no opinion about
  * which decoder is stricter.
  *

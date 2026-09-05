@@ -622,10 +622,10 @@ struct ParityCounts {
     size_t oracle_accepted_other_bytes;
     size_t fail_opens;
     size_t over_strict;
-    /* Refusals of a page the reference reproduces, on a rung already recorded
-     * as a strictness departure. Counted and printed per rung rather than
-     * ignored: an exemption whose population nobody prints is one nobody
-     * notices growing. */
+    /* Refusals of a page the reference reproduces, on a rung
+     * src/gdeflate_schedule.h declares a strictness departure. Counted and
+     * printed per rung rather than ignored: an exemption whose population
+     * nobody prints is one nobody notices growing. */
     size_t recorded_departures;
     size_t departure_hits[cudec_detail::kGDeflateRejectCount];
 };
@@ -641,24 +641,16 @@ bool IsDeclaredDeparture(GDeflateReject rung) {
     return cudec_detail::GDeflateRejectIsDeclaredDeparture(rung);
 }
 
-/* ONE RUNG BELONGS IN NEITHER PLACE YET, AND THIS IS THE WHOLE OF THE
- * CARVE-OUT. Removing one byte from the end of a real page makes its size stop
- * being a whole number of 32-bit words; this decoder refuses that on
+/* THE CARVE-OUT THAT STOOD HERE IS GONE, and this file names no rung of its
+ * own (issue #453). Removing one byte from the end of a real page makes its
+ * size stop being a whole number of 32-bit words; this decoder refuses that on
  * kGDeflateRejectPagePartialWord and the reference decodes it to the original
- * bytes, because the words it never needed are the ones that went missing. So
- * it is a strictness departure the two decoders genuinely have, and
- * GDeflateRejectIsDeclaredDeparture does not name it. Whether the predicate
- * should - which loosens the differential fuzz target's trap and is a change
- * to src/ rather than to a test - is issue #453, and it is not decided here.
- *
- * IT IS WRITTEN AS ONE NAMED RUNG RATHER THAN AS A SET, and the count it
- * absorbs is printed on every run, so it cannot grow into the allowlist the
- * departure lock exists against. Any other rung refusing a page the reference
- * reproduces still fails this gate. */
-bool IsRecordedDeparture(GDeflateReject rung) {
-    return IsDeclaredDeparture(rung) ||
-           rung == cudec_detail::kGDeflateRejectPagePartialWord;
-}
+ * bytes. That is a strictness departure the two decoders genuinely have, so it
+ * is declared in src/gdeflate_schedule.h with the rest and paid for by a page
+ * in tests/gdeflate_departure_lock.cpp, rather than exempted by a second list
+ * living in the gate that measures it. Every rung this gate absorbs is now a
+ * rung the predicate declares, and any other one refusing a page the reference
+ * reproduces still fails here. */
 
 int MutantParity(ParityCounts* counts) {
     counts->mutants = 0;
@@ -809,13 +801,14 @@ int MutantParity(ParityCounts* counts) {
                         chunks[i].name.c_str(),
                         static_cast<int>(results[i].status),
                         static_cast<int>(twin.status));
-            if (!IsRecordedDeparture(twin.rung)) {
+            if (!IsDeclaredDeparture(twin.rung)) {
                 counts->over_strict++;
                 REQUIRE_CTX(false,
                             "%s: OVER-STRICT - the reference decoded it to the "
                             "bytes the unmutated page gives, and this decoder "
-                            "refused on rung %d, which is neither declared in "
-                            "src/gdeflate_schedule.h nor recorded on #453",
+                            "refused on rung %d, which "
+                            "src/gdeflate_schedule.h does not declare a "
+                            "strictness departure",
                             chunks[i].name.c_str(),
                             static_cast<int>(twin.rung));
             }
@@ -846,7 +839,7 @@ int MutantParity(ParityCounts* counts) {
     std::printf("gdeflate_gate_gpu: mutant parity: %zu pages, %zu the "
                 "reference rejects and the kernel rejects too, %zu both accept "
                 "with identical bytes, %zu the reference accepts as other "
-                "bytes, %zu the kernel refuses on a rung already recorded as a "
+                "bytes, %zu the kernel refuses on a rung declared a "
                 "strictness departure; 0 fail-opens, 0 undeclared over-strict "
                 "rejects\n",
                 counts->mutants, counts->oracle_rejects,
@@ -855,18 +848,16 @@ int MutantParity(ParityCounts* counts) {
     /* Printed per rung rather than as one total, because the exemption's
      * population is the thing a reader has to be able to watch: a rung that
      * starts absorbing hundreds of mutants is an exemption that has quietly
-     * become the rule. */
+     * become the rule. Every rung reaching this loop is declared - an
+     * undeclared one fails the REQUIRE above and never gets here - so the line
+     * says where the declaration is and what pays for it. */
     for (uint32_t r = 0; r < cudec_detail::kGDeflateRejectCount; r++) {
         if (counts->departure_hits[r] != 0) {
+            REQUIRE(IsDeclaredDeparture(static_cast<GDeflateReject>(r)));
             std::printf("gdeflate_gate_gpu:   rung %u absorbed %zu of them, "
-                        "%s\n",
-                        r, counts->departure_hits[r],
-                        IsDeclaredDeparture(
-                            static_cast<GDeflateReject>(r))
-                            ? "declared in src/gdeflate_schedule.h and executed "
-                              "by tests/gdeflate_departure_lock.cpp"
-                            : "recorded on issue #453 and declared nowhere in "
-                              "src/");
+                        "declared in src/gdeflate_schedule.h and executed by "
+                        "tests/gdeflate_departure_lock.cpp\n",
+                        r, counts->departure_hits[r]);
         }
     }
     return 0;
