@@ -940,6 +940,175 @@ int Negatives() {
 
 }  // namespace
 
+/* THE JUMP TABLE THAT THE #461 INSTANCE ACTUALLY LANDS IN, HELD AT THE UNIT
+ * RATHER THAN ONLY THROUGH A WHOLE FRAME.
+ *
+ * WHAT THIS IS AND WHAT IT IS NOT, because the instance is named after
+ * something else. The mutation that raised #461 is called
+ * `block1-huffman-description-header`, and the name is the generator's
+ * intention rather than what it hits: tests/zstd_corpus.cpp guards that
+ * mutation on `literals_payload_size != 0`, which is set for a Treeless
+ * section as well as a Compressed one, and on the fixture in question it lands
+ * on a TREELESS section. A Treeless section carries no Huffman tree
+ * description at all - RFC 8878 section 4.2.2 says its payload opens with the
+ * Jump_Table - so the byte the mutation flips is the low byte of the first
+ * stream's compressed size, not a tree description header.
+ *
+ * WHAT THE FLIP DOES. The jump table is three 16-bit sizes and the fourth
+ * stream's size is what is left over, so moving the first size by 128 moves
+ * where streams two, three and four begin and shortens the fourth by the same
+ * amount. cudec reaches the streams and finds one that ends before its size
+ * says it does, which is kZstdLiteralsRejectStreamTruncated.
+ *
+ * WHAT THIS LOCKS IS A DELIBERATE STRICTNESS AND NOT A BUG, which is the #461
+ * decision. The pinned reference does not refuse this class: it returns the
+ * declared content size with some bytes wrong, on a fixture carrying no
+ * content checksum. So this case is asserted the other way round from every
+ * negative above - the twin refuses AND what the reference does is read and
+ * printed rather than required to be a refusal. If the reference ever starts
+ * refusing it, that is a change worth seeing rather than a failure. */
+int JumpTableStrictness() {
+    const std::vector<ZstdFixture> fixtures = MakeZstdFixtures();
+    REQUIRE(!fixtures.empty());
+    size_t instances = 0;
+    size_t reference_permissive = 0;
+
+    for (const ZstdFixture& fixture : fixtures) {
+        uint64_t window_size = 0;
+        std::vector<LiteralsSite> sites;
+        std::string why;
+        if (WalkLiteralsSites(fixture.compressed, &window_size, &sites,
+                              &why) != CUDEC_OK) {
+            continue;
+        }
+        /* The table a Treeless section reads is the one the last Compressed
+         * section in the same frame left behind, so the sections are decoded
+         * in frame order and the state is carried exactly as the sweep above
+         * carries it. A Treeless section decoded against a fresh state would
+         * be refused for the missing table and would prove nothing about the
+         * jump table. */
+        TwinState state;
+        for (const LiteralsSite& site : sites) {
+            const Bytes section(
+                fixture.compressed.begin() + static_cast<long>(site.offset),
+                fixture.compressed.begin() +
+                    static_cast<long>(site.offset + site.available));
+            ZstdLiteralsHeader header;
+            ZstdLiteralsReject rung = cudec_detail::kZstdLiteralsRejectNone;
+            REQUIRE_CTX(ZstdParseLiteralsHeader(section.data(), section.size(),
+                                                &header, &rung) == CUDEC_OK,
+                        "%s: a section the sweep parsed no longer parses",
+                        fixture.name.c_str());
+
+            /* The four-stream Treeless sections are the ones with a jump
+             * table AND a carried table to read it with. Everything else is
+             * decoded only to carry the state forward. */
+            const bool candidate = header.block_type == kZstdLiteralsTreeless &&
+                                   header.stream_count == 4 &&
+                                   state.table.present;
+            if (candidate) {
+                const size_t at = site.offset + header.header_size;
+                const unsigned char before = fixture.compressed[at];
+                const unsigned char after =
+                    static_cast<unsigned char>(before ^ 0x80u);
+
+                /* A COPY of the carried state, so the mutant cannot leave a
+                 * half-built table behind for the sections after it. */
+                TwinState mutant_state = state;
+                Bytes moved = section;
+                moved[header.header_size] = after;
+                Bytes dst(header.regenerated_size == 0
+                              ? 1
+                              : header.regenerated_size,
+                          0);
+                uint64_t produced = 0;
+                uint64_t consumed = 0;
+                ZstdLiteralsReject moved_rung =
+                    cudec_detail::kZstdLiteralsRejectNone;
+                const cudec_status status = ZstdDecodeLiterals(
+                    moved.data(), moved.size(), window_size,
+                    &mutant_state.table, &mutant_state.scratch, dst.data(),
+                    dst.size(), &produced, &consumed, &moved_rung);
+                if (status == CUDEC_OK) {
+                    /* A flip that happens to land on a legal jump table is
+                     * not this class and is skipped rather than counted. */
+                    continue;
+                }
+                REQUIRE_CTX(produced == 0,
+                            "%s block %zu: refused the moved jump table and "
+                            "still produced %llu bytes",
+                            fixture.name.c_str(), site.block_index,
+                            static_cast<unsigned long long>(produced));
+                CoverRung(moved_rung);
+                if (moved_rung !=
+                    cudec_detail::kZstdLiteralsRejectStreamTruncated) {
+                    continue;
+                }
+                instances++;
+
+                /* What the reference does with the same frame, read rather
+                 * than required. */
+                Bytes moved_frame = fixture.compressed;
+                moved_frame[at] = after;
+                Bytes reference_out(fixture.original.size() + 64, 0);
+                const size_t by_reference = ZSTD_decompress(
+                    reference_out.data(), reference_out.size(),
+                    moved_frame.data(), moved_frame.size());
+                const bool refuses = ZSTD_isError(by_reference) != 0;
+                if (!refuses) {
+                    reference_permissive++;
+                }
+                std::printf(
+                    "- %s block %zu: first jump-table size moved (0x%02X -> "
+                    "0x%02X), twin refuses at StreamTruncated, the reference "
+                    "%s\n",
+                    fixture.name.c_str(), site.block_index,
+                    static_cast<unsigned>(before), static_cast<unsigned>(after),
+                    refuses ? "refuses too"
+                            : "does NOT refuse - it returns bytes it cannot "
+                              "have read correctly, which is the "
+                              "permissiveness #461 records");
+            }
+
+            /* Carry the state forward on the unmutated bytes. */
+            Bytes dst(header.regenerated_size == 0 ? 1
+                                                   : header.regenerated_size,
+                      0);
+            uint64_t produced = 0;
+            uint64_t consumed = 0;
+            ZstdLiteralsReject clean_rung =
+                cudec_detail::kZstdLiteralsRejectNone;
+            REQUIRE_CTX(ZstdDecodeLiterals(section.data(), section.size(),
+                                           window_size, &state.table,
+                                           &state.scratch, dst.data(),
+                                           dst.size(), &produced, &consumed,
+                                           &clean_rung) == CUDEC_OK,
+                        "%s: an unmutated section the sweep decoded no longer "
+                        "decodes (rung %d)",
+                        fixture.name.c_str(), static_cast<int>(clean_rung));
+        }
+    }
+
+    /* A sweep that reached no instance would pass every assertion above,
+     * which is the shape this project has been bitten by. */
+    REQUIRE_CTX(instances > 0,
+                "no four-stream Treeless section in the corpus reaches "
+                "StreamTruncated on a moved jump table, so the #461 class is "
+                "unmeasured at this unit");
+    /* AND THE HALF THAT IS THE ISSUE ITSELF: at least one of them must be a
+     * case the reference does not refuse. If they all became refusals the
+     * strictness would no longer be a departure from the reference, and this
+     * test would be locking a distinction that had stopped existing. */
+    REQUIRE_CTX(reference_permissive > 0,
+                "the reference now refuses every moved jump table this twin "
+                "refuses, so the departure #461 records is gone and the "
+                "record needs re-reading rather than this test passing");
+    std::printf("- jump-table strictness: %zu instances, %zu of them the "
+                "reference does not refuse\n",
+                instances, reference_permissive);
+    return 0;
+}
+
 int main() {
     int rc = Sweep();
     if (rc != 0) {
@@ -954,6 +1123,10 @@ int main() {
         return rc;
     }
     rc = Negatives();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = JumpTableStrictness();
     if (rc != 0) {
         return rc;
     }
