@@ -226,16 +226,17 @@ __device__ inline void ZstdFillBlock(unsigned char* dst,
  * the caller's capacity narrowed by what earlier blocks produced.
  *
  * THE EXECUTION IS HANDED `remaining` WHERE THE HOST HANDS IT THE BLOCK'S OWN
- * SIZE, AND THE DIFFERENCE IS VISIBLE ONLY ON A REFUSAL. A block's size is
- * the running total plus the literals its sequences do not consume, so it is
- * known only once the last tile has been summed - and the tiles have to
- * execute as they are produced, because holding them all is the workspace
- * 14.3 refuses. `remaining` is the larger of the two and is what the caller's
- * buffer actually allows, so every write stays inside the declared region
- * either way; on a block that decodes, the two bounds admit exactly the same
- * sequences, because such a block's size is at most `remaining`. The check
- * that says so runs after the last tile and refuses with the rung the host
- * gives. */
+ * SIZE, AND WHAT MAKES THAT SOUND IS THE CHECK IN THE TILE LOOP. A block's
+ * size is the running total plus the literals its sequences do not consume,
+ * so it is known only once the last tile has been summed - and the tiles have
+ * to execute as they are produced, because holding them all is the workspace
+ * 14.3 refuses. What the loop does instead is hold the size-so-far to
+ * `remaining` after each tile's prefix sum and BEFORE that tile's copies, so
+ * by the time a sequence runs, the bound the host would have given it is
+ * already known to be at least as tight as `remaining`. On a block that
+ * decodes the two are the same number; on one that does not, the refusal
+ * comes from that comparison with the class the host gives, rather than from
+ * a rung inside the execution unit that no stream is supposed to reach. */
 __device__ inline cudec_status ZstdDecodeCompressedBlockDevice(
     ZstdFrameShared* frame, const unsigned char* body, uint64_t body_size,
     unsigned char* dst, uint64_t remaining) {
@@ -257,12 +258,32 @@ __device__ inline cudec_status ZstdDecodeCompressedBlockDevice(
         return status;
     }
     const uint64_t literals_size = literals_header.regenerated_size;
+    /* THE BLOCK MAXIMUM IS COMPARED HERE AND NOT ONLY INSIDE THE UNIT THAT
+     * OWNS IT, AND THE REASON IS THE ORDER RATHER THAN DOUBT. ZstdDecodeLiterals
+     * makes this same comparison against the same ZstdLiteralsBlockMaximum
+     * value and refuses CORRUPT_INPUT, which is the class the host reports for
+     * such a block - but it cannot be asked until it has an address to decode
+     * into, and the address below only exists once the section fits in what
+     * the frame has left. So the two comparisons run in the host's order:
+     * a section larger than the format allows is malformed, and only a section
+     * the format allows but the declaration does not is the capacity answer
+     * below. The bound is derived once, at block_max, and compared twice. */
+    if (literals_size > block_max) {
+        return CUDEC_ERR_CORRUPT_INPUT;
+    }
     if (literals_size > remaining) {
         /* A block regenerates at least its own literals, so a literals
-         * section larger than the frame has left to declare is a frame that
-         * cannot be describing this output. Refused before the address below
-         * is formed, which is what keeps the subtraction from wrapping. */
-        return CUDEC_ERR_CORRUPT_INPUT;
+         * section larger than the frame has left to declare is a block whose
+         * size passes the declaration. Refused before the address below is
+         * formed, which is what keeps the subtraction from wrapping.
+         *
+         * THE STATUS IS THE HOST'S, NOT THE ONE THE CONDITION SUGGESTS. The
+         * host reaches the same bytes through ZstdExecuteBlock's
+         * destination-too-small rung, which answers OUTPUT_TOO_SMALL, and
+         * `plan.block_size >= literals_size` is what makes the two rungs the
+         * same statement. Answering CORRUPT_INPUT here would be the device
+         * and the twin giving different classes for one frame. */
+        return CUDEC_ERR_OUTPUT_TOO_SMALL;
     }
     unsigned char* literals = dst + frame->produced + remaining - literals_size;
 
@@ -375,6 +396,43 @@ __device__ inline cudec_status ZstdDecodeCompressedBlockDevice(
                 return status;
             }
 
+            /* THE ONE CHECK THAT MAKES THE WHOLE NO-WORKSPACE SHAPE SAFE,
+             * AND IT RUNS BEFORE THE COPIES RATHER THAN AFTER THEM.
+             *
+             * `carry.at + (literals_size - carry.literals_used)` is the
+             * block's size as far as the sum has got: the bytes the
+             * sequences so far produce, plus every literal they have not
+             * consumed. It is the same quantity ZstdExecPrefixSumFinish
+             * returns as `block_size`, taken at a tile boundary, and it only
+             * grows - each further sequence adds its match bytes and moves
+             * literals from the tail into the runs.
+             *
+             * Held to `remaining`, it establishes 14.3's placement invariant
+             * for every sequence of this tile before one byte moves. The
+             * literals sit at [P + R - L, P + R) and sequence i's run copies
+             * from `literals + literal_at_i` to `base + at_i`, so the copy
+             * moves toward lower addresses exactly when the match bytes
+             * before it fit in `R - L` - which is what this comparison says.
+             * Checked after the tile's copies instead, a block that violated
+             * it would overwrite literals it has not read yet, and only the
+             * refusal at the end of the block would stop that garbage being
+             * reported. It stays inside the caller's buffer either way, but
+             * "inside the buffer and refused afterwards" is not the property
+             * this shape claims.
+             *
+             * It is also what keeps ZstdExecuteSequence's plan-consistency
+             * rung out of reach of a stream. That rung is the unit's
+             * caller-bug rung, documented as reachable by a wrong scan and
+             * never by a stream, and handing the execution `remaining`
+             * instead of the block's own size would otherwise let a hostile
+             * frame fire it - answering CORRUPT_INPUT where the host answers
+             * OUTPUT_TOO_SMALL, and mis-filing a stream rejection as a
+             * decoder bug in anything that triages by rung. */
+            if (carry.at > remaining ||
+                literals_size - carry.literals_used > remaining - carry.at) {
+                return CUDEC_ERR_OUTPUT_TOO_SMALL;
+            }
+
             for (uint32_t index = 0; index < got; index++) {
                 /* The successor of the tile's last sequence is where the sum
                  * has got to, which is the destination the next tile's first
@@ -404,10 +462,10 @@ __device__ inline cudec_status ZstdDecodeCompressedBlockDevice(
     if (status != CUDEC_OK) {
         return status;
     }
-    /* The bound the execution above was given loosely, applied exactly. The
-     * host's own rung for a block that regenerates past what the frame
-     * declared is OUTPUT_TOO_SMALL, and it is the same statement made in the
-     * same place: after the plan exists and before the block is reported. */
+    /* The same comparison the tile loop makes, at the close. It is not a
+     * second guard for the tiles - each of those was already held to it - it
+     * is the one for a block with no sequences at all, whose whole size is
+     * its literals and which never enters the loop above. */
     if (plan.block_size > remaining) {
         return CUDEC_ERR_OUTPUT_TOO_SMALL;
     }

@@ -20,6 +20,8 @@
  * Nothing here is timed. */
 #include "cudec.h"
 #include "require.h"
+#include "xxhash64.h"
+#include "zstd_blocks.h"
 #include "zstd_corpus.h"
 
 #include "vendor_rt_test.h"
@@ -37,6 +39,10 @@ constexpr unsigned char kDstPoison = 0xA5;
 /* Slack past the declared content size, so the poison beyond bytes_written
  * has somewhere to survive. */
 constexpr size_t kCapacitySlack = 96;
+/* The format's own ceiling on a block's sequence count - every sequence emits
+ * at least a three-byte match, so a 128 KiB block holds no more - given to the
+ * host harness below so its storage rung is never the one that fires. */
+constexpr uint32_t kHostSequenceCapacity = 43690;
 
 struct Chunk {
     const Bytes* src;
@@ -269,6 +275,306 @@ int RunCorpus(Census* census) {
     return 0;
 }
 
+/* ---- The reject rungs this kernel introduces, held to the host twin ----- */
+
+/* WHAT THIS IS AND WHAT IT IS NOT. The standing device gate set - determinism,
+ * the two-directional mutant reject parity over the whole corpus, and the
+ * capacity and window adversarials - is #399 and none of it is here. What is
+ * here is narrower and belongs to this landing: the kernel's own walk carries
+ * refusals the host loop makes somewhere else, because the literals are staged
+ * in the destination and the sequences are executed a tile at a time, and each
+ * of those refusals has to answer with the CLASS the twin answers on the same
+ * bytes. A class that diverges is not cosmetic - CUDEC_ERR_OUTPUT_TOO_SMALL
+ * invites a caller to retry with a bigger buffer and CUDEC_ERR_CORRUPT_INPUT
+ * does not - and it was a divergence in exactly these rungs that the review of
+ * this branch found.
+ *
+ * The verdict comes from src/zstd_blocks.h run on the host over the same
+ * bytes, never from a status written down here. */
+struct HostHarness {
+    std::vector<cudec_detail::ZstdHufCell> huf;
+    std::vector<cudec_detail::ZstdFseCell> litlen;
+    std::vector<cudec_detail::ZstdFseCell> matchlen;
+    std::vector<cudec_detail::ZstdFseCell> offset;
+    cudec_detail::ZstdLiteralsScratch literals_scratch;
+    cudec_detail::ZstdSeqScratch seq_scratch;
+    Bytes literals;
+    std::vector<cudec_detail::ZstdSequence> sequences;
+    std::vector<uint64_t> offsets;
+    std::vector<uint64_t> destinations;
+    cudec_detail::ZstdFrameState state;
+
+    HostHarness()
+        : huf(1u << cudec_detail::kZstdLiteralsMaxTableLog),
+          litlen(1u << cudec_detail::kZstdLitLenAccuracyLogMax),
+          matchlen(1u << cudec_detail::kZstdMatchLenAccuracyLogMax),
+          offset(1u << cudec_detail::kZstdOffsetAccuracyLogMax),
+          literals(cudec_detail::kZstdBlockSizeCeiling),
+          /* The format's own ceiling on a block's sequence count, so the
+           * loop's storage rung is never the one that fires and the classes
+           * being compared are the ones this test is about. */
+          sequences(kHostSequenceCapacity),
+          offsets(kHostSequenceCapacity),
+          destinations(kHostSequenceCapacity + 1) {
+        state.literals_table.cells = huf.data();
+        state.literals_table.capacity = static_cast<uint32_t>(huf.size());
+        state.litlen.cells = litlen.data();
+        state.litlen.capacity = static_cast<uint32_t>(litlen.size());
+        state.matchlen.cells = matchlen.data();
+        state.matchlen.capacity = static_cast<uint32_t>(matchlen.size());
+        state.offset.cells = offset.data();
+        state.offset.capacity = static_cast<uint32_t>(offset.size());
+        state.literals_scratch = &literals_scratch;
+        state.seq_scratch = &seq_scratch;
+        state.literals = literals.data();
+        state.literals_capacity = literals.size();
+        state.sequences = sequences.data();
+        state.sequences_capacity = kHostSequenceCapacity;
+        state.offsets = offsets.data();
+        state.offsets_capacity = kHostSequenceCapacity;
+        state.destinations = destinations.data();
+        state.destinations_capacity = kHostSequenceCapacity + 1;
+        cudec_detail::ZstdFrameStateInit(&state);
+    }
+};
+
+/* The whole-frame host path, the same three steps tests/zstd_twin_driver.h
+ * walks: the frame header, the block loop, and the content checksum. */
+cudec_status HostDecode(const Bytes& frame, size_t capacity, Bytes* out) {
+    HostHarness harness;
+    cudec_detail::ZstdFrameHeader header;
+    cudec_detail::ZstdFrameReject frame_rung =
+        cudec_detail::kZstdFrameRejectNone;
+    cudec_status status = cudec_detail::ZstdParseFrameHeader(
+        frame.data(), frame.size(), &header, &frame_rung);
+    if (status != CUDEC_OK) {
+        return status;
+    }
+    if (header.frame_content_size > capacity) {
+        return CUDEC_ERR_OUTPUT_TOO_SMALL;
+    }
+    out->assign(capacity, 0);
+    uint64_t produced = 0;
+    uint64_t consumed = 0;
+    cudec_detail::ZstdBlocksReport report;
+    cudec_detail::ZstdBlocksReject blocks_rung =
+        cudec_detail::kZstdBlocksRejectNone;
+    status = cudec_detail::ZstdDecodeBlocks(
+        frame.data() + header.header_size, frame.size() - header.header_size,
+        &header, &harness.state, out->data(), header.frame_content_size,
+        &produced, &consumed, &report, &blocks_rung);
+    if (status != CUDEC_OK) {
+        return status;
+    }
+    uint64_t pos = header.header_size + consumed;
+    if (header.content_checksum) {
+        const uint64_t digest =
+            cudec_detail::Xxh64(out->data(), static_cast<size_t>(produced));
+        if (cudec_detail::ZstdVerifyContentChecksum(frame.data() + pos,
+                                                    frame.size() - pos, digest,
+                                                    &frame_rung) != CUDEC_OK) {
+            return CUDEC_ERR_CORRUPT_INPUT;
+        }
+        pos += 4;
+    }
+    if (pos != frame.size()) {
+        return CUDEC_ERR_CORRUPT_INPUT;
+    }
+    out->resize(static_cast<size_t>(produced));
+    return CUDEC_OK;
+}
+
+/* A single-segment frame header: Frame_Content_Size present and one byte
+ * wide, which is what puts the frame inside the accepted envelope and makes
+ * the window the content size. */
+void AppendSingleSegmentHeader(Bytes* frame, unsigned char content_size) {
+    frame->push_back(0x28);
+    frame->push_back(0xB5);
+    frame->push_back(0x2F);
+    frame->push_back(0xFD);
+    frame->push_back(0x20);
+    frame->push_back(content_size);
+}
+
+/* Block_Header, RFC 8878 section 3.1.1.2: Last_Block in bit 0, Block_Type in
+ * bits 1 and 2, Block_Size in the remaining 21, little-endian. */
+void AppendBlockHeader(Bytes* frame, uint32_t size, unsigned type, bool last) {
+    const uint32_t raw = (last ? 1u : 0u) | (type << 1) | (size << 3);
+    frame->push_back(static_cast<unsigned char>(raw & 0xFFu));
+    frame->push_back(static_cast<unsigned char>((raw >> 8) & 0xFFu));
+    frame->push_back(static_cast<unsigned char>((raw >> 16) & 0xFFu));
+}
+
+int RunRejectParity() {
+    struct Case {
+        const char* name;
+        Bytes frame;
+        size_t capacity;
+    };
+    std::vector<Case> cases;
+
+    /* A block whose literals section alone regenerates more than the frame
+     * declared, with the section still inside the format's block maximum.
+     * The kernel meets this before it has an address to stage the literals
+     * at; the host meets it after the literals are decoded, at the
+     * execution's destination bound. */
+    {
+        Case c;
+        c.name = "literals past the declaration, inside the block maximum";
+        /* Two blocks, because a single-segment frame's window IS its content
+         * size: with one block the two bounds coincide and the case cannot be
+         * built. A first Raw block spends most of the declaration, and the
+         * second block's literals then exceed what is left while staying
+         * inside the block maximum the window implies. */
+        AppendSingleSegmentHeader(&c.frame, 40);
+        AppendBlockHeader(&c.frame, 35, kZstdBlockRaw, false);
+        for (unsigned i = 0; i < 35; i++) {
+            c.frame.push_back(static_cast<unsigned char>('a' + (i % 26u)));
+        }
+        AppendBlockHeader(&c.frame, 3, kZstdBlockCompressed, true);
+        c.frame.push_back(
+            static_cast<unsigned char>(kZstdLiteralsRle | (30u << 3)));
+        c.frame.push_back('q');
+        c.frame.push_back(0x00);
+        c.capacity = 40 + kCapacitySlack;
+        cases.push_back(c);
+    }
+    /* The same shape with the section ALSO past the block maximum the window
+     * implies, which is the malformed answer rather than the capacity one.
+     * The two cases are next to each other on purpose: they differ in one
+     * field and they must not answer the same. */
+    {
+        Case c;
+        c.name = "literals past the block maximum";
+        AppendSingleSegmentHeader(&c.frame, 20);
+        AppendBlockHeader(&c.frame, 3, kZstdBlockCompressed, true);
+        c.frame.push_back(static_cast<unsigned char>(kZstdLiteralsRle | (60u << 3)));
+        c.frame.push_back('q');
+        c.frame.push_back(0x00);
+        c.capacity = 20 + kCapacitySlack;
+        cases.push_back(c);
+    }
+    /* A Raw block declaring more than the frame has left. */
+    {
+        Case c;
+        c.name = "raw block past the declaration";
+        AppendSingleSegmentHeader(&c.frame, 4);
+        AppendBlockHeader(&c.frame, 10, kZstdBlockRaw, true);
+        for (unsigned i = 0; i < 10; i++) {
+            c.frame.push_back(static_cast<unsigned char>('a' + i));
+        }
+        c.capacity = 64;
+        cases.push_back(c);
+    }
+    /* A frame that declares fewer bytes than its blocks produce is refused;
+     * so is one that declares more. */
+    {
+        Case c;
+        c.name = "frame produces less than it declared";
+        AppendSingleSegmentHeader(&c.frame, 20);
+        AppendBlockHeader(&c.frame, 4, kZstdBlockRaw, true);
+        for (unsigned i = 0; i < 4; i++) {
+            c.frame.push_back('r');
+        }
+        c.capacity = 20 + kCapacitySlack;
+        cases.push_back(c);
+    }
+    /* The reserved block type, which no frame may carry. */
+    {
+        Case c;
+        c.name = "reserved block type";
+        AppendSingleSegmentHeader(&c.frame, 4);
+        AppendBlockHeader(&c.frame, 4, 3, true);
+        for (unsigned i = 0; i < 4; i++) {
+            c.frame.push_back('r');
+        }
+        c.capacity = 64;
+        cases.push_back(c);
+    }
+    /* Truncated at the block body. */
+    {
+        Case c;
+        c.name = "block body truncated";
+        AppendSingleSegmentHeader(&c.frame, 8);
+        AppendBlockHeader(&c.frame, 8, kZstdBlockRaw, true);
+        c.frame.push_back('t');
+        c.capacity = 64;
+        cases.push_back(c);
+    }
+    /* Bytes after the last block, which section 12.4 refuses rather than
+     * ignores. */
+    {
+        Case c;
+        c.name = "bytes follow the frame";
+        AppendSingleSegmentHeader(&c.frame, 4);
+        AppendBlockHeader(&c.frame, 4, kZstdBlockRaw, true);
+        for (unsigned i = 0; i < 4; i++) {
+            c.frame.push_back('r');
+        }
+        c.frame.push_back(0x00);
+        c.capacity = 64;
+        cases.push_back(c);
+    }
+    /* A capacity below what the frame declares, which is the one condition
+     * on this list a larger destination really does repair. */
+    {
+        Case c;
+        c.name = "capacity below the declaration";
+        AppendSingleSegmentHeader(&c.frame, 40);
+        AppendBlockHeader(&c.frame, 40, kZstdBlockRaw, true);
+        for (unsigned i = 0; i < 40; i++) {
+            c.frame.push_back(static_cast<unsigned char>('a' + (i % 26u)));
+        }
+        c.capacity = 8;
+        cases.push_back(c);
+    }
+
+    std::vector<Chunk> chunks;
+    for (size_t i = 0; i < cases.size(); i++) {
+        Chunk chunk;
+        chunk.src = &cases[i].frame;
+        chunk.dst_capacity = cases[i].capacity;
+        chunks.push_back(chunk);
+    }
+    std::vector<cudec_chunk_result> results;
+    std::vector<Bytes> produced;
+    if (RunBatch(chunks, &results, &produced) != 0) {
+        return 1;
+    }
+
+    for (size_t i = 0; i < cases.size(); i++) {
+        Bytes host_out;
+        const cudec_status want =
+            HostDecode(cases[i].frame, cases[i].capacity, &host_out);
+        REQUIRE_CTX(want != CUDEC_OK,
+                    "%s: the host twin ACCEPTED a frame this case is built to "
+                    "have refused, so the case proves nothing",
+                    cases[i].name);
+        REQUIRE_CTX(results[i].status == want,
+                    "%s: the device answers %d and the host twin answers %d "
+                    "on the same bytes",
+                    cases[i].name, static_cast<int>(results[i].status),
+                    static_cast<int>(want));
+        REQUIRE_CTX(results[i].bytes_written == 0,
+                    "%s: refused and still reported %llu bytes",
+                    cases[i].name,
+                    static_cast<unsigned long long>(results[i].bytes_written));
+        /* The destination of a refused frame is unspecified by the ABI and
+         * is deliberately not asserted on: the kernel stages literals into it
+         * and executes tiles into it before the refusal that stops the block,
+         * and the contract's promise is bytes_written zero rather than an
+         * untouched buffer. */
+    }
+    /* The two neighbouring literals cases must not have answered the same,
+     * which is the whole reason they are both here. */
+    REQUIRE(results[0].status != results[1].status);
+    std::printf(
+        "reject parity: %llu refusals, each in the class the host twin gives, "
+        "each reporting no bytes\n",
+        static_cast<unsigned long long>(cases.size()));
+    return 0;
+}
+
 /* ---- The surfaces the pinned compressor will not emit ------------------- */
 
 /* An RLE literals section inside the accepted envelope.
@@ -413,6 +719,9 @@ int main() {
     if (RunHandBuilt(&census) != 0) {
         return 1;
     }
+    if (RunRejectParity() != 0) {
+        return 1;
+    }
     if (RunBatchGeometry(64u * 1024u, 3) != 0) {
         return 1;
     }
@@ -421,8 +730,8 @@ int main() {
     }
 
     std::printf(
-        "census: the Zstd kernel decoded a corpus carrying "
-        "libzstd - blocks raw/rle/compressed %u/%u/%u, literals "
+        "census: the decoded frames carried "
+        "blocks raw/rle/compressed %u/%u/%u, literals "
         "raw/rle/compressed/treeless %u/%u/%u/%u, table modes "
         "basic/rle/compressed/repeat %u/%u/%u/%u, %u four-stream and %u "
         "single-stream literals sections, %u checksummed frames, %u frames "
