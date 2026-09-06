@@ -203,10 +203,30 @@ bool TimeCtxCold(const void* const* h_src, const size_t* h_ssz,
  * throughput arithmetic are written once and both entries below share them.
  * A second copy per format would be a second protocol, and two numbers
  * produced by two protocols are not comparable. */
-bool BenchBatch(LaunchFn full, LaunchFn parse_only,
-                const unsigned char* const* comp, const size_t* comp_sizes,
-                const size_t* orig_sizes, size_t n, int warmup, int runs,
-                cudec_gpu_result* out) {
+/* The uploaded batch every timed variant here runs over: the device copies of
+ * the pages, the four argument arrays, the result array and the stream. Held
+ * as one value because the upload is the same for the throughput rows and for
+ * the grid sweep, and two copies of it would be two places for the two
+ * measurements to stop being about the same bytes. */
+struct DeviceBatch {
+    const void** d_s = nullptr;
+    void** d_d = nullptr;
+    size_t* d_ss = nullptr;
+    size_t* d_dc = nullptr;
+    cudec_chunk_result* d_r = nullptr;
+    size_t n = 0;
+    size_t total_out = 0;
+    cudec_rt::stream_t stream{};
+};
+
+/* Uploads the batch and runs `full` once as the correctness precondition:
+ * every chunk must return CUDEC_OK with its original decoded size, or the
+ * numbers are meaningless (honest-numbers discipline). Buffers are reclaimed
+ * at process exit; the bench is a short-lived one-shot, like the test
+ * harness. */
+bool UploadAndVerify(LaunchFn full, const unsigned char* const* comp,
+                     const size_t* comp_sizes, const size_t* orig_sizes,
+                     size_t n, DeviceBatch* out) {
     std::vector<const void*> h_s(n);
     std::vector<void*> h_d(n);
     std::vector<size_t> h_ss(n), h_dc(n);
@@ -247,8 +267,6 @@ bool BenchBatch(LaunchFn full, LaunchFn parse_only,
     cudec_rt::stream_t stream;
     BG_RT(cudec_rt::stream_create(&stream));
 
-    /* Correctness precondition: every chunk must decode OK, or the numbers
-     * are meaningless (honest-numbers discipline). */
     if (full(d_s, d_ss, d_d, d_dc, n, d_r, stream) != CUDEC_OK) {
         return false;
     }
@@ -263,6 +281,33 @@ bool BenchBatch(LaunchFn full, LaunchFn parse_only,
             return false;
         }
     }
+
+    out->d_s = d_s;
+    out->d_d = d_d;
+    out->d_ss = d_ss;
+    out->d_dc = d_dc;
+    out->d_r = d_r;
+    out->n = n;
+    out->total_out = total_out;
+    out->stream = stream;
+    return true;
+}
+
+bool BenchBatch(LaunchFn full, LaunchFn parse_only,
+                const unsigned char* const* comp, const size_t* comp_sizes,
+                const size_t* orig_sizes, size_t n, int warmup, int runs,
+                cudec_gpu_result* out) {
+    DeviceBatch b;
+    if (!UploadAndVerify(full, comp, comp_sizes, orig_sizes, n, &b)) {
+        return false;
+    }
+    const size_t total_out = b.total_out;
+    const cudec_rt::stream_t stream = b.stream;
+    const void** d_s = b.d_s;
+    void** d_d = b.d_d;
+    size_t* d_ss = b.d_ss;
+    size_t* d_dc = b.d_dc;
+    cudec_chunk_result* d_r = b.d_r;
 
     double full_ms = 0.0;
     double parse_ms = 0.0;
@@ -291,12 +336,130 @@ bool BenchBatch(LaunchFn full, LaunchFn parse_only,
     out->parse_only_gbps_p50 =
         parse_only != nullptr ? cudec_bench::GbpsFromMs(gb, parse_ms)
                               : kCudecBenchNoParseOnly;
-    /* Buffers are reclaimed at process exit; the bench is a short-lived
-     * one-shot, like the test harness. */
+    return true;
+}
+
+/* Event-times the shipped GDeflate kernel at ONE chosen grid width. Launched
+ * here rather than through the batch entry for the one reason the entry cannot
+ * serve: the grid is what is under measurement, and the entry derives it. The
+ * kernel, the block shape and the arguments are the shipped ones - what varies
+ * between rows is gridDim.x and nothing else. */
+bool TimeGDeflateAtGrid(const DeviceBatch& b, size_t pages, unsigned blocks,
+                        int warmup, int runs, double* p50_ms) {
+    for (int i = 0; i < warmup; i++) {
+        (void)cudec_rt::get_last_error();
+        cudec_detail::gdeflate_decode_batch<cudec_detail::kCudaWaveSize>
+            <<<blocks, cudec_detail::kBlockThreads, 0, b.stream>>>(
+                b.d_s, b.d_ss, b.d_d, b.d_dc, pages, b.d_r);
+        if (cudec_rt::get_last_error() != cudec_rt::success) {
+            return false;
+        }
+    }
+    BG_RT(cudec_rt::stream_synchronize(b.stream));
+
+    cudec_rt::event_t start, stop;
+    BG_RT(cudec_rt::event_create(&start));
+    BG_RT(cudec_rt::event_create(&stop));
+    std::vector<float> times(static_cast<size_t>(runs));
+    for (int i = 0; i < runs; i++) {
+        BG_RT(cudec_rt::event_record(start, b.stream));
+        (void)cudec_rt::get_last_error();
+        cudec_detail::gdeflate_decode_batch<cudec_detail::kCudaWaveSize>
+            <<<blocks, cudec_detail::kBlockThreads, 0, b.stream>>>(
+                b.d_s, b.d_ss, b.d_d, b.d_dc, pages, b.d_r);
+        if (cudec_rt::get_last_error() != cudec_rt::success) {
+            return false;
+        }
+        BG_RT(cudec_rt::event_record(stop, b.stream));
+        BG_RT(cudec_rt::event_synchronize(stop));
+        BG_RT(cudec_rt::event_elapsed_ms(&times[static_cast<size_t>(i)], start,
+                                         stop));
+    }
+    BG_RT(cudec_rt::event_destroy(start));
+    BG_RT(cudec_rt::event_destroy(stop));
+    std::sort(times.begin(), times.end());
+    /* The same nearest-rank p50 every other row in this harness uses. */
+    *p50_ms = cudec_bench::Percentile(times, 50);
     return true;
 }
 
 }  // namespace
+
+bool cudec_bench_gdeflate_residency(cudec_gdeflate_residency* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    /* Device 0, the same one cudec_bench_gpu_device_line names in the
+     * methodology block, so the residency below is attested about the device
+     * the report says it ran on. */
+    cudec_rt::device_prop_t prop{};
+    if (cudec_rt::get_device_properties(&prop, 0) != cudec_rt::success) {
+        return false;
+    }
+    const void* entry = reinterpret_cast<const void*>(
+        &cudec_detail::gdeflate_decode_batch<cudec_detail::kCudaWaveSize>);
+    cudec_rt::func_attributes_t attr{};
+    if (cudec_rt::func_get_attributes(&attr, entry) != cudec_rt::success) {
+        return false;
+    }
+    int blocks_per_sm = 0;
+    if (cudec_rt::occupancy_max_active_blocks_per_sm(
+            &blocks_per_sm, entry,
+            static_cast<int>(cudec_detail::kBlockThreads), 0) !=
+        cudec_rt::success) {
+        return false;
+    }
+    out->sm_count = prop.multiProcessorCount;
+    out->block_threads = static_cast<int>(cudec_detail::kBlockThreads);
+    out->warps_per_block = static_cast<int>(cudec_detail::kBlockWarps);
+    out->registers_per_thread = attr.numRegs;
+    out->shared_bytes_per_block = attr.sharedSizeBytes;
+    out->local_bytes_per_thread = attr.localSizeBytes;
+    out->max_blocks_per_sm = blocks_per_sm;
+    out->resident_blocks = blocks_per_sm * prop.multiProcessorCount;
+    out->resident_warps = out->resident_blocks * out->warps_per_block;
+    return true;
+}
+
+unsigned cudec_bench_gdeflate_shipped_grid(size_t pages) {
+    return cudec_detail::decode_grid_blocks(pages);
+}
+
+bool cudec_bench_gpu_gdeflate_sweep(const unsigned char* const* comp,
+                                    const size_t* comp_sizes,
+                                    const size_t* orig_sizes, size_t n,
+                                    int warmup, int runs,
+                                    cudec_gdeflate_sweep_point* points,
+                                    size_t point_count) {
+    DeviceBatch b;
+    if (!UploadAndVerify(LaunchFullGDeflate, comp, comp_sizes, orig_sizes, n,
+                         &b)) {
+        return false;
+    }
+    for (size_t i = 0; i < point_count; i++) {
+        const size_t pages = points[i].pages;
+        /* A point naming more pages than were uploaded would read past the
+         * argument arrays on the device. Refused rather than clamped: a
+         * clamped row would carry a page count nothing decoded. */
+        if (pages == 0 || pages > n) {
+            return false;
+        }
+        const unsigned blocks = points[i].blocks == 0
+                                    ? cudec_detail::decode_grid_blocks(pages)
+                                    : points[i].blocks;
+        /* A grid holding less than one whole wave makes the kernel stride
+         * zero and it returns without decoding, which would time an empty
+         * launch. The kernel refuses it; so does this. */
+        if (blocks == 0) {
+            return false;
+        }
+        if (!TimeGDeflateAtGrid(b, pages, blocks, warmup, runs,
+                                &points[i].ms_p50)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool cudec_bench_gpu_device_line(char* out, size_t n) {
     if (out == nullptr || n == 0) {

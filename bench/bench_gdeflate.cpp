@@ -74,6 +74,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1642,11 +1643,235 @@ bool ParseCount(const char* text, size_t lo, size_t hi, size_t* out) {
     return true;
 }
 
+/* THE TAIL-WASTE READOUT (issue #207).
+ *
+ * The lever this measures is whether driving more than one page per warp
+ * recovers the tail a warp-per-page launch leaves. It needs no kernel change
+ * to measure, and that is a property of the shipped kernel rather than a
+ * convenience: src/gdeflate_decode.cuh already loops `chunk += total_waves`,
+ * so narrowing the grid IS multi-tile-per-warp running. The rows below vary
+ * gridDim.x and nothing else.
+ *
+ * WHY NO PROFILER NUMBER APPEARS HERE. The issue asks for achieved warps per
+ * SM, and on this machine Nsight Compute connects and is refused the hardware
+ * counters (ERR_NVGPUCTRPERM, a desktop driver setting no session may change).
+ * What is printed instead is the runtime occupancy answer, which is a CEILING
+ * on how many warps a launch of this kernel can hold, beside event-timed
+ * decodes, which are what a batch costs. A ceiling is not an achieved figure
+ * and is never reported as one.
+ *
+ * The page-count sweep is the second half and is the one that shows
+ * quantisation directly: the same corpus truncated to fewer pages, timed at
+ * the shipped grid. A launch that wastes its tail is flat across a range of
+ * page counts and steps at a residency boundary; one that does not is linear
+ * in the page count. */
+const unsigned kTailwasteGridMultiples[] = {0, 1, 2, 4, 8};
+const size_t kTailwasteGridCount =
+    sizeof(kTailwasteGridMultiples) / sizeof(kTailwasteGridMultiples[0]);
+
+bool RunTailwaste(const std::vector<unsigned char>& source,
+                  const std::string& name, const std::string& provenance,
+                  int level, size_t warmup, size_t runs, bool selfcheck,
+                  uint64_t expected_digest) {
+    Corpus corpus;
+    corpus.name = name;
+    corpus.provenance = provenance;
+    corpus.composition = kCompositionNotAsserted;
+    if (!BuildCorpus(source, level, &corpus)) {
+        return false;
+    }
+    if (!CorpusRoundTrips(source, corpus)) {
+        return false;
+    }
+    const uint64_t digest = CorpusDigest(corpus);
+    if (selfcheck && !CheckDigest(digest, name, level, expected_digest)) {
+        return false;
+    }
+
+    cudec_gdeflate_residency r;
+    if (!cudec_bench_gdeflate_residency(&r)) {
+        std::fprintf(stderr, "residency query failed - no device?\n");
+        return false;
+    }
+
+    const size_t pages = corpus.originals.size();
+    std::vector<const unsigned char*> comp_ptrs(pages);
+    std::vector<size_t> comp_sizes(pages);
+    std::vector<size_t> orig_sizes(pages);
+    for (size_t i = 0; i < pages; i++) {
+        comp_ptrs[i] = corpus.compressed[i].data();
+        comp_sizes[i] = corpus.compressed[i].size();
+        orig_sizes[i] = corpus.originals[i].size();
+    }
+
+    char device[256];
+    (void)cudec_bench_gpu_device_line(device, sizeof(device));
+
+    std::printf("## bench_gdeflate tail-waste report\n");
+    std::printf("- lever: multi-tile-per-warp for short or leftover pages "
+                "(issue #207), measured by varying gridDim.x over the SHIPPED "
+                "kernel, whose grid-stride loop is what maps several pages "
+                "onto one warp. No kernel byte differs between the rows\n");
+    std::printf("- host CPU: %s\n", cudec_bench::HostCpuName().c_str());
+    std::printf("- CUDA device: %s\n", device);
+    std::printf("- cudec: %d\n", cudec_version());
+    std::printf("- corpus: %s, level %d, %zu pages, %.2f MB original, %s\n",
+                corpus.name.c_str(), level, pages,
+                static_cast<double>(corpus.original_bytes) / 1e6,
+                corpus.provenance.c_str());
+    std::printf("- corpus digest: %016llx\n",
+                static_cast<unsigned long long>(digest));
+    if (selfcheck) {
+        std::printf("- THIS RUN IS THE ROT CHECK AND NOT A MEASUREMENT: a "
+                    "four-page corpus decoded once, far below this "
+                    "device's residency, so every figure below is a "
+                    "launch cost and none of them is a throughput or "
+                    "tail-waste result. What it proves is that the "
+                    "residency query, the sweep and the report still "
+                    "run, and that the corpus this harness builds is "
+                    "the one the record was taken on\n");
+    }
+    std::printf("- timing: CUDA-event, %zu warmup + %zu runs, p50 "
+                "nearest-rank, device-resident (H2D/D2H excluded); every page "
+                "decoded and verified to its original size through "
+                "cudec_gdeflate_decompress_batch before anything is timed\n",
+                warmup, runs);
+    std::printf("- NOT a profiler reading: Nsight Compute is refused the "
+                "hardware counters on this machine (ERR_NVGPUCTRPERM, a "
+                "desktop driver setting), so no achieved-occupancy counter "
+                "appears below. The residency block is the runtime occupancy "
+                "answer, which is a ceiling on what a launch can hold and "
+                "never a count of what ran\n");
+
+    std::printf("\n### Residency of the shipped kernel\n");
+    std::printf("- kernel: gdeflate_decode_batch<32>, %d threads per block "
+                "(%d warps)\n",
+                r.block_threads, r.warps_per_block);
+    std::printf("- registers per thread: %d; shared bytes per block: %zu; "
+                "local bytes per thread: %zu\n",
+                r.registers_per_thread, r.shared_bytes_per_block,
+                r.local_bytes_per_thread);
+    std::printf("- SMs on this device: %d; max resident blocks per SM: %d\n",
+                r.sm_count, r.max_blocks_per_sm);
+    std::printf("- the machine holds %d blocks = %d warps of this kernel at "
+                "once; one warp decodes one page, so %d pages is the batch "
+                "size at which the device is exactly full once\n",
+                r.resident_blocks, r.resident_warps, r.resident_warps);
+
+    const unsigned shipped = cudec_bench_gdeflate_shipped_grid(pages);
+    const double resident = static_cast<double>(r.resident_blocks);
+    const double waves =
+        r.resident_blocks > 0 ? static_cast<double>(shipped) / resident : 0.0;
+    std::printf("\n### What the shipped grid asks of this device\n");
+    std::printf("- shipped grid for %zu pages: %u blocks, against %d "
+                "resident: %.2f waves\n",
+                pages, shipped, r.resident_blocks, waves);
+    if (r.resident_blocks > 0) {
+        const unsigned span = static_cast<unsigned>(r.resident_blocks);
+        const unsigned rest = shipped % span;
+        const unsigned last_fill = rest == 0 ? span : rest;
+        const unsigned idle = span - last_fill;
+        std::printf("- the last wave carries %u of %u blocks, so %u block "
+                    "slots stand idle while it drains: %.1f%% of one wave and "
+                    "%.1f%% of the whole launch block-slot capacity\n",
+                    last_fill, span, idle,
+                    100.0 * static_cast<double>(idle) /
+                        static_cast<double>(span),
+                    100.0 * static_cast<double>(idle) /
+                        (static_cast<double>(span) * std::ceil(waves)));
+    }
+    std::printf("- THAT ARITHMETIC IS AN UPPER BOUND ON THE QUANTISATION AND "
+                "NOT A COST. Blocks retire independently, so a later block "
+                "starts the moment an earlier one frees a slot; what the "
+                "figure bounds is the drain at the end of the launch, and the "
+                "timed rows below are what it actually costs\n");
+
+    /* Both sweeps in ONE call, so both run over one upload of one corpus.
+     * The grid rows come first at the full page count; the page rows follow
+     * at the shipped grid. */
+    /* An eighth of the machine per row on a real corpus. Clamped to the page
+     * count so a corpus smaller than one step still produces a row rather
+     * than an empty table that reads as a sweep nobody ran. */
+    size_t step = static_cast<size_t>(r.resident_warps) / 8;
+    if (step == 0 || step > pages) {
+        step = pages;
+    }
+    std::vector<cudec_gdeflate_sweep_point> pts;
+    for (size_t i = 0; i < kTailwasteGridCount; i++) {
+        cudec_gdeflate_sweep_point pt;
+        pt.pages = pages;
+        pt.blocks = kTailwasteGridMultiples[i] == 0
+                        ? 0u
+                        : kTailwasteGridMultiples[i] *
+                              static_cast<unsigned>(r.resident_blocks);
+        pt.ms_p50 = 0.0;
+        pts.push_back(pt);
+    }
+    const size_t grid_rows = pts.size();
+    for (size_t n = step; n <= pages; n += step) {
+        cudec_gdeflate_sweep_point pt;
+        pt.pages = n;
+        pt.blocks = 0;
+        pt.ms_p50 = 0.0;
+        pts.push_back(pt);
+    }
+    if (!cudec_bench_gpu_gdeflate_sweep(
+            comp_ptrs.data(), comp_sizes.data(), orig_sizes.data(), pages,
+            static_cast<int>(warmup), static_cast<int>(runs), pts.data(),
+            pts.size())) {
+        std::fprintf(stderr, "sweep failed\n");
+        return false;
+    }
+    const double gb = static_cast<double>(corpus.original_bytes) / 1e9;
+    std::printf("\n### The grid sweep: the same kernel and the same batch, "
+                "fewer blocks\n");
+    std::printf("\n| grid (blocks) | waves of the machine | pages per warp "
+                "(mean) | p50 ms | GB/s | vs shipped |\n");
+    std::printf("| ------------- | -------------------- | "
+                "---------------------- | ------ | ---- | ---------- |\n");
+    for (size_t i = 0; i < grid_rows; i++) {
+        const unsigned blocks = pts[i].blocks == 0 ? shipped : pts[i].blocks;
+        const double warps = static_cast<double>(blocks) *
+                             static_cast<double>(r.warps_per_block);
+        std::printf("| %u%s | %.2f | %.2f | %.3f | %.3f | %.3fx |\n", blocks,
+                    pts[i].blocks == 0 ? " (shipped)" : "",
+                    r.resident_blocks > 0
+                        ? static_cast<double>(blocks) / resident
+                        : 0.0,
+                    warps > 0.0 ? static_cast<double>(pages) / warps : 0.0,
+                    pts[i].ms_p50, cudec_bench::GbpsFromMs(gb, pts[i].ms_p50),
+                    pts[0].ms_p50 > 0.0 ? pts[i].ms_p50 / pts[0].ms_p50 : 0.0);
+    }
+    std::printf("\nThe shipped row and the multiple-of-residency rows are one "
+                "kernel at five grid widths. A row faster than the shipped "
+                "one is the lever paying; a row slower is the lever costing, "
+                "and either way the number is what decides it.\n");
+
+    std::printf("\n### The page-count sweep: where the launch quantises\n");
+    std::printf("\n| pages | shipped grid | waves | p50 ms | ms per page |\n");
+    std::printf("| ----- | ------------ | ----- | ------ | ----------- |\n");
+    for (size_t i = grid_rows; i < pts.size(); i++) {
+        const size_t n = pts[i].pages;
+        const unsigned g = cudec_bench_gdeflate_shipped_grid(n);
+        std::printf("| %zu | %u | %.2f | %.3f | %.5f |\n", n, g,
+                    r.resident_blocks > 0
+                        ? static_cast<double>(g) / resident
+                        : 0.0,
+                    pts[i].ms_p50, pts[i].ms_p50 / static_cast<double>(n));
+    }
+    std::printf("\nA flat p50 across a range of page counts is the tail this "
+                "issue is about: those pages cost nothing extra because the "
+                "warps were standing idle anyway. A ms-per-page column that "
+                "falls and then holds is the machine filling; one that holds "
+                "from the first row is a launch with no tail to recover.\n");
+    return true;
+}
+
 void Usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s [--gpu] [--warmup N] [--runs N] [--assetlike] "
                  "[--blocktypes] [--blockmix] [--worstrounds] "
-                 "[--worstheaders] [--selfcheck] "
+                 "[--worstheaders] [--tailwaste] [--selfcheck] "
                  "[corpus files...]\n",
                  argv0);
 }
@@ -2071,6 +2296,7 @@ int main(int argc, char** argv) {
     bool blockmix = false;
     bool worstrounds = false;
     bool worstheaders = false;
+    bool tailwaste = false;
     bool gpu = false;
     std::vector<std::string> files;
 
@@ -2088,6 +2314,8 @@ int main(int argc, char** argv) {
             worstrounds = true;
         } else if (arg == "--worstheaders") {
             worstheaders = true;
+        } else if (arg == "--tailwaste") {
+            tailwaste = true;
         } else if (arg == "--selfcheck") {
             selfcheck = true;
         } else if (arg == "--runs" && i + 1 < argc) {
@@ -2183,6 +2411,23 @@ int main(int argc, char** argv) {
         runs = 1;
     }
 
+    if (tailwaste) {
+        /* Its own corpus path and its own report, so the flags that build a
+         * different corpus or print a different report are refused rather
+         * than silently ranked against each other. --gpu is not among them:
+         * this report is a device measurement whether or not the flag that
+         * adds device ROWS to the throughput report was passed, and refusing
+         * it would make the reader think one of the two is optional. */
+        if (blocktypes || blockmix || worstrounds || worstheaders) {
+            Usage(argv[0]);
+            std::fprintf(stderr,
+                         "--tailwaste builds one corpus and prints one report "
+                         "of its own; it does not combine with --blocktypes, "
+                         "--blockmix, --worstrounds or --worstheaders\n");
+            return 2;
+        }
+    }
+
     if (blocktypes) {
         return RunBlocktypes(warmup, runs, selfcheck, gpu);
     }
@@ -2238,6 +2483,21 @@ int main(int argc, char** argv) {
 
     const uint64_t* expected =
         assetlike ? kAssetlikeSelfcheckDigests : kSelfcheckDigests;
+
+    if (tailwaste) {
+        /* Level 6 alone: it is the default level and therefore the shape most
+         * data arrives in, and the tail this issue is about is a property of
+         * the page COUNT rather than of the level. A four-level sweep would
+         * quadruple a run whose every row is a device launch and would say
+         * the same thing four times. */
+        /* Level 6 is kLevels[2], and the digest is taken from the same
+         * table the throughput selfcheck reads rather than from a second
+         * copy of the number. */
+        return RunTailwaste(source, name, provenance, kLevels[2], warmup, runs,
+                            selfcheck, expected[2])
+                   ? 0
+                   : 1;
+    }
 
     if (blockmix) {
         return RunBlockmix(source, name, provenance, selfcheck, expected);

@@ -63,6 +63,76 @@ bool cudec_bench_gpu_gdeflate(const unsigned char* const* comp,
                               const size_t* orig_sizes, size_t n, int warmup,
                               int runs, cudec_gpu_result* out);
 
+/* TAIL WASTE (issue #207): what a launch's geometry costs when the page count
+ * does not fill the machine, measured without a hardware performance counter.
+ *
+ * The counter route is shut on the machine this project measures on - Nsight
+ * Compute connects and is refused ERR_NVGPUCTRPERM, which is a desktop driver
+ * setting and not something a session may change - so an achieved-warps figure
+ * cannot come from a profiler here. What replaces it is not a substitute for
+ * the same number under another name: it is the runtime's own residency answer
+ * (registers and shared memory against the SM's budget), which bounds what any
+ * launch of this kernel can hold, next to event-timed decodes of the same batch
+ * at different grid sizes, which is what a batch actually costs. Neither is a
+ * counter reading and neither is reported as one.
+ */
+struct cudec_gdeflate_residency {
+    int sm_count;
+    int block_threads;
+    int warps_per_block;
+    int registers_per_thread;
+    size_t shared_bytes_per_block;
+    size_t local_bytes_per_thread;
+    /* From the runtime's occupancy answer for the shipped kernel at the
+     * shipped block shape - a ceiling on residency, never a count of warps
+     * that ran. */
+    int max_blocks_per_sm;
+    int resident_blocks;
+    int resident_warps;
+};
+
+/* Fills `out` for the shipped GDeflate kernel at the shipped block shape.
+ * False on any runtime failure, with `out` left alone. */
+bool cudec_bench_gdeflate_residency(cudec_gdeflate_residency* out);
+
+/* The grid the shipped batch entry launches for `pages`, from the library's
+ * own arithmetic rather than from a copy of it in the harness. */
+unsigned cudec_bench_gdeflate_shipped_grid(size_t pages);
+
+/* One point of the sweep: how many of the batch leading pages to decode, and
+ * at what grid width. `blocks` of 0 means the grid the shipped entry would
+ * launch for `pages`, so the baseline row comes from the same arithmetic the
+ * library uses rather than from a copy of it. */
+struct cudec_gdeflate_sweep_point {
+    size_t pages;
+    unsigned blocks;
+    double ms_p50; /* out */
+};
+
+/* Event-times the SHIPPED GDeflate kernel over ONE uploaded batch at every
+ * point, filling each point ms_p50.
+ *
+ * THIS IS THE LEVER ITSELF AND NOT A MODEL OF IT. The kernel already carries a
+ * grid-stride loop over pages, so a grid narrower than one warp per page is
+ * multi-tile-per-warp executing, with no kernel byte changed: at
+ * `resident_blocks` every warp is resident for the whole launch and drives as
+ * many pages as it can pull.
+ *
+ * ONE UPLOAD FOR EVERY POINT, and that is a correctness property rather than a
+ * saving. The device buffers this harness allocates are reclaimed at process
+ * exit, so a sweep that uploaded per point would exhaust the device and would
+ * time each point against a differently-fragmented heap. Every point here runs
+ * over the same bytes at the same addresses; only `pages` and gridDim.x move.
+ *
+ * Every page is decoded and verified through the public batch entry before a
+ * single run is timed, exactly as the throughput rows are. */
+bool cudec_bench_gpu_gdeflate_sweep(const unsigned char* const* comp,
+                                    const size_t* comp_sizes,
+                                    const size_t* orig_sizes, size_t n,
+                                    int warmup, int runs,
+                                    cudec_gdeflate_sweep_point* points,
+                                    size_t point_count);
+
 struct cudec_stream_ctx_result {
     size_t chunks;
     size_t output_bytes;

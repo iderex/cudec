@@ -2379,6 +2379,325 @@ attributing bytes from the page start rather than the block start reds it on
 the sum; counting one block per page -- the opening-walk reading -- reds it on
 the second.
 
+## M4 perf lever (issue #207): the launch has no tail worth recovering, and no kernel code ships
+
+The claim under test was that a warp-per-page mapping wastes the tail of a
+launch when the page count does not fill the machine or the pages are unevenly
+sized, and that driving more than one page per warp would recover it. It does
+not, and the measurement below is why.
+
+**THE LEVER NEEDED NO KERNEL CHANGE TO MEASURE, AND THAT IS A PROPERTY OF THE
+SHIPPED KERNEL RATHER THAN A SHORTCUT.** `src/gdeflate_decode.cuh` already
+loops `chunk += total_waves`, so a grid narrower than one warp per page IS
+multi-tile-per-warp executing: at a grid of exactly the machine's residency
+every warp is resident for the whole launch and pulls pages until they run out.
+The rows below are one kernel, one uploaded corpus, one verified decode, at five
+grid widths -- `gridDim.x` is the only thing that differs between them. So this
+entry reports a lever that was RUN, not one that was modelled.
+
+**NO PROFILER NUMBER APPEARS HERE AND THE ABSENCE IS DISCLOSED RATHER THAN
+FILLED.** The issue asks for achieved warps per SM. Nsight Compute on this
+machine connects to the process and is then refused the hardware counters with
+`ERR_NVGPUCTRPERM`; the permission is a desktop driver setting, not a container
+privilege and not something a measurement session may grant itself, and cudec
+#258 closed with the same negative answer for Compute Sanitizer. What stands in
+its place is two things that are not that number and are not reported as it:
+the runtime's own occupancy answer, which is a CEILING on how many warps a
+launch of this kernel can hold, and event-timed decodes, which are what a batch
+actually costs. An achieved-occupancy counter reading is not in this record.
+
+### What the device holds
+
+Read from the runtime for `gdeflate_decode_batch<32>` at the shipped block
+shape, on the RTX 3080:
+
+| quantity                   | value                 |
+| -------------------------- | --------------------- |
+| block shape                | 128 threads (4 warps) |
+| registers per thread       | 77                    |
+| shared bytes per block     | 15328                 |
+| local bytes per thread     | 176                   |
+| SMs                        | 68                    |
+| max resident blocks per SM | 6                     |
+| resident blocks / warps    | 408 / 1632            |
+
+One warp decodes one page, so **1632 pages is the batch size at which this
+device is exactly full once**. That single number is what the rest of this
+entry is read against.
+
+### The tail the arithmetic leaves
+
+| corpus     | pages | shipped grid | waves | last wave | idle block slots | share of launch capacity |
+| ---------- | ----- | ------------ | ----- | --------- | ---------------- | ------------------------ |
+| Silesia    | 3234  | 809          | 1.98  | 401 / 408 | 7                | 0.9%                     |
+| asset-like | 3200  | 800          | 1.96  | 392 / 408 | 16               | 2.0%                     |
+
+That is an UPPER BOUND on the quantisation and not a cost: blocks retire
+independently, so a later block starts the moment an earlier one frees a slot,
+and what the figure bounds is the drain at the end of the launch. Even as a
+bound it is under a fiftieth of the launch on both corpora, which is the first
+reason to expect nothing here.
+
+### The grid sweep, and the reason the direction is dead
+
+p50 milliseconds, CUDA-event timed, 3 warmup + 30 runs, device-resident, every
+page verified to its original size through `cudec_gdeflate_decompress_batch`
+before anything is timed. `vs shipped` is that row against the shipped grid **of
+the same run**.
+
+| grid (blocks)          | pages per warp | Silesia run 1 | run 2     | asset-like |
+| ---------------------- | -------------- | ------------- | --------- | ---------- |
+| shipped (809 / 800)    | 1.00           | 31.289 ms     | 29.417 ms | 36.979 ms  |
+| 408 (exactly resident) | ~1.97          | 0.989x        | 0.973x    | 0.989x     |
+| 816                    | ~0.99          | 1.027x        | 1.020x    | 0.999x     |
+| 1632                   | ~0.50          | 1.011x        | 0.990x    | 0.982x     |
+| 3264                   | 0.25           | 1.014x        | 0.984x    | 0.965x     |
+
+**READ THE TWO SILESIA COLUMNS AGAINST EACH OTHER BEFORE READING EITHER OF THEM
+DOWNWARDS.** The same corpus at the same grid, on an otherwise idle device,
+gave 31.289 ms and 29.417 ms in two invocations: a 6.0% spread between runs at
+one grid. Every difference BETWEEN grids is smaller than that. The persistent
+grid is 1.1% and 2.7% faster on the two Silesia runs and 1.1% faster on
+asset-like -- and on asset-like the FASTEST row is 3264 blocks, the widest grid
+in the sweep, which is the opposite of what the lever predicts. A signal whose
+sign flips between corpora and whose size is a fraction of the run-to-run spread
+is not a signal.
+
+**So the lever is refused, and it is refused by measurement rather than by the
+zero-regression rule.** The pre-registered accept rule wanted an improvement on
+at least one corpus with no regression on the worst case; nothing here reaches
+the first half, so the second was never in question. **No kernel byte ships.**
+`decode_grid_blocks` in `src/chunk_decode.cuh` stays as it is.
+
+### Where the tail actually is, and why this lever cannot reach it
+
+The page-count sweep is the same corpus truncated, timed at the shipped grid.
+The column to read is ms per page.
+
+| pages | waves of the machine | Silesia ms/page | asset-like ms/page |
+| ----- | -------------------- | --------------- | ------------------ |
+| 204   | 0.12                 | 0.03319         | 0.02710            |
+| 408   | 0.25                 | 0.02083         | 0.01601            |
+| 816   | 0.50                 | 0.01113         | 0.00936            |
+| 1632  | 1.00                 | 0.00844         | 0.01174            |
+| 2448  | 1.50                 | 0.00964         | 0.01168            |
+| 3060  | 1.88                 | 0.00926         | 0.01178            |
+
+A batch of 204 pages costs roughly four times as much per page as a batch of 3060. **That is the real tail waste and it is large** -- and multi-tile-per-warp
+is exactly the wrong lever for it, by construction. Below 1632 pages the device
+is not full because there are not enough pages to fill it; handing one warp two
+pages when there are already more warps than pages recovers nothing, because the
+idle warps were never going to be given work. What that regime wants is more
+pages in the batch or several batches on one stream, which is the caller's
+decision and not this kernel's geometry.
+
+Above the residency the ms-per-page column is flat to within its own noise on
+both corpora, which is the same finding as the grid sweep from the other side:
+once the machine is full, the launch costs what the pages cost.
+
+### What this entry does not cover
+
+The two adversarial corpora (`worst-rounds`, `worst-headers`) were NOT swept,
+and the reason is that the sweep cannot say anything about them. Both are 512
+pages, which is below this device's 1632-warp residency, so every warp gets at
+most one page at every grid in the sweep and the lever cannot be exercised on
+them at all. Their regime is the sub-residency half of the page-count table
+above, which is measured on both headline corpora. Nothing here claims a
+worst-case number, and nothing here changes one: no kernel code ships, so the
+#36 zero-regression rule has nothing to bind.
+
+Also not claimed: any statement about WHY a full launch costs what it costs.
+That is the refill-coalescing question (#205) and the table-layout question
+(#204), both of which want a profiler this machine will not give one.
+
+### The runs
+
+Recorded 2026-09-06 in the Ubuntu-24.04 WSL distribution, on
+`NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3`, host CPU
+`AMD Ryzen 9 5950X 16-Core Processor`, nvcc 13.3, against the gdeflate fork
+pinned at `8ba9502fb30d2bf728592d121f0d402e40c8cb05`. The corpus digests
+`042b2473240db0b0` (Silesia level 6) and `47dad3ea983dc577` (asset-like level 6)
+are the ones the #228 baseline section recorded, so this sweep and those
+throughput rows are attested against identical bytes. Reproduce with
+
+```
+bench_gdeflate --tailwaste --warmup 3 --runs 30 bench/corpora/silesia/*
+bench_gdeflate --tailwaste --warmup 3 --runs 30 --assetlike
+```
+
+The tables above are a reading aid. The three blocks below are the record.
+
+```
+## bench_gdeflate tail-waste report
+- lever: multi-tile-per-warp for short or leftover pages (issue #207), measured by varying gridDim.x over the SHIPPED kernel, whose grid-stride loop is what maps several pages onto one warp. No kernel byte differs between the rows
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, level 6, 3234 pages, 211.94 MB original, cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- corpus digest: 042b2473240db0b0
+- timing: CUDA-event, 3 warmup + 30 runs, p50 nearest-rank, device-resident (H2D/D2H excluded); every page decoded and verified to its original size through cudec_gdeflate_decompress_batch before anything is timed
+- NOT a profiler reading: Nsight Compute is refused the hardware counters on this machine (ERR_NVGPUCTRPERM, a desktop driver setting), so no achieved-occupancy counter appears below. The residency block is the runtime occupancy answer, which is a ceiling on what a launch can hold and never a count of what ran
+
+### Residency of the shipped kernel
+- kernel: gdeflate_decode_batch<32>, 128 threads per block (4 warps)
+- registers per thread: 77; shared bytes per block: 15328; local bytes per thread: 176
+- SMs on this device: 68; max resident blocks per SM: 6
+- the machine holds 408 blocks = 1632 warps of this kernel at once; one warp decodes one page, so 1632 pages is the batch size at which the device is exactly full once
+
+### What the shipped grid asks of this device
+- shipped grid for 3234 pages: 809 blocks, against 408 resident: 1.98 waves
+- the last wave carries 401 of 408 blocks, so 7 block slots stand idle while it drains: 1.7% of one wave and 0.9% of the whole launch block-slot capacity
+- THAT ARITHMETIC IS AN UPPER BOUND ON THE QUANTISATION AND NOT A COST. Blocks retire independently, so a later block starts the moment an earlier one frees a slot; what the figure bounds is the drain at the end of the launch, and the timed rows below are what it actually costs
+
+### The grid sweep: the same kernel and the same batch, fewer blocks
+
+| grid (blocks) | waves of the machine | pages per warp (mean) | p50 ms | GB/s | vs shipped |
+| ------------- | -------------------- | ---------------------- | ------ | ---- | ---------- |
+| 809 (shipped) | 1.98 | 1.00 | 31.289 | 6.774 | 1.000x |
+| 408 | 1.00 | 1.98 | 30.956 | 6.847 | 0.989x |
+| 816 | 2.00 | 0.99 | 32.125 | 6.597 | 1.027x |
+| 1632 | 4.00 | 0.50 | 31.635 | 6.699 | 1.011x |
+| 3264 | 8.00 | 0.25 | 31.736 | 6.678 | 1.014x |
+
+The shipped row and the multiple-of-residency rows are one kernel at five grid widths. A row faster than the shipped one is the lever paying; a row slower is the lever costing, and either way the number is what decides it.
+
+### The page-count sweep: where the launch quantises
+
+| pages | shipped grid | waves | p50 ms | ms per page |
+| ----- | ------------ | ----- | ------ | ----------- |
+| 204 | 51 | 0.12 | 6.772 | 0.03319 |
+| 408 | 102 | 0.25 | 8.500 | 0.02083 |
+| 612 | 153 | 0.38 | 8.508 | 0.01390 |
+| 816 | 204 | 0.50 | 9.083 | 0.01113 |
+| 1020 | 255 | 0.62 | 9.936 | 0.00974 |
+| 1224 | 306 | 0.75 | 10.845 | 0.00886 |
+| 1428 | 357 | 0.88 | 11.928 | 0.00835 |
+| 1632 | 408 | 1.00 | 13.767 | 0.00844 |
+| 1836 | 459 | 1.12 | 17.851 | 0.00972 |
+| 2040 | 510 | 1.25 | 18.804 | 0.00922 |
+| 2244 | 561 | 1.38 | 19.603 | 0.00874 |
+| 2448 | 612 | 1.50 | 23.599 | 0.00964 |
+| 2652 | 663 | 1.62 | 23.319 | 0.00879 |
+| 2856 | 714 | 1.75 | 22.818 | 0.00799 |
+| 3060 | 765 | 1.88 | 28.332 | 0.00926 |
+
+A flat p50 across a range of page counts is the tail this issue is about: those pages cost nothing extra because the warps were standing idle anyway. A ms-per-page column that falls and then holds is the machine filling; one that holds from the first row is a launch with no tail to recover.
+```
+
+```
+## bench_gdeflate tail-waste report
+- lever: multi-tile-per-warp for short or leftover pages (issue #207), measured by varying gridDim.x over the SHIPPED kernel, whose grid-stride loop is what maps several pages onto one warp. No kernel byte differs between the rows
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: dickens+mozilla+mr+nci+ooffice+osdb+reymont+samba+sao+webster+x-ray+xml, level 6, 3234 pages, 211.94 MB original, cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork; every page decoded back by the reference and compared against the source before timing
+- corpus digest: 042b2473240db0b0
+- timing: CUDA-event, 3 warmup + 30 runs, p50 nearest-rank, device-resident (H2D/D2H excluded); every page decoded and verified to its original size through cudec_gdeflate_decompress_batch before anything is timed
+- NOT a profiler reading: Nsight Compute is refused the hardware counters on this machine (ERR_NVGPUCTRPERM, a desktop driver setting), so no achieved-occupancy counter appears below. The residency block is the runtime occupancy answer, which is a ceiling on what a launch can hold and never a count of what ran
+
+### Residency of the shipped kernel
+- kernel: gdeflate_decode_batch<32>, 128 threads per block (4 warps)
+- registers per thread: 77; shared bytes per block: 15328; local bytes per thread: 176
+- SMs on this device: 68; max resident blocks per SM: 6
+- the machine holds 408 blocks = 1632 warps of this kernel at once; one warp decodes one page, so 1632 pages is the batch size at which the device is exactly full once
+
+### What the shipped grid asks of this device
+- shipped grid for 3234 pages: 809 blocks, against 408 resident: 1.98 waves
+- the last wave carries 401 of 408 blocks, so 7 block slots stand idle while it drains: 1.7% of one wave and 0.9% of the whole launch block-slot capacity
+- THAT ARITHMETIC IS AN UPPER BOUND ON THE QUANTISATION AND NOT A COST. Blocks retire independently, so a later block starts the moment an earlier one frees a slot; what the figure bounds is the drain at the end of the launch, and the timed rows below are what it actually costs
+
+### The grid sweep: the same kernel and the same batch, fewer blocks
+
+| grid (blocks) | waves of the machine | pages per warp (mean) | p50 ms | GB/s | vs shipped |
+| ------------- | -------------------- | ---------------------- | ------ | ---- | ---------- |
+| 809 (shipped) | 1.98 | 1.00 | 29.417 | 7.205 | 1.000x |
+| 408 | 1.00 | 1.98 | 28.629 | 7.403 | 0.973x |
+| 816 | 2.00 | 0.99 | 29.997 | 7.065 | 1.020x |
+| 1632 | 4.00 | 0.50 | 29.113 | 7.280 | 0.990x |
+| 3264 | 8.00 | 0.25 | 28.948 | 7.321 | 0.984x |
+
+The shipped row and the multiple-of-residency rows are one kernel at five grid widths. A row faster than the shipped one is the lever paying; a row slower is the lever costing, and either way the number is what decides it.
+
+### The page-count sweep: where the launch quantises
+
+| pages | shipped grid | waves | p50 ms | ms per page |
+| ----- | ------------ | ----- | ------ | ----------- |
+| 204 | 51 | 0.12 | 5.997 | 0.02939 |
+| 408 | 102 | 0.25 | 8.046 | 0.01972 |
+| 612 | 153 | 0.38 | 7.979 | 0.01304 |
+| 816 | 204 | 0.50 | 8.964 | 0.01099 |
+| 1020 | 255 | 0.62 | 10.174 | 0.00997 |
+| 1224 | 306 | 0.75 | 11.403 | 0.00932 |
+| 1428 | 357 | 0.88 | 12.098 | 0.00847 |
+| 1632 | 408 | 1.00 | 12.982 | 0.00795 |
+| 1836 | 459 | 1.12 | 16.324 | 0.00889 |
+| 2040 | 510 | 1.25 | 17.182 | 0.00842 |
+| 2244 | 561 | 1.38 | 17.995 | 0.00802 |
+| 2448 | 612 | 1.50 | 20.443 | 0.00835 |
+| 2652 | 663 | 1.62 | 20.983 | 0.00791 |
+| 2856 | 714 | 1.75 | 21.844 | 0.00765 |
+| 3060 | 765 | 1.88 | 27.675 | 0.00904 |
+
+A flat p50 across a range of page counts is the tail this issue is about: those pages cost nothing extra because the warps were standing idle anyway. A ms-per-page column that falls and then holds is the machine filling; one that holds from the first row is a launch with no tail to recover.
+```
+
+```
+## bench_gdeflate tail-waste report
+- lever: multi-tile-per-warp for short or leftover pages (issue #207), measured by varying gridDim.x over the SHIPPED kernel, whose grid-stride loop is what maps several pages onto one warp. No kernel byte differs between the rows
+- host CPU: AMD Ryzen 9 5950X 16-Core Processor
+- CUDA device: NVIDIA GeForce RTX 3080 (sm_86), driver 13.3, runtime 13.3
+- cudec: 100
+- corpus: asset-like, level 6, 3200 pages, 209.72 MB original, generated in-harness, a MODEL of a game asset package (bench/assetlike_source.h, issue #139) and not a measurement on real game data; cut into 64 KiB pages and each page compressed on its own by the pinned gdeflate fork
+- corpus digest: 47dad3ea983dc577
+- timing: CUDA-event, 3 warmup + 30 runs, p50 nearest-rank, device-resident (H2D/D2H excluded); every page decoded and verified to its original size through cudec_gdeflate_decompress_batch before anything is timed
+- NOT a profiler reading: Nsight Compute is refused the hardware counters on this machine (ERR_NVGPUCTRPERM, a desktop driver setting), so no achieved-occupancy counter appears below. The residency block is the runtime occupancy answer, which is a ceiling on what a launch can hold and never a count of what ran
+
+### Residency of the shipped kernel
+- kernel: gdeflate_decode_batch<32>, 128 threads per block (4 warps)
+- registers per thread: 77; shared bytes per block: 15328; local bytes per thread: 176
+- SMs on this device: 68; max resident blocks per SM: 6
+- the machine holds 408 blocks = 1632 warps of this kernel at once; one warp decodes one page, so 1632 pages is the batch size at which the device is exactly full once
+
+### What the shipped grid asks of this device
+- shipped grid for 3200 pages: 800 blocks, against 408 resident: 1.96 waves
+- the last wave carries 392 of 408 blocks, so 16 block slots stand idle while it drains: 3.9% of one wave and 2.0% of the whole launch block-slot capacity
+- THAT ARITHMETIC IS AN UPPER BOUND ON THE QUANTISATION AND NOT A COST. Blocks retire independently, so a later block starts the moment an earlier one frees a slot; what the figure bounds is the drain at the end of the launch, and the timed rows below are what it actually costs
+
+### The grid sweep: the same kernel and the same batch, fewer blocks
+
+| grid (blocks) | waves of the machine | pages per warp (mean) | p50 ms | GB/s | vs shipped |
+| ------------- | -------------------- | ---------------------- | ------ | ---- | ---------- |
+| 800 (shipped) | 1.96 | 1.00 | 36.979 | 5.671 | 1.000x |
+| 408 | 1.00 | 1.96 | 36.572 | 5.734 | 0.989x |
+| 816 | 2.00 | 0.98 | 36.932 | 5.678 | 0.999x |
+| 1632 | 4.00 | 0.49 | 36.317 | 5.775 | 0.982x |
+| 3264 | 8.00 | 0.25 | 35.676 | 5.878 | 0.965x |
+
+The shipped row and the multiple-of-residency rows are one kernel at five grid widths. A row faster than the shipped one is the lever paying; a row slower is the lever costing, and either way the number is what decides it.
+
+### The page-count sweep: where the launch quantises
+
+| pages | shipped grid | waves | p50 ms | ms per page |
+| ----- | ------------ | ----- | ------ | ----------- |
+| 204 | 51 | 0.12 | 5.528 | 0.02710 |
+| 408 | 102 | 0.25 | 6.532 | 0.01601 |
+| 612 | 153 | 0.38 | 7.003 | 0.01144 |
+| 816 | 204 | 0.50 | 7.634 | 0.00936 |
+| 1020 | 255 | 0.62 | 10.622 | 0.01041 |
+| 1224 | 306 | 0.75 | 13.899 | 0.01136 |
+| 1428 | 357 | 0.88 | 17.113 | 0.01198 |
+| 1632 | 408 | 1.00 | 19.157 | 0.01174 |
+| 1836 | 459 | 1.12 | 22.839 | 0.01244 |
+| 2040 | 510 | 1.25 | 26.708 | 0.01309 |
+| 2244 | 561 | 1.38 | 27.582 | 0.01229 |
+| 2448 | 612 | 1.50 | 28.593 | 0.01168 |
+| 2652 | 663 | 1.62 | 30.351 | 0.01144 |
+| 2856 | 714 | 1.75 | 33.558 | 0.01175 |
+| 3060 | 765 | 1.88 | 36.040 | 0.01178 |
+
+A flat p50 across a range of page counts is the tail this issue is about: those pages cost nothing extra because the warps were standing idle anyway. A ms-per-page column that falls and then holds is the machine filling; one that holds from the first row is a launch with no tail to recover.
+```
+
 ## M5: the Zstd CPU denominator (issue #227)
 
 There is no Zstd kernel yet. This entry is the denominator a later device

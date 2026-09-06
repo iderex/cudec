@@ -1804,6 +1804,31 @@ dynamic blocks, where 99.9% of the work is; that stays with #204, #205 and
 was taken over, and the guard that separates this census from a walk over
 page openings, which would have undercounted stored blocks by construction.
 
+**M4 perf lever outcome (issue #207): the launch geometry has no tail worth
+recovering, and no kernel code ships.** The claim was that a warp-per-page
+mapping wastes the tail of a launch on short or unevenly sized pages, and that
+driving several pages per warp would recover it. The shipped kernel already
+carries a grid-stride loop, so the lever was RUN rather than modelled: the same
+kernel over one verified upload at five grid widths, `gridDim.x` the only
+difference. On the RTX 3080 the runtime holds 408 blocks -- 1632 warps -- of
+this kernel resident, so the shipped grid for the recorded corpora is under two
+waves and leaves 0.9% (Silesia) and 2.0% (asset-like) of block-slot capacity
+idle in the drain as an upper bound. Measured, the persistent grid is 1.1-2.7%
+faster and the same corpus at one grid varies 6.0% between two invocations, so
+every difference between grids is inside the run-to-run spread; on asset-like
+the fastest row is the WIDEST grid, which is the opposite of the lever's
+prediction. Refused by measurement rather than by the zero-regression rule -
+nothing reached the first half of the accept condition. **Where the tail
+genuinely is:** below the device's residency a batch costs roughly four times
+as much per page as a full one, and multi-tile-per-warp cannot reach that by
+construction, because handing one warp two pages recovers nothing when there
+are already more warps than pages. That regime wants a larger batch, which is
+the caller's decision and not this kernel's geometry. No profiler reading is in
+the record: Nsight Compute connects and is refused the hardware counters on
+this machine (`ERR_NVGPUCTRPERM`, a desktop driver setting), so the residency
+figures are the runtime's occupancy ceiling and never an achieved-occupancy
+count. Recorded in [docs/BENCHMARKS.md](BENCHMARKS.md).
+
 ### 13.3 The validation ladder
 
 Every value read from the stream is checked before its first use as an
