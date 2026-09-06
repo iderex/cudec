@@ -65,20 +65,19 @@ int main() {
     REQUIRE(cudec_gdeflate_decompress_batch(srcs, sizes, dsts, caps, 1,
                                             results, nullptr) == CUDEC_ERR_CUDA);
 
-    /* The Zstd entry, the same opposite assertion and for the same reason
-     * (issue #427). Written out rather than folded into a loop over the two
-     * not-implemented entries: what this file is for is the point where two
-     * entries stop being the same code, and a loop would assume they are. */
+    /* The Zstd entry, which flipped the same way on the day its own kernel
+     * landed (issues #427, #203). Written out rather than folded into a loop
+     * over the four: what this file is for is the point where two entries
+     * stop being the same code, and a loop would assume they are. */
     REQUIRE(cudec_zstd_decompress_batch(nullptr, sizes, dsts, caps, 1, results,
                                         nullptr) ==
             CUDEC_ERR_INVALID_ARGUMENT);
     REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 1, results,
-                                        nullptr) == CUDEC_ERR_NOT_IMPLEMENTED);
+                                        nullptr) == CUDEC_ERR_CUDA);
     REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 1, results,
-                                        nullptr) == CUDEC_ERR_NOT_IMPLEMENTED);
+                                        nullptr) == CUDEC_ERR_CUDA);
 
-    std::printf("PASS: with zero visible devices the three kernel-backed batch "
-                "entries report CUDEC_ERR_CUDA and the Zstd entry reports "
-                "CUDEC_ERR_NOT_IMPLEMENTED\n");
+    std::printf("PASS: with zero visible devices all four batch entries "
+                "report CUDEC_ERR_CUDA on a batch that passes validation\n");
     return 0;
 }

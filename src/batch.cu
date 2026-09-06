@@ -4,6 +4,7 @@
 #include "gdeflate_decode.cuh"
 #include "lz4_block.h"
 #include "snappy_block.h"
+#include "zstd_decode.cuh"
 
 #include "vendor_rt.h"
 
@@ -44,6 +45,29 @@ struct GDeflateLaunch {
         cudec_detail::gdeflate_decode_batch<WaveSize>
             <<<cudec_detail::decode_grid_blocks(chunk_count),
                cudec_detail::kBlockThreadsFor<WaveSize>, 0,
+               cudec_rt::stream_from_abi(stream)>>>(
+                d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities,
+                chunk_count, d_results);
+    }
+};
+
+/* One BLOCK per frame rather than one wave, and the grid is one block per
+ * frame: a Zstd frame's entropy decode is serial per stream, so what a frame
+ * gets is a block whose shared memory holds its table set
+ * (docs/MASTERPLAN.md section 14.2). The width is the kernel's own constant
+ * rather than the wave-derived one the two launchers above use, because 14.2
+ * derives it from the table set against an SM's shared memory and not from a
+ * wave count - it is 128 threads at either wave width, which is four waves on
+ * one and two on the other. */
+struct ZstdLaunch {
+    template <int WaveSize>
+    static void Run(const void* const* d_src_ptrs, const size_t* d_src_sizes,
+                    void* const* d_dst_ptrs, const size_t* d_dst_capacities,
+                    size_t chunk_count, cudec_chunk_result* d_results,
+                    cudec_stream_t stream) {
+        cudec_detail::zstd_decode_batch<WaveSize>
+            <<<cudec_detail::zstd_grid_blocks(chunk_count),
+               cudec_detail::kZstdBlockThreads, 0,
                cudec_rt::stream_from_abi(stream)>>>(
                 d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities,
                 chunk_count, d_results);
@@ -154,21 +178,18 @@ cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
                                         d_results, stream);
 }
 
-/* The Zstd entry is the frozen contract without its kernel behind it yet
- * (issue #427). It shares the validator with the three above rather than
- * growing its own, so the reject classes cannot drift apart while it is being
- * frozen, and then stops: no launch, and deliberately no
- * cudec_rt::get_last_error() drain either. Draining is how the entries above
- * buy a post-launch check that reports their own submission; with nothing
- * submitted there is nothing to report, and consuming a caller's pending
- * error on the way to answering "not built here" would be this entry
- * altering CUDA state it never used.
+/* The Zstd entry with its kernel behind it (issues #427, #203). It shares the
+ * validator, the width query and the post-launch check with the three above,
+ * so the reject classes and the launch discipline cannot drift apart between
+ * the families; what it does not share is the launch geometry, which is
+ * ZstdLaunch's and is a block per frame.
  *
- * That absence is what tests/launch_fail.cpp reads: with no visible device
- * an entry that made any CUDA call would answer CUDEC_ERR_CUDA, so the
- * not-implemented answer there is the evidence that this path touches the
- * runtime at all only through the validator, which touches it not at
- * all. */
+ * tests/launch_fail.cpp read the not-implemented answer this entry used to
+ * give as the evidence that it touched the runtime only through a validator
+ * that touches it not at all. That evidence is spent: with a kernel behind it
+ * the entry queries the width and launches, so with no visible device it
+ * answers CUDEC_ERR_CUDA exactly as the three entries beside it do, and that
+ * is the line in that test which changes meaning today. */
 cudec_status cudec_zstd_decompress_batch(const void* const* d_src_ptrs,
                                          const size_t* d_src_sizes,
                                          void* const* d_dst_ptrs,
@@ -176,12 +197,7 @@ cudec_status cudec_zstd_decompress_batch(const void* const* d_src_ptrs,
                                          size_t chunk_count,
                                          cudec_chunk_result* d_results,
                                          cudec_stream_t stream) {
-    (void)stream;
-    const cudec_status valid = cudec_detail::validate_batch_args(
-        d_src_ptrs, d_src_sizes, d_dst_ptrs, d_dst_capacities, chunk_count,
-        d_results);
-    if (valid != CUDEC_OK) {
-        return valid;
-    }
-    return CUDEC_ERR_NOT_IMPLEMENTED;
+    return submit_batch<ZstdLaunch>(d_src_ptrs, d_src_sizes, d_dst_ptrs,
+                                    d_dst_capacities, chunk_count, d_results,
+                                    stream);
 }

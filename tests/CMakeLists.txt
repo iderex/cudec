@@ -482,6 +482,27 @@ cudec_add_test(zstd_tile_dependency SOURCES zstd_tile_dependency.cpp
                zstd_corpus.cpp LIBS zstd_full)
 target_include_directories(zstd_tile_dependency
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+# The Zstd kernel on the device (issue #203): the pinned compressor makes the
+# frames, every frame goes through the batch entry into a poisoned
+# destination, and the answer is held to what the pinned decompressor says the
+# frame means. GPU-labelled: it drives the shipped kernel.
+#
+# The corpus reaches it through a static library rather than through a source
+# listed beside the .cu, and that is the rule at the top of this file rather
+# than a preference: zstd_full carries the reference's include directory
+# PUBLIC, so naming it on a target holding a .cu would put <zstd.h> on nvcc's
+# command line. The library takes that link PRIVATE and hands the test the
+# corpus header alone, which is the shape cudec_test_fixtures already uses for
+# the same reason.
+if(NOT CUDEC_SANITIZE)
+  add_library(cudec_zstd_corpus STATIC zstd_corpus.cpp)
+  target_link_libraries(cudec_zstd_corpus PRIVATE zstd_full)
+  target_include_directories(cudec_zstd_corpus PUBLIC .)
+  set_target_properties(cudec_zstd_corpus PROPERTIES CXX_STANDARD 17
+                                                     CXX_STANDARD_REQUIRED ON)
+  target_compile_options(cudec_zstd_corpus PRIVATE -O2)
+endif()
+cudec_add_test(zstd_device SOURCES zstd_device.cu GPU LIBS cudec_zstd_corpus)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
