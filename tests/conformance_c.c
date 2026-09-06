@@ -5,11 +5,10 @@
  * fallback, which no other translation unit compiles.
  *
  * Every path exercised here returns synchronously without making a CUDA
- * call (see cudec.h): the documented argument rejects, and the one
- * documented ACCEPT that answers CUDEC_ERR_NOT_IMPLEMENTED because this
- * build carries no GDeflate kernel. So this test runs green on the
- * GPU-less CI runner - the pointers below are host memory and are never
- * dereferenced. */
+ * call (see cudec.h): the documented argument rejects, and nothing else.
+ * Every batch entry now has a kernel behind it, so no accepted batch is
+ * called here at all. So this test runs green on the GPU-less CI runner -
+ * the pointers below are host memory and are never dereferenced. */
 #include "cudec.h"
 
 #include <stdint.h>
@@ -138,10 +137,10 @@ int main(void) {
      * symbol and the eight reject classes above did not move, and
      * tests/launch_fail.cpp holds the launch half on a GPU-less process. */
 
-    /* The same nine classes on the Zstd entry (issue #427), written out call
-     * for call for the reason the two blocks above are: a future entry wired
-     * to its own validator, or to none, would pass a test that only counted
-     * on the sharing. */
+    /* The same eight classes on the Zstd entry (issues #427, #203), written
+     * out call for call for the reason the two blocks above are: a future
+     * entry wired to its own validator, or to none, would pass a test that
+     * only counted on the sharing. */
     REQUIRE(cudec_zstd_decompress_batch(0, sizes, dsts, caps, 1, aligned,
                                         0) == CUDEC_ERR_INVALID_ARGUMENT);
     REQUIRE(cudec_zstd_decompress_batch(srcs, 0, dsts, caps, 1, aligned,
@@ -159,8 +158,12 @@ int main(void) {
     REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, SIZE_MAX,
                                         aligned,
                                         0) == CUDEC_ERR_INVALID_ARGUMENT);
-    REQUIRE(cudec_zstd_decompress_batch(srcs, sizes, dsts, caps, 1, aligned,
-                                        0) == CUDEC_ERR_NOT_IMPLEMENTED);
+
+    /* The ninth class this entry carried while it had no kernel is gone with
+     * the kernel (issue #203), and no call replaces it here for the reason
+     * the GDeflate block above gives: an accepted batch now reaches a launch,
+     * and these are host pointers this GPU-less test must never hand to one.
+     */
 
     /* The frame entry point resolves its own C linkage here. Every call
      * below is a documented argument reject that returns before any CUDA

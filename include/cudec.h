@@ -34,11 +34,15 @@ typedef enum cudec_status {
     /* An API entry point or decode path declared here but not implemented
      * in this build. It is what a declared-but-unbuilt entry answers a
      * batch it has already accepted, so the freeze on that entry's symbol
-     * and signature never depends on a build configuration:
-     * cudec_zstd_decompress_batch returns it today, and the value is fixed
-     * so a caller's switch stays exhaustive across the build that stops
-     * returning it - which cudec_gdeflate_decompress_batch did when its
-     * kernel landed, with the symbol and every reject class unmoved. */
+     * and signature never depends on a build configuration.
+     *
+     * NO ENTRY RETURNS IT TODAY, and the value stays where it is rather than
+     * being reclaimed. Both entries that ever answered it -
+     * cudec_gdeflate_decompress_batch and then cudec_zstd_decompress_batch -
+     * stopped when their kernels landed, with the symbol and every reject
+     * class unmoved, which is what the freeze was for. A caller's switch
+     * stays exhaustive across that change only because the value is
+     * fixed. */
     CUDEC_ERR_NOT_IMPLEMENTED = 5,
     /* A well-formed frame that uses a feature cudec does not decode, or a
      * legal frame type it declines (block-linked mode, a dictionary id, a
@@ -231,15 +235,17 @@ cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
  * capacity, bytes_written == 0 on any of them, and the destination contents
  * then unspecified but never presented as a valid decode.
  *
- * THIS BUILD CARRIES NO ZSTD KERNEL, AND THAT IS A DEFINED STATUS RATHER
- * THAN AN ABSENT SYMBOL. A batch that passes the validation above returns
- * CUDEC_ERR_NOT_IMPLEMENTED, having made no CUDA call at all - so this
- * entry, like the GDeflate one above, also leaves the thread's pending CUDA
- * error state untouched on a call it accepts. The symbol, the signature and
- * every reject class above are frozen now and do not move when the kernel
- * lands; only the answer to an accepted batch does. A symbol that was absent
- * instead would make the freeze conditional on a build configuration, which
- * is two contracts wearing one name. */
+ * A frame is decoded by one BLOCK rather than by one warp, and that is the
+ * format rather than a tuning choice: a Zstd frame's entropy decode is
+ * serial per stream, so what a frame is given is a block whose shared memory
+ * holds its entropy table set. Nothing a caller can observe moves with it.
+ *
+ * The contract was frozen before the kernel stood behind it, and the freeze
+ * held: the symbol, the signature and every reject class above did not move
+ * when the kernel landed; only the answer to an accepted batch did, from
+ * CUDEC_ERR_NOT_IMPLEMENTED to the launch. A symbol that had been absent
+ * instead would have made the freeze conditional on a build configuration,
+ * which is two contracts wearing one name. */
 cudec_status cudec_zstd_decompress_batch(const void* const* d_src_ptrs,
                                          const size_t* d_src_sizes,
                                          void* const* d_dst_ptrs,

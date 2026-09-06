@@ -2195,6 +2195,41 @@ them by naming where the literals live.
   from 32 resident warps at 64 registers. Above it the block count falls
   and the shared-memory headroom the four-warp block relies on stops being
   headroom.
+
+  **Measured outcome (issue #203, 2026-09-06): this trigger has fired, and
+  the shared-memory half of 14.2 held.** Read off the shipped kernel on the
+  RTX 3080 through `cudaFuncGetAttributes` and
+  `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, at 128 threads:
+
+  ```
+  kernel: 80 registers/thread, 12064 bytes static smem, 176 bytes local
+  occupancy: 6 resident blocks/SM at 128 threads = 24 warps/SM
+  ```
+
+  So registers bind rather than shared memory: 12064 bytes is inside the
+  12292 bytes 14.10 budgeted, and eight blocks of it would still fit the
+  roughly 100 KiB an sm_86 SM offers - what stops the eighth block is 80
+  registers a thread, not the table set. The consequence is 24 resident
+  warps against the 32 the budget is derived from, and nothing in this
+  landing tries to argue that down: what would move it is a register
+  measurement per stage, which is #235 to #239's business rather than the
+  kernel's own pull request.
+
+  **It does spill, by a little, and that is stated rather than rounded to
+  none.** `-Xptxas -v` over the same translation unit:
+
+  ```
+  176 bytes stack frame, 8 bytes spill stores, 4 bytes spill loads
+  Used 80 registers, used 1 barriers, 12064 bytes smem
+  ```
+
+  Twelve bytes of traffic against a 176-byte frame is not what holds this
+  kernel back at 80 registers, and no claim here says the allocation is
+  spill-free. What the frame itself costs is the serial lane's working set -
+  a bit reader, three FSE states and the repeat history at once, which 14.10
+  predicted would set the whole block's allocation - and moving it is the
+  same per-stage measurement named above.
+
 - **An extension that widens a table.** 12.5's extension ladder is where a
   wider window or a larger table log would arrive, and the 9472 bytes moves
   with it. A literals tree of depth twelve alone would take the table set
