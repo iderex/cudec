@@ -197,6 +197,26 @@ target_compile_options(
 # runner.
 add_test(NAME bench_gdeflate_selfcheck COMMAND bench_gdeflate --selfcheck)
 
+# The tail-waste sweep (issue #207). GPU-LABELLED, and it is the first
+# bench entry here that is: everything above times the reference decoder on
+# the host and touches no device, while this path exists to ask the runtime
+# how many blocks of the shipped kernel fit on an SM and then to launch that
+# kernel at several grid widths. There is nothing left of it to run on the
+# GPU-less CI runner, so it is labelled rather than made conditional.
+#
+# What it protects is the plumbing and not a number. Four pages decoded once
+# is far below any device's residency, so the figures it prints are launch
+# costs; the report says so on its own line rather than leaving a reader to
+# infer it. What reds here is the residency query failing, the sweep losing
+# its verification precondition, a grid arithmetic that stopped matching the
+# library's, or the level-6 corpus moving underneath the record - that last
+# one against the same digit table the entry below reads, so the two cannot
+# disagree about which corpus is meant.
+add_test(NAME bench_gdeflate_tailwaste_selfcheck
+         COMMAND bench_gdeflate --tailwaste --selfcheck)
+set_tests_properties(bench_gdeflate_tailwaste_selfcheck PROPERTIES LABELS gpu
+                                                        RUN_SERIAL TRUE)
+
 # The asset-like corpus through the same grid (issue #139's block, issue
 # #224's path). Separate entry because it locks different bytes: the source
 # block comes from bench/assetlike_source.h, which bench_lz4 reads too, so a
@@ -345,5 +365,6 @@ set_tests_properties(
   bench_gdeflate_selfcheck bench_gdeflate_assetlike_selfcheck
   bench_gdeflate_blocktypes_selfcheck bench_gdeflate_blockmix_selfcheck
   bench_gdeflate_worst_selfcheck bench_gdeflate_worstheaders_selfcheck
+  bench_gdeflate_tailwaste_selfcheck
   PROPERTIES TIMEOUT ${CUDEC_TEST_TIMEOUT_SECONDS})
 cudec_assert_test_timeouts()

@@ -60,6 +60,8 @@
 #define CUDEC_RT_GET_DEVICE_PROPERTIES hipGetDeviceProperties
 #define CUDEC_RT_DRIVER_GET_VERSION hipDriverGetVersion
 #define CUDEC_RT_RUNTIME_GET_VERSION hipRuntimeGetVersion
+#define CUDEC_RT_OCCUPANCY_MAX_ACTIVE_BLOCKS \
+    hipOccupancyMaxActiveBlocksPerMultiprocessor
 /* The two report-line spellings the backends do not share: the architecture
  * name lives in a string field here and in a major/minor pair on CUDA, and
  * a HIP version integer is major * 10000000 + minor * 100000 + patch where
@@ -91,6 +93,8 @@
 #define CUDEC_RT_GET_DEVICE_PROPERTIES cudaGetDeviceProperties
 #define CUDEC_RT_DRIVER_GET_VERSION cudaDriverGetVersion
 #define CUDEC_RT_RUNTIME_GET_VERSION cudaRuntimeGetVersion
+#define CUDEC_RT_OCCUPANCY_MAX_ACTIVE_BLOCKS \
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor
 #define CUDEC_RT_ARCH_OF(prop, out, n) \
     std::snprintf((out), (n), "sm_%d%d", (prop).major, (prop).minor)
 #define CUDEC_RT_VERSION_MAJOR(v) ((v) / 1000)
@@ -183,6 +187,20 @@ inline error_t runtime_get_version(int* v) {
 inline void device_arch(const device_prop_t& prop, char* out, size_t n) {
     CUDEC_RT_ARCH_OF(prop, out, n);
 }
+/* HOW MANY BLOCKS OF THIS KERNEL FIT ON ONE SM AT ONCE, which is the residency
+ * a launch can achieve rather than a count of anything that ran. It is the
+ * runtime's own answer from the kernel's registers and shared memory, so it
+ * needs no hardware performance counter and is producible where a profiler is
+ * refused the counters (issue #207). The entry is a plain pointer for the
+ * reason func_get_attributes above gives. */
+inline error_t occupancy_max_active_blocks_per_sm(int* blocks,
+                                                  const void* entry,
+                                                  int block_threads,
+                                                  size_t dynamic_shared) {
+    return CUDEC_RT_OCCUPANCY_MAX_ACTIVE_BLOCKS(blocks, entry, block_threads,
+                                                dynamic_shared);
+}
+
 inline int version_major(int v) { return CUDEC_RT_VERSION_MAJOR(v); }
 inline int version_minor(int v) { return CUDEC_RT_VERSION_MINOR(v); }
 
