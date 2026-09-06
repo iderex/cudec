@@ -20,9 +20,8 @@
  * Nothing here is timed. */
 #include "cudec.h"
 #include "require.h"
-#include "xxhash64.h"
-#include "zstd_blocks.h"
 #include "zstd_corpus.h"
+#include "zstd_host_frame.h"
 
 #include "vendor_rt_test.h"
 
@@ -39,10 +38,6 @@ constexpr unsigned char kDstPoison = 0xA5;
 /* Slack past the declared content size, so the poison beyond bytes_written
  * has somewhere to survive. */
 constexpr size_t kCapacitySlack = 96;
-/* The format's own ceiling on a block's sequence count - every sequence emits
- * at least a three-byte match, so a 128 KiB block holds no more - given to the
- * host harness below so its storage rung is never the one that fires. */
-constexpr uint32_t kHostSequenceCapacity = 43690;
 
 struct Chunk {
     const Bytes* src;
@@ -291,99 +286,6 @@ int RunCorpus(Census* census) {
  *
  * The verdict comes from src/zstd_blocks.h run on the host over the same
  * bytes, never from a status written down here. */
-struct HostHarness {
-    std::vector<cudec_detail::ZstdHufCell> huf;
-    std::vector<cudec_detail::ZstdFseCell> litlen;
-    std::vector<cudec_detail::ZstdFseCell> matchlen;
-    std::vector<cudec_detail::ZstdFseCell> offset;
-    cudec_detail::ZstdLiteralsScratch literals_scratch;
-    cudec_detail::ZstdSeqScratch seq_scratch;
-    Bytes literals;
-    std::vector<cudec_detail::ZstdSequence> sequences;
-    std::vector<uint64_t> offsets;
-    std::vector<uint64_t> destinations;
-    cudec_detail::ZstdFrameState state;
-
-    HostHarness()
-        : huf(1u << cudec_detail::kZstdLiteralsMaxTableLog),
-          litlen(1u << cudec_detail::kZstdLitLenAccuracyLogMax),
-          matchlen(1u << cudec_detail::kZstdMatchLenAccuracyLogMax),
-          offset(1u << cudec_detail::kZstdOffsetAccuracyLogMax),
-          literals(cudec_detail::kZstdBlockSizeCeiling),
-          /* The format's own ceiling on a block's sequence count, so the
-           * loop's storage rung is never the one that fires and the classes
-           * being compared are the ones this test is about. */
-          sequences(kHostSequenceCapacity),
-          offsets(kHostSequenceCapacity),
-          destinations(kHostSequenceCapacity + 1) {
-        state.literals_table.cells = huf.data();
-        state.literals_table.capacity = static_cast<uint32_t>(huf.size());
-        state.litlen.cells = litlen.data();
-        state.litlen.capacity = static_cast<uint32_t>(litlen.size());
-        state.matchlen.cells = matchlen.data();
-        state.matchlen.capacity = static_cast<uint32_t>(matchlen.size());
-        state.offset.cells = offset.data();
-        state.offset.capacity = static_cast<uint32_t>(offset.size());
-        state.literals_scratch = &literals_scratch;
-        state.seq_scratch = &seq_scratch;
-        state.literals = literals.data();
-        state.literals_capacity = literals.size();
-        state.sequences = sequences.data();
-        state.sequences_capacity = kHostSequenceCapacity;
-        state.offsets = offsets.data();
-        state.offsets_capacity = kHostSequenceCapacity;
-        state.destinations = destinations.data();
-        state.destinations_capacity = kHostSequenceCapacity + 1;
-        cudec_detail::ZstdFrameStateInit(&state);
-    }
-};
-
-/* The whole-frame host path, the same three steps tests/zstd_twin_driver.h
- * walks: the frame header, the block loop, and the content checksum. */
-cudec_status HostDecode(const Bytes& frame, size_t capacity, Bytes* out) {
-    HostHarness harness;
-    cudec_detail::ZstdFrameHeader header;
-    cudec_detail::ZstdFrameReject frame_rung =
-        cudec_detail::kZstdFrameRejectNone;
-    cudec_status status = cudec_detail::ZstdParseFrameHeader(
-        frame.data(), frame.size(), &header, &frame_rung);
-    if (status != CUDEC_OK) {
-        return status;
-    }
-    if (header.frame_content_size > capacity) {
-        return CUDEC_ERR_OUTPUT_TOO_SMALL;
-    }
-    out->assign(capacity, 0);
-    uint64_t produced = 0;
-    uint64_t consumed = 0;
-    cudec_detail::ZstdBlocksReport report;
-    cudec_detail::ZstdBlocksReject blocks_rung =
-        cudec_detail::kZstdBlocksRejectNone;
-    status = cudec_detail::ZstdDecodeBlocks(
-        frame.data() + header.header_size, frame.size() - header.header_size,
-        &header, &harness.state, out->data(), header.frame_content_size,
-        &produced, &consumed, &report, &blocks_rung);
-    if (status != CUDEC_OK) {
-        return status;
-    }
-    uint64_t pos = header.header_size + consumed;
-    if (header.content_checksum) {
-        const uint64_t digest =
-            cudec_detail::Xxh64(out->data(), static_cast<size_t>(produced));
-        if (cudec_detail::ZstdVerifyContentChecksum(frame.data() + pos,
-                                                    frame.size() - pos, digest,
-                                                    &frame_rung) != CUDEC_OK) {
-            return CUDEC_ERR_CORRUPT_INPUT;
-        }
-        pos += 4;
-    }
-    if (pos != frame.size()) {
-        return CUDEC_ERR_CORRUPT_INPUT;
-    }
-    out->resize(static_cast<size_t>(produced));
-    return CUDEC_OK;
-}
-
 /* A single-segment frame header: Frame_Content_Size present and one byte
  * wide, which is what puts the frame inside the accepted envelope and makes
  * the window the content size. */
@@ -545,7 +447,8 @@ int RunRejectParity() {
     for (size_t i = 0; i < cases.size(); i++) {
         Bytes host_out;
         const cudec_status want =
-            HostDecode(cases[i].frame, cases[i].capacity, &host_out);
+            cudec_test::HostDecodeFrame(cases[i].frame, cases[i].capacity,
+                                        &host_out);
         REQUIRE_CTX(want != CUDEC_OK,
                     "%s: the host twin ACCEPTED a frame this case is built to "
                     "have refused, so the case proves nothing",
