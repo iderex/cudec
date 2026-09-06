@@ -591,6 +591,122 @@ int main() {
         CoverRung(rung);
     }
 
+    /* ---- Step 5: the spelling boundary, and the eight bytes that hang on one
+     * byte (issue #461).
+     *
+     * RFC 8878 section 4.2.1 splits the Huffman_Tree_Description's header byte
+     * at 128. At or above it the byte declares `header - 127` weights packed
+     * two to a byte, so the description is 1 + ceil((header - 127) / 2) bytes.
+     * Below it the byte IS the byte count of an FSE-compressed weight stream,
+     * so the description is 1 + header bytes. Nothing else in the description
+     * says how long it is.
+     *
+     * WHY THAT MATTERS ONE LAYER UP AND IS ASSERTED HERE. The description's
+     * consumed length is what fixes where a Compressed literals section's four
+     * streams begin. So a single flipped bit in this byte moves every stream,
+     * and a decoder that read the description generously would go on to decode
+     * out of bytes that are not streams. The two readings of one byte are
+     * asserted side by side rather than left as prose.
+     *
+     * WHAT THIS IS NOT, AND THE NAME THAT MISLEADS. The #461 mutation is called
+     * `huffman-description-header`, so this looks like the place that holds its
+     * instance, and it is not. That mutation is guarded in
+     * tests/zstd_corpus.cpp on `literals_payload_size != 0`, which is set for a
+     * Treeless section too, and on the fixture it fires on it lands on one - a
+     * Treeless section carries no tree description at all, and the byte it
+     * moves is the first size in the Jump_Table. The instance is held by the
+     * jump-table case in tests/zstd_literals_twin.cpp. What is held HERE is the
+     * neighbouring clause, unreached by any corpus mutation, which is why it is
+     * written by hand: the corpus emits only the FSE spelling at these sizes.
+     *
+     * The numbers are chosen to be the ones a reader of #461 will be carrying:
+     * 0x91 is the direct spelling of eighteen weights, ten bytes; 0x11 is an
+     * FSE spelling of seventeen compressed bytes, eighteen bytes. Eight apart,
+     * from one bit. */
+    {
+        /* Eighteen written weights: sixteen of one and two of three. They
+         * spend 16 * 2^0 + 2 * 2^2 = 24 of a 32-cell table, so the depth is
+         * five, the remainder is eight, and the implied nineteenth weight is
+         * four. Hand-computed, so the expectation is not the thing under
+         * test, and the deepest rank is populated because sixteen weights of
+         * one sit in it. */
+        Weights eighteen(16, 1);
+        eighteen.push_back(3);
+        eighteen.push_back(3);
+        REQUIRE(eighteen.size() == 18);
+
+        const Bytes direct = EncodeDirect(eighteen);
+        REQUIRE(direct.size() == 10);
+        REQUIRE(direct[0] == 0x91);
+        REQUIRE(ParityHolds(direct.data(), direct.size(), "spelling-direct"));
+
+        ZstdHufWeightScratch scratch;
+        Weights weights(kZstdHufMaxSymbolValue + 1, 0);
+        unsigned count = 0;
+        unsigned log = 0;
+        uint64_t consumed = 0;
+        ZstdHufReject rung = cudec_detail::kZstdHufRejectNone;
+        REQUIRE(ZstdHufReadWeights(direct.data(), direct.size(),
+                                   kZstdHufMaxSymbolValue + 1,
+                                   kZstdHufMaxTableLog, &scratch,
+                                   weights.data(), &count, &log, &consumed,
+                                   &rung) == CUDEC_OK);
+        REQUIRE(count == 19);
+        REQUIRE(log == 5);
+        REQUIRE(weights[18] == 4);
+        /* The whole point: ten, and it came from the header byte alone. */
+        REQUIRE(consumed == 10);
+
+        /* One bit down in that byte and the same ten bytes are an FSE spelling
+         * declaring seventeen compressed bytes behind it. The unit does not
+         * have them, so it refuses as truncated - and the refusal is the proof
+         * that it asked for eighteen bytes where the direct reading asked for
+         * ten. A decoder that had read this description as ten bytes long
+         * would have gone on to read four streams starting eight bytes too
+         * early. */
+        Bytes fse = direct;
+        fse[0] = 0x11;
+        REQUIRE(fse[0] == (direct[0] & 0x7Fu));
+        count = 0;
+        log = 0;
+        consumed = 0;
+        rung = cudec_detail::kZstdHufRejectNone;
+        REQUIRE(ZstdHufReadWeights(fse.data(), fse.size(),
+                                   kZstdHufMaxSymbolValue + 1,
+                                   kZstdHufMaxTableLog, &scratch,
+                                   weights.data(), &count, &log, &consumed,
+                                   &rung) != CUDEC_OK);
+        REQUIRE(rung == cudec_detail::kZstdHufRejectDescriptionTruncated);
+        REQUIRE(consumed == 0);
+        CoverRung(rung);
+
+        /* THE RUNG DOES NOT SEPARATE THE LENGTH FROM THE CONTENTS ON THE FSE
+         * ARM, AND THAT IS ASSERTED RATHER THAN LEFT TO BE ASSUMED. Padding
+         * the same bytes out to the eighteen the header asks for gets past the
+         * length check and then fails inside the FSE weight decode - which
+         * reports the SAME rung, because src/zstd_huf.h spends
+         * DescriptionTruncated on the table read, the table build and the bit
+         * reader as well. So the refusal above is evidence that the unit
+         * refused, and the CONSUMED LENGTH above it - ten against the
+         * eighteen this header asks for - is the evidence about where the
+         * streams would begin. A reader who took the rung for the length
+         * check alone would be reading more out of it than it carries. */
+        Bytes padded = fse;
+        padded.resize(18, 0);
+        count = 0;
+        log = 0;
+        consumed = 0;
+        rung = cudec_detail::kZstdHufRejectNone;
+        REQUIRE(ZstdHufReadWeights(padded.data(), padded.size(),
+                                   kZstdHufMaxSymbolValue + 1,
+                                   kZstdHufMaxTableLog, &scratch,
+                                   weights.data(), &count, &log, &consumed,
+                                   &rung) != CUDEC_OK);
+        REQUIRE(rung == cudec_detail::kZstdHufRejectDescriptionTruncated);
+        REQUIRE(consumed == 0);
+        CoverRung(rung);
+    }
+
     /* Every rung the unit can return has a negative written to reach it. A rung
      * added later with nothing behind it reds here rather than shipping as
      * untested refusal. */

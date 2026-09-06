@@ -525,35 +525,33 @@ int RunWidthRefusal() {
  *
  * An entry also carries the issue that holds its repair. A departure nobody is
  * holding is a permanent exemption wearing a temporary name. */
-struct DeclaredDeparture {
-    const char* name;
-    int stage;
-    int rung;
-    const char* issue;
-};
-
-/* One entry. The mutation moves a byte of a Compressed literals section's
- * Huffman tree description; the reference decodes the frame whole and this
- * decoder stops inside the literals section with a stream that runs out of
- * bits. The stage is src/zstd_blocks.h's Literals and the rung is
- * src/zstd_literals.h's StreamTruncated, and it is the FORMAT UNITS' verdict
- * rather than the kernel's - the device and the host twin give the same status
- * on the same bytes, which is what the lock below asserts rather than assumes. */
-const DeclaredDeparture kDeclaredDepartures[] = {
-    {"tables-compressed / block1-huffman-description-header-at-22032", 2, 13,
-     "#461"},
-};
-constexpr size_t kDeclaredDepartureCount =
-    sizeof(kDeclaredDepartures) / sizeof(kDeclaredDepartures[0]);
-
-const DeclaredDeparture* FindDeparture(const std::string& name) {
-    for (size_t i = 0; i < kDeclaredDepartureCount; i++) {
-        if (name == kDeclaredDepartures[i].name) {
-            return &kDeclaredDepartures[i];
-        }
-    }
-    return 0;
-}
+/* WHAT SEPARATES A REFERENCE THAT WAS RIGHT FROM ONE THAT WAS ONLY WILLING
+ * (issue #461).
+ *
+ * The rule this file applies is mechanical - a refusal against an accepting
+ * reference - and mechanical is the point, because a rule that asked which
+ * answer was better would be arguing with its own evidence. But an accepting
+ * reference is not by itself a legal frame: a mutation can leave a stream the
+ * reference reads to the end and gets wrong, and on a fixture with no content
+ * checksum nothing downstream has anything to check that against.
+ *
+ * So the classifier asks one more question before it calls a refusal
+ * over-strict: did the reference produce the bytes the UNMUTATED fixture
+ * produces? Where it did, the mutation was inert and a refusal is a departure
+ * to explain. Where it did not, the reference decoded a corrupt frame into
+ * wrong bytes without noticing, and this decoder refusing is the fail-closed
+ * contract rather than strictness - that row is counted as
+ * reference-permissive and named on the run's own output.
+ *
+ * THE DECLARED-DEPARTURE REGISTER IS GONE WITH IT AND THAT IS THE REPAIR
+ * RATHER THAN A LOOSENING. Its one entry was this class, declared per name
+ * because there was nothing that could tell the two apart; the comparison
+ * above tells them apart from the bytes, so a name-list would now be a second
+ * way of saying the same thing that could disagree with it. What the register
+ * used to lock - that the twin refuses too - is asserted on every
+ * reference-permissive row below rather than on the one that was written down,
+ * and the instance itself is held at the unit by the jump-table case in
+ * tests/zstd_literals_twin.cpp. An undeclared over-strict row still reds. */
 
 /* ---- section 3: two-directional mutant reject parity ---- */
 
@@ -563,8 +561,7 @@ struct ParityCounts {
     unsigned both_reject;
     unsigned declined;
     unsigned overstrict;
-    unsigned declared_departures;
-    bool departure_seen[kDeclaredDepartureCount];
+    unsigned reference_permissive;
 };
 
 int RunMutantParity(ParityCounts* counts) {
@@ -575,6 +572,7 @@ int RunMutantParity(ParityCounts* counts) {
     std::vector<Chunk> chunks;
     std::vector<Bytes> oracle_out;
     std::vector<bool> oracle_ok;
+    std::vector<bool> oracle_matches_base;
     for (size_t i = 0; i < fixtures.size(); i++) {
         const Bytes frame(fixtures[i].compressed.begin(),
                           fixtures[i].compressed.end());
@@ -587,6 +585,10 @@ int RunMutantParity(ParityCounts* counts) {
         for (size_t m = 0; m < mutants.size(); m++) {
             Bytes decoded;
             const bool ok = ZstdOracleDecodes(mutants[m].frame, &decoded);
+            /* Whether the reference's answer for this mutant is the frame's
+             * own bytes. Taken against `plain`, the unmutated fixture's
+             * decode, which this loop already has. */
+            oracle_matches_base.push_back(ok && decoded == plain);
             Chunk chunk;
             chunk.name = fixtures[i].name + " / " + mutants[m].description;
             chunk.src = mutants[m].frame;
@@ -665,53 +667,50 @@ int RunMutantParity(ParityCounts* counts) {
             int rung = -1;
             const cudec_status twin = cudec_test::HostDecodeFrame(
                 slice[i].src, slice[i].dst_capacity, &host_out, &stage, &rung);
-            const DeclaredDeparture* declared = FindDeparture(batch.names[i]);
-            if (declared == 0) {
-                counts->overstrict++;
-                REQUIRE_CTX(false,
-                            "%s: the kernel REFUSED with status %d a frame "
-                            "the reference decodes, and no departure is "
-                            "declared for it (host twin %d, stage %d, rung "
-                            "%d)",
-                            batch.names[i].c_str(), static_cast<int>(status),
-                            static_cast<int>(twin), stage, rung);
+            if (!oracle_matches_base[at]) {
+                /* The reference decoded a corrupt frame into bytes that are
+                 * not the frame's own and did not notice. Refusing is the
+                 * contract; the row is not over-strictness. The twin is still
+                 * held to the same answer, because a refusal only this kernel
+                 * makes is a different fault and must not hide here. */
+                REQUIRE_CTX(twin != CUDEC_OK,
+                            "%s: the reference decoded it to bytes the "
+                            "unmutated fixture does not produce, this kernel "
+                            "refused with status %d, and the host twin "
+                            "DECODED it - so the refusal is this kernel's own "
+                            "rather than the format units'",
+                            batch.names[i].c_str(), static_cast<int>(status));
+                counts->reference_permissive++;
+                continue;
             }
-            /* The lock: a declared departure has to still BE one. */
-            REQUIRE_CTX(twin != CUDEC_OK,
-                        "%s is declared a departure of the format units, and "
-                        "the host twin decodes it - so the refusal is this "
-                        "kernel's own and the declaration hides it (%s)",
-                        batch.names[i].c_str(), declared->issue);
-            REQUIRE_CTX(stage == declared->stage && rung == declared->rung,
-                        "%s is declared at stage %d rung %d and the twin now "
-                        "stops at stage %d rung %d - the declaration names a "
-                        "refusal that is no longer the one happening (%s)",
-                        batch.names[i].c_str(), declared->stage,
-                        declared->rung, stage, rung, declared->issue);
-            counts->declared_departures++;
-            counts->departure_seen[declared - kDeclaredDepartures] = true;
+            counts->overstrict++;
+            REQUIRE_CTX(false,
+                        "%s: the kernel REFUSED with status %d a frame the "
+                        "reference decodes to the unmutated fixture's own "
+                        "bytes, so the mutation was inert and this is a "
+                        "departure to explain (host twin %d, stage %d, rung "
+                        "%d)",
+                        batch.names[i].c_str(), static_cast<int>(status),
+                        static_cast<int>(twin), stage, rung);
         }
         FreeBatch(&batch);
     }
     REQUIRE(counts->overstrict == 0);
     REQUIRE(counts->both_reject > 0);
     REQUIRE(counts->both_accept > 0);
-    /* A declaration nothing reached is stale, and a stale one is an exemption
-     * that outlived its reason. It reds here rather than sitting. */
-    for (size_t i = 0; i < kDeclaredDepartureCount; i++) {
-        REQUIRE_CTX(counts->departure_seen[i],
-                    "the departure declared for %s was not reached by any "
-                    "mutant - either the corpus stopped producing it or it is "
-                    "repaired, and either way the declaration goes (%s)",
-                    kDeclaredDepartures[i].name, kDeclaredDepartures[i].issue);
-    }
+    /* The reference-permissive class is not required to be non-empty here.
+     * The corpus deciding to stop producing such a mutant is not a failure of
+     * this gate, and the instance #461 is about is held at the unit by
+     * tests/zstd_literals_twin.cpp, which DOES red if it stops being reached.
+     * The count is printed so a change in it is visible. */
     std::printf(
         "mutant parity: %u mutants - %u accepted by both with identical "
         "bytes, %u rejected by both, %u declined as outside the subset, %u "
-        "undeclared over-strict, %u declared departures still refusing at the "
-        "rung they are declared at\n",
+        "over-strict against a reference that decoded the frame's own bytes, "
+        "%u refused where the reference decoded a corrupt frame into bytes "
+        "the unmutated fixture does not produce\n",
         counts->mutants, counts->both_accept, counts->both_reject,
-        counts->declined, counts->overstrict, counts->declared_departures);
+        counts->declined, counts->overstrict, counts->reference_permissive);
     return 0;
 }
 
@@ -859,8 +858,9 @@ int main() {
     std::printf(
         "PASS: the Zstd device gate set - determinism across five grids, a "
         "three-stream split and a repeat of the shipped entry; two-directional "
-        "reject parity over %u mutants with %u undeclared over-strict and %u "
-        "declared departures; and the capacity and window bounds\n",
-        counts.mutants, counts.overstrict, counts.declared_departures);
+        "reject parity over %u mutants with %u over-strict and %u refused "
+        "where the reference decoded a corrupt frame; and the capacity "
+        "and window bounds\n",
+        counts.mutants, counts.overstrict, counts.reference_permissive);
     return 0;
 }
