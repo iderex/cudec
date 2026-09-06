@@ -34,11 +34,15 @@ typedef enum cudec_status {
     /* An API entry point or decode path declared here but not implemented
      * in this build. It is what a declared-but-unbuilt entry answers a
      * batch it has already accepted, so the freeze on that entry's symbol
-     * and signature never depends on a build configuration:
-     * cudec_zstd_decompress_batch returns it today, and the value is fixed
-     * so a caller's switch stays exhaustive across the build that stops
-     * returning it - which cudec_gdeflate_decompress_batch did when its
-     * kernel landed, with the symbol and every reject class unmoved. */
+     * and signature never depends on a build configuration.
+     *
+     * NO ENTRY RETURNS IT TODAY, and the value stays where it is rather than
+     * being reclaimed. Both entries that ever answered it -
+     * cudec_gdeflate_decompress_batch and then cudec_zstd_decompress_batch -
+     * stopped when their kernels landed, with the symbol and every reject
+     * class unmoved, which is what the freeze was for. A caller's switch
+     * stays exhaustive across that change only because the value is
+     * fixed. */
     CUDEC_ERR_NOT_IMPLEMENTED = 5,
     /* A well-formed frame that uses a feature cudec does not decode, or a
      * legal frame type it declines (block-linked mode, a dictionary id, a

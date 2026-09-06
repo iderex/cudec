@@ -49,6 +49,22 @@
  * what that costs is a measurement rather than a claim - #231 records the
  * first baselines and #235 to #239 are the levers that would widen it.
  *
+ * EVERY THREAD-0 SECTION IS PRECEDED BY A BARRIER, AND THAT IS A RULE RATHER
+ * THAN A HABIT. The block's control flow is decided on flags in shared memory
+ * that thread 0 writes and all 128 threads read, so a flag read after the
+ * barrier that published it is still racing the NEXT write of it: thread 0 is
+ * free to run ahead the moment a barrier releases, and a lagging warp then
+ * reads the following block's `last_block` or the following call's `status`.
+ * What that produces is not a wrong byte but a SPLIT BLOCK - some warps break
+ * out of the loop or return while the others go on - and from there the
+ * barriers below are reached by a subset of the block. Measured on this
+ * kernel before the rule was applied: a legal two-block frame answered
+ * CUDEC_OK with bytes_written set and 380 of its 1024 bytes never written by
+ * anybody, because three of four warps had left. The barrier in front of each
+ * thread-0 section is what stops the writer from moving until every reader is
+ * done with the previous value, and tests/CMakeLists.txt refuses a section in
+ * this file that does not have one.
+ *
  * FAIL-CLOSED, WITH THE BOUNDS THE UNITS ALREADY CARRY. Every write is
  * bounded before it happens by the frame's declared content size, which is
  * bounded by the caller's capacity before the first block runs. On any
@@ -409,6 +425,7 @@ __device__ inline void ZstdDecodeFrameDevice(ZstdFrameShared* frame,
                                              const unsigned char* src,
                                              uint64_t size, unsigned char* dst,
                                              uint64_t capacity) {
+    __syncthreads();
     if (threadIdx.x == 0) {
         ZstdFrameReject frame_rung = kZstdFrameRejectNone;
         frame->produced = 0;
@@ -442,6 +459,7 @@ __device__ inline void ZstdDecodeFrameDevice(ZstdFrameShared* frame,
      * retires. */
     const uint64_t fuel = size / 3 + 1;
     for (uint64_t step = 0; step < fuel; step++) {
+        __syncthreads();
         if (threadIdx.x == 0) {
             ZstdBlockHeader block;
             ZstdFrameReject frame_rung = kZstdFrameRejectNone;
@@ -484,6 +502,7 @@ __device__ inline void ZstdDecodeFrameDevice(ZstdFrameShared* frame,
         }
 
         if (frame->compressed) {
+            __syncthreads();
             if (threadIdx.x == 0) {
                 frame->status = ZstdDecodeCompressedBlockDevice(
                     frame, src + frame->pos + 3, frame->body_size, dst,
@@ -502,7 +521,6 @@ __device__ inline void ZstdDecodeFrameDevice(ZstdFrameShared* frame,
                           frame->copy_is_rle);
         }
         __syncthreads();
-
         if (threadIdx.x == 0) {
             frame->pos += static_cast<uint64_t>(3) + frame->body_size;
         }
@@ -512,6 +530,7 @@ __device__ inline void ZstdDecodeFrameDevice(ZstdFrameShared* frame,
         }
     }
 
+    __syncthreads();
     if (threadIdx.x == 0) {
         if (!frame->last_block) {
             /* The fuel ran out, which the bound above puts beyond every
@@ -565,6 +584,7 @@ __global__ void __launch_bounds__(kZstdBlockThreads)
         const unsigned char* src =
             static_cast<const unsigned char*>(src_ptrs[chunk]);
         unsigned char* dst = static_cast<unsigned char*>(dst_ptrs[chunk]);
+        __syncthreads();
         if (threadIdx.x == 0) {
             frame.state.literals_table.cells = frame.huf_cells;
             frame.state.literals_table.capacity = kZstdHufTableCells;
@@ -586,6 +606,7 @@ __global__ void __launch_bounds__(kZstdBlockThreads)
         ZstdDecodeFrameDevice(&frame, src, src_sizes[chunk], dst,
                               dst_caps[chunk]);
 
+        __syncthreads();
         if (threadIdx.x == 0) {
             results[chunk].status = frame.status;
             results[chunk].reserved = 0;

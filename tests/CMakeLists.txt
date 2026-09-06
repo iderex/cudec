@@ -3123,6 +3123,156 @@ foreach(_exempt IN LISTS _loop_rule_exempt)
   endif()
 endforeach()
 
+# Every thread-0 section in the Zstd kernel is preceded by a block barrier
+# (issue #203).
+#
+# WHAT IT REFUSES AND WHY IT IS A RULE RATHER THAN A HABIT. src/zstd_decode.cuh
+# decides the whole block's control flow on flags in shared memory that thread 0
+# writes and all 128 threads read - the block's status, whether it is a
+# Compressed block, whether it was the last one. A flag read after the barrier
+# that published it is STILL racing the next write of it: a barrier releases
+# every thread at once, thread 0 is free to run ahead into the following
+# section, and a lagging warp then reads the following block's value. What that
+# produces is not a wrong byte, it is a SPLIT BLOCK - some warps break out of
+# the loop or return while the others carry on - and every barrier after that
+# is reached by a subset of the block.
+#
+# It was measured on this kernel before the rule existed: a legal two-block
+# frame came back CUDEC_OK with bytes_written set and 380 of its 1024 bytes
+# never written by anybody, because three of four warps had left the loop an
+# iteration early. A second instance leaked across chunks, so a hostile frame
+# corrupted an honest one sharing its block and the honest one was still
+# reported as a success.
+#
+# THE ORACLE DIFF CANNOT SEE THIS AND NEITHER CAN A SECOND RUN OF IT. The test
+# in tests/zstd_device.cu asserts on the schedule the hardware happened to give,
+# and the schedule that exposes the race is legal but rare; racecheck, which
+# would see it directly, cannot attach to a device on this host (#127, #258).
+# So the guard is over the SOURCE - the barrier in front of each thread-0
+# section is what stops the writer moving until every reader is done with the
+# previous value, and its absence is decidable by reading the file.
+#
+# WHAT IT DOES NOT CATCH, said rather than left to be discovered. It is a
+# textual rule over one file: it counts thread-0 sections and counts the ones
+# whose immediately preceding line is a barrier, and a mismatch is the refusal.
+# It says nothing about a shared flag read and rewritten inside a single
+# section, nothing about the other kernels, and nothing about whether the
+# barriers that ARE there are the right ones. It is a floor under one defect
+# class, not a proof of barrier discipline.
+function(cudec_check_thread_zero_barriers path out_violations)
+  set(_violations "")
+  if(NOT EXISTS "${path}")
+    string(APPEND _violations
+           "  ${path}: the file this rule is written against does not exist\n")
+    set(${out_violations} "${_violations}" PARENT_SCOPE)
+    return()
+  endif()
+  file(READ "${path}" _text)
+  # The semicolon is protected for the reason cudec_scan_source protects it:
+  # it separates list elements, so a match carrying one would be counted twice
+  # by list(LENGTH) and the two counts below would stop meaning what they say.
+  # The placeholder is a control byte, which no source in this tree carries.
+  string(ASCII 2 _tok_semi)
+  if(_text MATCHES "${_tok_semi}")
+    string(APPEND _violations
+           "  ${path}: a control byte (0x02) in a source read as text - this "
+           "check cannot tell one from its own line markers, so the file is "
+           "refused rather than scanned\n")
+    set(${out_violations} "${_violations}" PARENT_SCOPE)
+    return()
+  endif()
+  string(REPLACE "\r\n" "\n" _text "${_text}")
+  string(REPLACE ";" "${_tok_semi}" _text "${_text}")
+  set(_section "if[ \t]*\\([ \t]*threadIdx\\.x[ \t]*==[ \t]*0[ \t]*\\)[ \t]*{")
+  set(_barrier "__syncthreads\\([ \t]*\\)[ \t]*${_tok_semi}[ \t]*\n[ \t]*")
+  string(REGEX MATCHALL "${_section}" _all "${_text}")
+  string(REGEX MATCHALL "${_barrier}${_section}" _guarded "${_text}")
+  list(LENGTH _all _n_all)
+  list(LENGTH _guarded _n_guarded)
+  if(_n_all EQUAL 0)
+    # A rule that matched nothing reports the same silence as a rule that
+    # matched everything and was satisfied, which is the failure this whole
+    # file's probes exist against.
+    string(APPEND _violations
+           "  ${path}: no `if (threadIdx.x == 0) {` section found at all - "
+           "this rule cannot be vacuously satisfied, so it refuses rather "
+           "than passing over a file it did not understand\n")
+  elseif(NOT _n_all EQUAL _n_guarded)
+    math(EXPR _missing "${_n_all} - ${_n_guarded}")
+    string(APPEND _violations
+           "  ${path}: ${_missing} of ${_n_all} `if (threadIdx.x == 0) {` "
+           "sections are not immediately preceded by `__syncthreads();` - "
+           "thread 0 may reach the write before every thread has read the "
+           "previous value, which splits the block (issue #203)\n")
+  endif()
+  set(${out_violations} "${_violations}" PARENT_SCOPE)
+endfunction()
+
+# The refusal proven to bite, in both directions, on files this file writes:
+# one section with its barrier must come back silent, the same section without
+# it must be refused by name, and a file with no section at all must be refused
+# rather than passed.
+set(_barrier_probe_dir ${CMAKE_CURRENT_BINARY_DIR}/probes/zstd_barriers)
+file(MAKE_DIRECTORY ${_barrier_probe_dir})
+file(
+  WRITE ${_barrier_probe_dir}/guarded.cu
+  "__global__ void probe(int* p) {\n"
+  "    __shared__ int flag;\n"
+  "    __syncthreads();\n"
+  "    if (threadIdx.x == 0) {\n"
+  "        flag = p[0];\n"
+  "    }\n"
+  "    __syncthreads();\n"
+  "    p[1] = flag;\n"
+  "}\n")
+file(
+  WRITE ${_barrier_probe_dir}/unguarded.cu
+  "__global__ void probe(int* p) {\n"
+  "    __shared__ int flag;\n"
+  "    if (threadIdx.x == 0) {\n"
+  "        flag = p[0];\n"
+  "    }\n"
+  "    __syncthreads();\n"
+  "    p[1] = flag;\n"
+  "}\n")
+file(WRITE ${_barrier_probe_dir}/empty.cu
+     "__global__ void probe(int* p) { p[0] = 0; }\n")
+cudec_check_thread_zero_barriers(${_barrier_probe_dir}/guarded.cu
+                                 _barrier_probe_guarded)
+if(_barrier_probe_guarded)
+  message(
+    FATAL_ERROR
+      "the thread-0 barrier rule rejects a compliant probe (issue #203). It "
+      "reported:\n${_barrier_probe_guarded}")
+endif()
+cudec_check_thread_zero_barriers(${_barrier_probe_dir}/unguarded.cu
+                                 _barrier_probe_unguarded)
+string(FIND "${_barrier_probe_unguarded}" "1 of 1" _barrier_probe_found)
+if(_barrier_probe_found LESS 0)
+  message(
+    FATAL_ERROR
+      "the thread-0 barrier rule does not refuse a section with no barrier in "
+      "front of it, so it proves nothing about src/zstd_decode.cuh (issue "
+      "#203). It reported:\n${_barrier_probe_unguarded}")
+endif()
+cudec_check_thread_zero_barriers(${_barrier_probe_dir}/empty.cu
+                                 _barrier_probe_empty)
+string(FIND "${_barrier_probe_empty}" "vacuously" _barrier_probe_vacuous)
+if(_barrier_probe_vacuous LESS 0)
+  message(
+    FATAL_ERROR
+      "the thread-0 barrier rule passes a file carrying no section at all, so "
+      "a rename would silently retire it (issue #203). It reported:\n"
+      "${_barrier_probe_empty}")
+endif()
+
+cudec_check_thread_zero_barriers(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src/zstd_decode.cuh _zstd_barrier_violations)
+if(_zstd_barrier_violations)
+  message(FATAL_ERROR "thread-0 sections without a barrier in front of them "
+                      "(issue #203):\n${_zstd_barrier_violations}")
+endif()
+
 set(_structural_violations "")
 foreach(_source IN LISTS _all_sources)
   set(_check_loops TRUE)
