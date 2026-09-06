@@ -503,6 +503,15 @@ if(NOT CUDEC_SANITIZE)
   target_compile_options(cudec_zstd_corpus PRIVATE -O2)
 endif()
 cudec_add_test(zstd_device SOURCES zstd_device.cu GPU LIBS cudec_zstd_corpus)
+# The standing device gate set for the Zstd path (issue #399): determinism
+# across launch geometries and concurrent streams, two-directional mutant
+# reject parity against the reference, and the capacity and window bounds.
+# Every decode in it is fenced with an event and a wall-clock deadline, so a
+# frame that held a launch is reported rather than waited on. GPU-labelled and
+# taking the corpus through the same library its neighbour above does, for the
+# reason that library carries.
+cudec_add_test(zstd_gate_gpu SOURCES zstd_gate_gpu.cu GPU LIBS
+               cudec_zstd_corpus)
 cudec_add_test(parser_twin SOURCES parser_twin.cpp LIBS cudec_test_fixtures)
 # The twin compiles the decoder core from src/ on the host - the
 # fail-closed ladder runs on the GPU-less CI runner (masterplan section 9,
