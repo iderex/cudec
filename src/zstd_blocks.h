@@ -94,8 +94,14 @@ enum ZstdBlocksReject {
     kZstdBlocksRejectContentPastCapacity,
     /* A Raw or RLE block would regenerate past what the declared content size
      * leaves. The compressed path reaches the same wall inside
-     * ZstdExecuteBlock, which is why only those two are named here. */
-    kZstdBlocksRejectBlockPastCapacity,
+     * ZstdExecuteBlock, which is why only those two are named here. CORRUPT
+     * rather than OUTPUT_TOO_SMALL, by the rule the Snappy entry of the header
+     * states and section 12.3 records for this format: once a frame has
+     * declared its own length, a block that runs past it is inconsistent
+     * rather than short of room, and a larger destination would not make it
+     * valid. The rung above is the one place the Zstd path answers
+     * OUTPUT_TOO_SMALL, and it fires before a byte is written. */
+    kZstdBlocksRejectBlockPastDeclaration,
     /* The frame ended having produced other than its declared content size.
      * Only the short direction reaches this: the long one is refused as it
      * happens, by the rung above and by the execution's own. */
@@ -238,7 +244,10 @@ CUDEC_HOST_DEVICE inline void ZstdBlocksStop(ZstdBlocksReport* report,
  * buffer, which is larger or equal. Handing the smaller of the two down is
  * what makes a block that regenerates past the declaration refuse here rather
  * than at the end of the frame, and the difference matters: at the end, the
- * bytes are already written. */
+ * bytes are already written. It is also what makes the execution's refusal
+ * of that bound a CORRUPT_INPUT answer rather than a capacity one - the
+ * caller's buffer was held against the declaration before the loop began,
+ * so what the execution refuses is the frame contradicting its own header. */
 CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeCompressedBlock(
     const unsigned char* body, uint64_t body_size,
     const ZstdFrameHeader* header, ZstdFrameState* state, uint64_t block_max,
@@ -474,8 +483,8 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdDecodeBlocks(
             const uint64_t regenerated = block.block_size;
             if (regenerated > declared - produced) {
                 ZstdBlocksStop(report, kZstdBlocksStageContentSize, 0);
-                return ZstdBlocksRefuse(kZstdBlocksRejectBlockPastCapacity,
-                                        CUDEC_ERR_OUTPUT_TOO_SMALL, reject);
+                return ZstdBlocksRefuse(kZstdBlocksRejectBlockPastDeclaration,
+                                        CUDEC_ERR_CORRUPT_INPUT, reject);
             }
             const bool raw = block.block_type == kZstdBlockTypeRaw;
             for (uint64_t index = 0; index < regenerated; index++) {

@@ -279,14 +279,18 @@ int RunHandBuiltFrames() {
     }
 
     /* Produced more than declared, refused as it happens rather than
-     * afterwards: at "afterwards" the bytes are already written. */
+     * afterwards: at "afterwards" the bytes are already written. THE CLASS IS
+     * CORRUPT_INPUT AND THE CAPACITY IS TWICE THE DECLARATION ON PURPOSE
+     * (#460): the frame has room to spare and is refused anyway, because
+     * what it passed is its own header and not the caller's buffer, and a
+     * caller told OUTPUT_TOO_SMALL here would retry with a larger one
+     * forever. */
     const Bytes half(content.begin(), content.begin() + 32);
     const Bytes long_frame = TwoRawFrame(40, half, half);
     REQUIRE(!ReferenceAccepts(long_frame, &reference));
-    rc = NegativeFrame("a raw block past the declared size", long_frame,
-                       kCapacity,
-                       cudec_detail::kZstdBlocksRejectBlockPastCapacity,
-                       CUDEC_ERR_OUTPUT_TOO_SMALL);
+    rc = NegativeFrame("a raw block past the declared size", long_frame, 80,
+                       cudec_detail::kZstdBlocksRejectBlockPastDeclaration,
+                       CUDEC_ERR_CORRUPT_INPUT);
     if (rc != 0) {
         return rc;
     }
@@ -295,12 +299,58 @@ int RunHandBuiltFrames() {
      * length rather than a body length - the one place those two differ. */
     const Bytes long_rle = TwoRleFrame(400, 0x5A, 250);
     REQUIRE(!ReferenceAccepts(long_rle, &reference));
-    rc = NegativeFrame("an RLE block past the declared size", long_rle,
-                       kCapacity,
-                       cudec_detail::kZstdBlocksRejectBlockPastCapacity,
-                       CUDEC_ERR_OUTPUT_TOO_SMALL);
+    rc = NegativeFrame("an RLE block past the declared size", long_rle, 800,
+                       cudec_detail::kZstdBlocksRejectBlockPastDeclaration,
+                       CUDEC_ERR_CORRUPT_INPUT);
     if (rc != 0) {
         return rc;
+    }
+
+    /* The same wall reached through a Compressed block, which meets it at
+     * the execution's bound rather than in the loop: a Raw block spends most
+     * of the declaration and an RLE literals section then regenerates more
+     * than is left, inside the block maximum the window implies. The loop
+     * reports no rung of its own for a refusal a unit made, so the report's
+     * stage and the unit's rung are what say where it stopped. Twice the
+     * declaration for capacity, as above. */
+    {
+        Bytes frame = FrameHeader(40);
+        const Bytes most(content.begin(), content.begin() + 35);
+        AppendBlockHeader(&frame, 35, 0, false);
+        frame.insert(frame.end(), most.begin(), most.end());
+        AppendBlockHeader(&frame, 3, 2, true);
+        frame.push_back(static_cast<unsigned char>(kZstdLiteralsRle | (30u << 3)));
+        frame.push_back('q');
+        frame.push_back(0x00);
+        REQUIRE(!ReferenceAccepts(frame, &reference));
+
+        Harness harness(kBlockMaximum, static_cast<uint32_t>(kBlockMaximum));
+        cudec_detail::ZstdFrameHeader header;
+        cudec_detail::ZstdFrameReject frame_rung =
+            cudec_detail::kZstdFrameRejectNone;
+        REQUIRE(cudec_detail::ZstdParseFrameHeader(frame.data(), frame.size(),
+                                                   &header,
+                                                   &frame_rung) == CUDEC_OK);
+        Bytes out(81, 0);
+        uint64_t produced = 0;
+        uint64_t consumed = 0;
+        cudec_detail::ZstdBlocksReport report;
+        ZstdBlocksReject rung = cudec_detail::kZstdBlocksRejectNone;
+        const cudec_status status = cudec_detail::ZstdDecodeBlocks(
+            frame.data() + header.header_size,
+            frame.size() - header.header_size, &header, &harness.state,
+            out.data(), 80, &produced, &consumed, &report, &rung);
+        REQUIRE_CTX(status == CUDEC_ERR_CORRUPT_INPUT,
+                    "a compressed block past the declared size: status %d",
+                    static_cast<int>(status));
+        REQUIRE(rung == cudec_detail::kZstdBlocksRejectNone);
+        REQUIRE_CTX(report.stage == cudec_detail::kZstdBlocksStageExecute &&
+                        report.rung ==
+                            cudec_detail::kZstdExecRejectBlockPastDeclaration,
+                    "a compressed block past the declared size: stopped at "
+                    "stage %d rung %d",
+                    static_cast<int>(report.stage), report.rung);
+        REQUIRE(produced == 0);
     }
 
     /* The frame declares more than the caller has room for. Refused before a

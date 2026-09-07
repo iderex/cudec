@@ -356,16 +356,65 @@ int RunRejectParity() {
         c.capacity = 20 + kCapacitySlack;
         cases.push_back(c);
     }
-    /* A Raw block declaring more than the frame has left. */
+    /* A Raw block larger than the block maximum the window implies. This
+     * case was named "raw block past the declaration" until #460's mutants
+     * showed it never reaches that rung: a single-segment frame's window IS
+     * its content size, so a ten-byte block in a four-byte frame is refused
+     * by the block header, on both residencies, before any bound of the
+     * loop's own is compared. The case stays, under its real name. */
     {
         Case c;
-        c.name = "raw block past the declaration";
+        c.name = "raw block past the block maximum";
         AppendSingleSegmentHeader(&c.frame, 4);
         AppendBlockHeader(&c.frame, 10, kZstdBlockRaw, true);
         for (unsigned i = 0; i < 10; i++) {
             c.frame.push_back(static_cast<unsigned char>('a' + i));
         }
         c.capacity = 64;
+        cases.push_back(c);
+    }
+    /* A Raw block past the declaration and INSIDE the block maximum, which
+     * takes two blocks: the first spends most of the declaration, the second
+     * is legal on its own and only their sum is not. This is the kernel's
+     * own Raw/RLE bound in the block loop, and the only case here that
+     * reaches it. */
+    {
+        Case c;
+        c.name = "raw block past the declaration, room to spare";
+        AppendSingleSegmentHeader(&c.frame, 40);
+        AppendBlockHeader(&c.frame, 35, kZstdBlockRaw, false);
+        for (unsigned i = 0; i < 35; i++) {
+            c.frame.push_back(static_cast<unsigned char>('a' + (i % 26u)));
+        }
+        AppendBlockHeader(&c.frame, 10, kZstdBlockRaw, true);
+        for (unsigned i = 0; i < 10; i++) {
+            c.frame.push_back(static_cast<unsigned char>('A' + i));
+        }
+        c.capacity = 80;
+        cases.push_back(c);
+    }
+    /* The first case again at EXACTLY twice the declaration, which is the
+     * shape #460 names: the destination would hold everything the blocks
+     * regenerate, and the frame is refused anyway because what it passed is
+     * its own header. Held to the host like every other case, and beside it
+     * the class is pinned by name, because this is the one answer on the
+     * list that a caller acts on differently - OUTPUT_TOO_SMALL would send
+     * it back with a larger buffer, and no buffer cures a frame that
+     * contradicts itself. */
+    {
+        Case c;
+        c.name = "compressed block past the declaration, room to spare";
+        AppendSingleSegmentHeader(&c.frame, 40);
+        AppendBlockHeader(&c.frame, 35, kZstdBlockRaw, false);
+        for (unsigned i = 0; i < 35; i++) {
+            c.frame.push_back(static_cast<unsigned char>('a' + (i % 26u)));
+        }
+        AppendBlockHeader(&c.frame, 3, kZstdBlockCompressed, true);
+        c.frame.push_back(
+            static_cast<unsigned char>(kZstdLiteralsRle | (30u << 3)));
+        c.frame.push_back('q');
+        c.frame.push_back(0x00);
+        c.capacity = 80;
         cases.push_back(c);
     }
     /* A frame that declares fewer bytes than its blocks produce is refused;
@@ -468,9 +517,35 @@ int RunRejectParity() {
          * and the contract's promise is bytes_written zero rather than an
          * untouched buffer. */
     }
-    /* The two neighbouring literals cases must not have answered the same,
-     * which is the whole reason they are both here. */
-    REQUIRE(results[0].status != results[1].status);
+    /* The two neighbouring literals cases answer the same class at the ABI
+     * since #460, and the host still tells them apart by where it stopped:
+     * the first at the execution's declaration bound, the second inside the
+     * literals unit at the block maximum. Asserting the host's stages differ
+     * is what keeps the pair meaningful - one field apart, two rungs - now
+     * that the status alone cannot. */
+    {
+        Bytes host_out;
+        int stage_first = -1;
+        int stage_second = -1;
+        int rung_first = -1;
+        int rung_second = -1;
+        cudec_test::HostDecodeFrame(cases[0].frame, cases[0].capacity,
+                                    &host_out, &stage_first, &rung_first);
+        cudec_test::HostDecodeFrame(cases[1].frame, cases[1].capacity,
+                                    &host_out, &stage_second, &rung_second);
+        REQUIRE_CTX(stage_first != stage_second,
+                    "the two literals cases stopped at the same host stage %d",
+                    stage_first);
+    }
+    /* The two room-to-spare cases are the decision itself, pinned by name:
+     * one for the block loop's Raw/RLE bound and one for the execution's. */
+    for (size_t i = 0; i < cases.size(); i++) {
+        if (std::strstr(cases[i].name, "room to spare") != 0) {
+            REQUIRE_CTX(results[i].status == CUDEC_ERR_CORRUPT_INPUT,
+                        "%s: status %d, want CORRUPT_INPUT", cases[i].name,
+                        static_cast<int>(results[i].status));
+        }
+    }
     std::printf(
         "reject parity: %llu refusals, each in the class the host twin gives, "
         "each reporting no bytes\n",
