@@ -1847,6 +1847,34 @@ this machine (`ERR_NVGPUCTRPERM`, a desktop driver setting), so the residency
 figures are the runtime's occupancy ceiling and never an achieved-occupancy
 count. Recorded in [docs/BENCHMARKS.md](BENCHMARKS.md).
 
+**M4 perf lever outcome (issue #204): the root-accelerator width stays at
+10/7, and no kernel code ships.** The layout this section settled has one
+free parameter, the width of the root accelerator in front of the
+fixed-footprint canonical decoder, and the two-level table 13.1 killed was
+not rebuilt to measure it: its footprint is input-chosen and stays refused.
+Four widths - 8/6, 9/6, the shipped 10/7 and 11/8 bits for the
+literal/length and distance roots - were built from one commit with the
+construction routine untouched, gated green on every GDeflate test, and
+swept A/B-interleaved twice over the #228 corpora on the same digests. The
+trade the issue predicted is real and its sign is right: on the header-bound
+worst case the narrowest root is 20% faster and the widest 19% slower, in the
+order of the fill size, and on asset-like's compressed levels the order is
+exactly reversed, with 11/8 about 20% faster and 8/6 14% slower. But the axis
+is the corpus and not the level - within each arm levels 1, 6 and 12 differ
+by a few percent and not monotonically, which is what the #206 census said
+in advance - and occupancy decides nothing on the round loop: the narrow arms
+reach the 32 resident warps per SM this section was sized for, at 64
+registers, and lose every compressed row; the wide arm falls to 16 and wins
+asset-like. Under the pre-registered rule no alternative passes, because the
+worst case is two corpora and each width regresses at least one of them
+beyond the run-to-run spread: the narrow roots lose worst-rounds by about 4%,
+the wide one loses both adversarial rows and the stored rows, where its 24544
+shared bytes halve the residency of a path that builds no table. The shipped
+width is the only one of the four that is the worst on no row. What the sweep
+leaves open, and does not take, is a width chosen per table build from the
+code-length histogram already in hand - a different lever with the wide arm's
+footprint. Recorded in [docs/BENCHMARKS.md](BENCHMARKS.md).
+
 ### 13.3 The validation ladder
 
 Every value read from the stream is checked before its first use as an
