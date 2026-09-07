@@ -258,32 +258,23 @@ __device__ inline cudec_status ZstdDecodeCompressedBlockDevice(
         return status;
     }
     const uint64_t literals_size = literals_header.regenerated_size;
-    /* THE BLOCK MAXIMUM IS COMPARED HERE AND NOT ONLY INSIDE THE UNIT THAT
-     * OWNS IT, AND THE REASON IS THE ORDER RATHER THAN DOUBT. ZstdDecodeLiterals
-     * makes this same comparison against the same ZstdLiteralsBlockMaximum
-     * value and refuses CORRUPT_INPUT, which is the class the host reports for
-     * such a block - but it cannot be asked until it has an address to decode
-     * into, and the address below only exists once the section fits in what
-     * the frame has left. So the two comparisons run in the host's order:
-     * a section larger than the format allows is malformed, and only a section
-     * the format allows but the declaration does not is the capacity answer
-     * below. The bound is derived once, at block_max, and compared twice. */
-    if (literals_size > block_max) {
-        return CUDEC_ERR_CORRUPT_INPUT;
-    }
     if (literals_size > remaining) {
         /* A block regenerates at least its own literals, so a literals
          * section larger than the frame has left to declare is a block whose
          * size passes the declaration. Refused before the address below is
          * formed, which is what keeps the subtraction from wrapping.
          *
-         * THE STATUS IS THE HOST'S, NOT THE ONE THE CONDITION SUGGESTS. The
-         * host reaches the same bytes through ZstdExecuteBlock's
-         * destination-too-small rung, which answers OUTPUT_TOO_SMALL, and
+         * THE STATUS IS THE HOST'S. The host reaches the same bytes through
+         * ZstdExecuteBlock's block-past-declaration rung, and
          * `plan.block_size >= literals_size` is what makes the two rungs the
-         * same statement. Answering CORRUPT_INPUT here would be the device
-         * and the twin giving different classes for one frame. */
-        return CUDEC_ERR_OUTPUT_TOO_SMALL;
+         * same statement: a frame whose blocks pass its own declaration is
+         * malformed, not short of room (section 12.3, #460). A section past
+         * the block maximum the window implies is refused by
+         * ZstdDecodeLiterals below in the same class, exactly where the host
+         * refuses it, so there is no order between the two bounds for this
+         * function to keep - which is why it no longer compares the block
+         * maximum itself. */
+        return CUDEC_ERR_CORRUPT_INPUT;
     }
     unsigned char* literals = dst + frame->produced + remaining - literals_size;
 
@@ -425,12 +416,14 @@ __device__ inline cudec_status ZstdDecodeCompressedBlockDevice(
              * caller-bug rung, documented as reachable by a wrong scan and
              * never by a stream, and handing the execution `remaining`
              * instead of the block's own size would otherwise let a hostile
-             * frame fire it - answering CORRUPT_INPUT where the host answers
-             * OUTPUT_TOO_SMALL, and mis-filing a stream rejection as a
-             * decoder bug in anything that triages by rung. */
+             * frame fire it - mis-filing a stream rejection as a decoder bug
+             * in anything that triages by rung. The class is the host's
+             * block-past-declaration answer, CORRUPT_INPUT (section 12.3):
+             * the bound being passed is the frame's own declaration, which
+             * no larger destination repairs. */
             if (carry.at > remaining ||
                 literals_size - carry.literals_used > remaining - carry.at) {
-                return CUDEC_ERR_OUTPUT_TOO_SMALL;
+                return CUDEC_ERR_CORRUPT_INPUT;
             }
 
             for (uint32_t index = 0; index < got; index++) {
@@ -467,7 +460,7 @@ __device__ inline cudec_status ZstdDecodeCompressedBlockDevice(
      * is the one for a block with no sequences at all, whose whole size is
      * its literals and which never enters the loop above. */
     if (plan.block_size > remaining) {
-        return CUDEC_ERR_OUTPUT_TOO_SMALL;
+        return CUDEC_ERR_CORRUPT_INPUT;
     }
     frame->copy_count = literals_size - plan.literals_used;
     frame->copy_src = literals + plan.literals_used;
@@ -539,10 +532,13 @@ __device__ inline void ZstdDecodeFrameDevice(ZstdFrameShared* frame,
                     /* Raw and RLE both regenerate their declared size and
                      * differ only in where the bytes come from. Bounded in
                      * the subtraction direction against what the declaration
-                     * leaves, so nothing can wrap. */
+                     * leaves, so nothing can wrap. The class is the host
+                     * loop's: a block past the frame's own declaration is
+                     * CORRUPT_INPUT, and the capacity answer was given once
+                     * above, from the header (section 12.3). */
                     const uint64_t regenerated = block.block_size;
                     if (regenerated > declared - frame->produced) {
-                        frame->status = CUDEC_ERR_OUTPUT_TOO_SMALL;
+                        frame->status = CUDEC_ERR_CORRUPT_INPUT;
                     } else {
                         frame->copy_count = regenerated;
                         frame->copy_is_rle =

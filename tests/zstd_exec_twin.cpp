@@ -43,7 +43,7 @@
 using cudec_detail::kZstdExecRejectBadRequest;
 using cudec_detail::kZstdExecRejectBlockTooLarge;
 using cudec_detail::kZstdExecRejectCount;
-using cudec_detail::kZstdExecRejectDestinationTooSmall;
+using cudec_detail::kZstdExecRejectBlockPastDeclaration;
 using cudec_detail::kZstdExecRejectLiteralsExhausted;
 using cudec_detail::kZstdExecRejectNone;
 using cudec_detail::kZstdExecRejectOffsetBeforeOutput;
@@ -189,8 +189,8 @@ TiledOutcome ExecuteTiled(const std::vector<ZstdSequence>& sequences,
 
     const uint64_t base = produced;
     if (base > dst->size() || out.plan.block_size > dst->size() - base) {
-        out.status = CUDEC_ERR_OUTPUT_TOO_SMALL;
-        out.rung = kZstdExecRejectDestinationTooSmall;
+        out.status = CUDEC_ERR_CORRUPT_INPUT;
+        out.rung = kZstdExecRejectBlockPastDeclaration;
         return out;
     }
     for (uint32_t index = 0; index < count; index++) {
@@ -629,14 +629,16 @@ int Negatives() {
         return 1;
     }
 
-    /* The destination does not hold the frame's output plus this block. Its
-     * status is OUTPUT_TOO_SMALL and not CORRUPT_INPUT: the bytes are good and
-     * the buffer is short, and a caller that cannot tell those apart cannot
-     * retry with a larger one. */
-    if (Refuses("destination-too-small", {Seq(3, 3)}, {3}, literals,
+    /* The frame's output plus this block passes the bound handed in. Its
+     * status is CORRUPT_INPUT and not OUTPUT_TOO_SMALL, because the bound
+     * every caller hands this unit is the frame's own declared content size
+     * and never the caller's buffer (section 12.3, #460): a block past it is
+     * the frame contradicting its header, and no larger destination cures
+     * that. The eight bytes here play the declaration. */
+    if (Refuses("block-past-declaration", {Seq(3, 3)}, {3}, literals,
                 cudec_detail::kZstdBlockSizeCeiling, kWideWindow, 8, 0,
-                kZstdExecRejectDestinationTooSmall,
-                CUDEC_ERR_OUTPUT_TOO_SMALL) != 0) {
+                kZstdExecRejectBlockPastDeclaration,
+                CUDEC_ERR_CORRUPT_INPUT) != 0) {
         return 1;
     }
 

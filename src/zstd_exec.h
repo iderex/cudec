@@ -113,11 +113,16 @@ enum ZstdExecReject {
     kZstdExecRejectOffsetPastWindow,
     /* A match reaching before the first byte the frame has produced. */
     kZstdExecRejectOffsetBeforeOutput,
-    /* The frame's output plus this block does not fit the destination. Its
-     * status is OUTPUT_TOO_SMALL and not CORRUPT_INPUT: the bytes may be
-     * perfectly good and the buffer merely short, and a caller that cannot
-     * tell those apart cannot retry. */
-    kZstdExecRejectDestinationTooSmall,
+    /* The frame's output plus this block passes the bound the caller handed
+     * in. Its status is CORRUPT_INPUT and not OUTPUT_TOO_SMALL, and the reason
+     * is what that bound IS: every caller of this unit hands it the frame's
+     * DECLARED content size, or what that declaration has left, never the
+     * caller's buffer - the buffer was held against the declaration once, at
+     * the frame preamble, and that comparison is the only OUTPUT_TOO_SMALL
+     * the Zstd path answers (section 12.3). So a block that reaches this rung
+     * contradicts its own frame header, and no larger destination repairs
+     * that; a caller told to retry with one would retry forever (#460). */
+    kZstdExecRejectBlockPastDeclaration,
     kZstdExecRejectCount
 };
 
@@ -408,9 +413,13 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdExecuteSequence(
  * here is the finished array, which is what lets every copy below be
  * independent of every other.
  *
- * `dst` is the frame's whole output and `*produced` the bytes of it earlier
- * blocks left, in and out: on success it advances by the block's size, and on
- * any refusal it is left exactly where it was. Bytes may have been written
+ * `dst` is the frame's whole output and `dst_capacity` is what the frame
+ * DECLARED it would regenerate, not the caller's buffer: the block loop hands
+ * the declaration down (src/zstd_blocks.h says why), so the bound refused
+ * below is the frame contradicting itself rather than a short destination.
+ * `*produced` is the bytes of it earlier blocks left, in and out: on success
+ * it advances by the block's size, and on any refusal it is left exactly
+ * where it was. Bytes may have been written
  * past it before a later sequence refused - a partial write is not a partial
  * success, and a caller that presented it as one would be reporting output it
  * has no reason to believe. */
@@ -433,8 +442,8 @@ CUDEC_HOST_DEVICE inline cudec_status ZstdExecuteBlock(
 
     const uint64_t base = *produced;
     if (base > dst_capacity || plan->block_size > dst_capacity - base) {
-        return ZstdExecRefuse(kZstdExecRejectDestinationTooSmall,
-                              CUDEC_ERR_OUTPUT_TOO_SMALL, reject);
+        return ZstdExecRefuse(kZstdExecRejectBlockPastDeclaration,
+                              CUDEC_ERR_CORRUPT_INPUT, reject);
     }
 
     uint64_t literal_at = 0;

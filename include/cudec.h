@@ -231,9 +231,17 @@ cudec_status cudec_gdeflate_decompress_batch(const void* const* d_src_ptrs,
  * can be retried elsewhere.
  *
  * Per frame, and isolated to that frame: those two statuses,
- * CUDEC_ERR_OUTPUT_TOO_SMALL when the decode would pass the supplied
- * capacity, bytes_written == 0 on any of them, and the destination contents
- * then unspecified but never presented as a valid decode.
+ * CUDEC_ERR_OUTPUT_TOO_SMALL when the frame's declared content size exceeds
+ * that chunk's d_dst_capacities entry - decided from the header, before a
+ * byte is written - bytes_written == 0 on any of them, and the destination
+ * contents then unspecified but never presented as a valid decode. The
+ * declared size is the same rule the Snappy entry states: it is checked
+ * against the capacity and never used to size anything, and a block that
+ * regenerates past what the frame itself declared reports
+ * CUDEC_ERR_CORRUPT_INPUT, because a frame contradicting its own header is
+ * malformed rather than short of room, and no larger destination makes it
+ * valid. A caller that retries CUDEC_ERR_OUTPUT_TOO_SMALL with a destination
+ * of the declared size therefore never sees it twice for one frame.
  *
  * A frame is decoded by one BLOCK rather than by one warp, and that is the
  * format rather than a tuning choice: a Zstd frame's entropy decode is

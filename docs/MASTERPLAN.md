@@ -1363,6 +1363,24 @@ oversized block and a failed checksum are `CORRUPT_INPUT`. Nothing in the
 subset is refused silently, and no refusal may leave partial output that a
 caller could read as a short decode.
 
+**Where `CUDEC_ERR_OUTPUT_TOO_SMALL` sits, decided (#460).** It fires in
+exactly one place on this path: `Frame_Content_Size` against the caller's
+capacity, at the frame preamble, before anything is written. Every later
+bound - a Raw or RLE block's size, a Compressed block's regenerated size, a
+literals section's regenerated size - is checked against what the
+_declaration_ has left, and passing it is `CORRUPT_INPUT`. That is the
+Snappy mapping under section 10 word for word, and for the same reason: a
+frame whose blocks regenerate past the size its own header declared has
+contradicted itself, no destination of any size repairs that, and a caller
+obeying the header would retry the capacity answer forever. The decision was
+open from the day #203 made the condition observable at the C ABI - the
+kernel answered what the host twin answered, and the twin answered the
+capacity class - and it went the Snappy way rather than the other because
+`OUTPUT_TOO_SMALL` is reserved for the one condition a larger buffer cures.
+It reaches neither LZ4 nor GDeflate: an LZ4 block and a raw GDeflate page
+carry no declared uncompressed length, so their only bound is the caller's
+capacity and their capacity answer is the right one.
+
 ### 12.4 Skippable frames are refused, not stepped over
 
 A skippable frame is refused with `UNSUPPORTED`.
