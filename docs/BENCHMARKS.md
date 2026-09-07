@@ -3271,3 +3271,218 @@ above as well.
 - wall per run: p50 0.046 ms / p90 0.049 ms / p99 0.064 ms
 - decode throughput: p50 4.480 GB/s / p90 4.221 GB/s / p99 3.206 GB/s
 ```
+
+## M4 perf lever (issue #204): the Huffman root-accelerator width, swept four ways, and no kernel code ships
+
+The claim under test was that the GDeflate Huffman table layout is a
+build-cost against lookup-cost trade whose balance point moves with the
+compression level, so that the layout has to be chosen per level. Measured,
+the trade is real and large, the LEVEL is not its axis, the CORPUS is, and no
+alternative width passes the pre-registered accept rule. The shipped layout
+stays.
+
+**WHAT THE ARMS ARE, AND WHAT THEY ARE NOT.** Section 13.1 of the masterplan
+killed the two-level table before any kernel existed: its worst legal case is
+2504 literal/length and 642 distance entries, a footprint chosen by whoever
+wrote the page rather than by the alphabet, and a footprint an attacker can
+grow is the anti-pattern the whole M4 shape refuses. That arm is NOT built
+here, and this entry does not claim to have measured it. What 13.1 shipped
+instead is a fixed-footprint canonical decoder with a root accelerator in front
+of it, and the accelerator's width is the one layout parameter that exists:
+`kGDeflateLitLenRootBits` and `kGDeflateDistRootBits` in
+`src/gdeflate_tables.h`, 10 and 7 bits as shipped. A code no longer than the
+root resolves in one shared-memory lookup; a longer one falls back to the
+length-by-length walk. Widening the root costs `2^R` entries to FILL per
+table build and per block, and saves walks per symbol; narrowing it does the
+opposite. That is exactly the build-against-lookup trade the issue names, on
+the layout that actually exists, so the arms are four widths of it:
+
+| arm      | lit/len root | distance root | root bytes per warp | team tables per block |
+| -------- | ------------ | ------------- | ------------------- | --------------------- |
+| 8/6      | 8 bits       | 6 bits        | 640                 | 8672                  |
+| 9/6      | 9 bits       | 6 bits        | 1152                | 10720                 |
+| **10/7** | 10 bits      | 7 bits        | 2304                | 15328 (shipped)       |
+| 11/8     | 11 bits      | 8 bits        | 4608                | 24544                 |
+
+The construction routine is untouched in every arm - the two constants are the
+only difference between the four trees, which is #96's single-source rule
+holding by construction rather than by review - and `GDeflateReverseBits`,
+the fill loop and the walk are the same bytes in all four binaries. Each arm
+is a git worktree of `12f834ac562a9f2339a6509b1bc4d459926b0a53`, built whole
+with `-DCUDEC_ENABLE_CUDA=ON`, and every GDeflate ctest entry ran green on it
+before a number was taken:
+
+```
+$ ctest --test-dir ~/build-204-<arm> -R 'gdeflate|bench_gdeflate' --no-tests=error
+100% tests passed, 0 tests failed out of 17      (each of the four arms)
+```
+
+### Method
+
+The #228 protocol, unchanged: `bench_gdeflate --gpu --warmup 3 --runs 30`
+per family, p50 nearest-rank of CUDA-event-timed whole-batch decodes,
+device-resident, every page verified to its original size before anything is
+timed, on the RTX 3080 (sm_86, driver 610.88, CUDA 13.3, nvcc 13.3.73) in the
+WSL route, with the host otherwise idle. Two full repeats; inside a repeat
+every arm ran a family before any arm ran the next one, so drift in the
+device's state lands on all four alike. Thirty-two invocations, each printing
+its own methodology block; the per-family corpus digests were read out of all
+thirty-two and each family's eight invocations carry one identical digest set,
+which is the same set #228 recorded:
+
+```
+silesia       88ed82d5ec9df3ad 131124d155e6672b 042b2473240db0b0 4b88e13a215ed884
+asset-like    08ac6ec118b60189 45690d97a5d3b054 47dad3ea983dc577 cb272ab3765d8378
+worst-rounds  6e2f2850f76891bb
+worst-headers c79e0a872dba2ca3
+```
+
+So the before arm below is #228's baseline re-taken in the same session rather
+than quoted from it, and the two agree: #228 recorded 7.519 / 8.056 / 7.905
+GB/s for Silesia at levels 1 / 6 / 12 and 0.497 GB/s for worst-headers; this
+session's shipped arm reads 7.539 / 7.525 / 8.035 and 0.517 in repeat 1.
+
+### What the device holds, per arm
+
+Read from the runtime through the harness's residency block, which is a
+CEILING the runtime computes and never an achieved-occupancy counter (Nsight
+Compute is refused the hardware counters on this machine, #258, #207):
+
+| arm      | registers per thread | shared bytes per block | max resident blocks per SM | resident warps per SM |
+| -------- | -------------------- | ---------------------- | -------------------------- | --------------------- |
+| 8/6      | 64                   | 8672                   | 8                          | 32                    |
+| 9/6      | 64                   | 10720                  | 8                          | 32                    |
+| **10/7** | 77                   | 15328                  | 6                          | 24                    |
+| 11/8     | 75                   | 24544                  | 4                          | 16                    |
+
+Two things in that table were not predicted. The narrow arms land on exactly
+the 32 resident warps per SM that section 9 targeted and 13.1 budgeted for -
+and they get there through the REGISTERS as much as through shared memory:
+the compiler allocates 64 per thread for the 8-bit and 9-bit roots against 77
+for the shipped 10-bit one, so the register bound that #214 recorded as
+binding at six blocks moves with the root width too. And the wide arm halves
+the shipped residency to 16 warps. Read against the throughput below, neither
+occupancy change is what decides a row.
+
+### The sweep
+
+GPU p50 per arm, both repeats, with the shipped arm's own two repeats first so
+the run-to-run spread is read before any difference between arms is. `vs
+shipped` is the arm's mean of two repeats against the shipped mean of two.
+
+**Silesia, GB/s:**
+
+| level | 10/7 rep 1 | rep 2   | 8/6 rep 1 | rep 2   | vs shipped | 9/6 rep 1 | rep 2   | vs shipped | 11/8 rep 1 | rep 2  | vs shipped |
+| ----- | ---------- | ------- | --------- | ------- | ---------- | --------- | ------- | ---------- | ---------- | ------ | ---------- |
+| 0     | 105.868    | 106.521 | 110.091   | 109.625 | +3.5%      | 110.150   | 110.095 | +3.7%      | 82.656     | 82.826 | -22.1%     |
+| 1     | 7.539      | 7.545   | 6.865     | 6.840   | -9.1%      | 6.967     | 6.967   | -7.6%      | 7.681      | 7.623  | +1.5%      |
+| 6     | 7.525      | 8.052   | 7.204     | 7.177   | -7.7%      | 7.382     | 7.354   | -5.4%      | 8.310      | 8.280  | +6.5%      |
+| 12    | 8.035      | 8.008   | 7.001     | 7.028   | -12.6%     | 7.088     | 7.104   | -11.5%     | 8.285      | 8.319  | +3.5%      |
+
+**Asset-like, GB/s:**
+
+| level | 10/7 rep 1 | rep 2   | 8/6 rep 1 | rep 2   | vs shipped | 9/6 rep 1 | rep 2   | vs shipped | 11/8 rep 1 | rep 2  | vs shipped |
+| ----- | ---------- | ------- | --------- | ------- | ---------- | --------- | ------- | ---------- | ---------- | ------ | ---------- |
+| 0     | 105.458    | 105.407 | 109.343   | 109.123 | +3.6%      | 109.285   | 109.110 | +3.6%      | 81.855     | 82.282 | -22.1%     |
+| 1     | 6.176      | 6.177   | 5.310     | 5.280   | -14.3%     | 5.757     | 5.771   | -6.7%      | 7.403      | 7.334  | +19.3%     |
+| 6     | 6.242      | 6.244   | 5.394     | 5.377   | -13.7%     | 5.879     | 5.897   | -5.7%      | 7.473      | 7.493  | +19.9%     |
+| 12    | 6.261      | 6.213   | 5.361     | 5.340   | -14.2%     | 5.868     | 5.957   | -5.2%      | 7.565      | 7.569  | +21.3%     |
+
+**The two adversarial corpora, GB/s:**
+
+| corpus        | 10/7 rep 1 | rep 2 | 8/6 rep 1 | rep 2 | vs shipped | 9/6 rep 1 | rep 2 | vs shipped | 11/8 rep 1 | rep 2 | vs shipped |
+| ------------- | ---------- | ----- | --------- | ----- | ---------- | --------- | ----- | ---------- | ---------- | ----- | ---------- |
+| worst-rounds  | 3.610      | 3.589 | 3.470     | 3.465 | -3.7%      | 3.579     | 3.325 | -4.1%      | 3.447      | 3.494 | -3.6%      |
+| worst-headers | 0.517      | 0.516 | 0.622     | 0.619 | +20.1%     | 0.585     | 0.583 | +13.1%     | 0.417      | 0.421 | -18.9%     |
+
+**READ THE SPREAD FIRST.** The shipped arm's two repeats agree within 0.7% on
+every row but one: Silesia level 6, where it read 7.525 and then 8.052 GB/s, a
+7.0% gap on one corpus at one level with nothing changed between the two runs
+
+- the same order of spread #207 recorded on the same corpus. Every difference
+  between arms below 7% on Silesia is therefore inside what one invocation can
+  do on its own, and the two Silesia rows that look like wins for 11/8 at levels
+  6 and 12 are read as "not distinguishable from the shipped arm" rather than as
+  wins. Every other row's spread is under 1% and the differences quoted against
+  it are five to thirty times that.
+
+### What the sweep says
+
+**The trade is real, it has the sign the issue predicted, and its axis is
+the corpus.** On worst-headers - a dynamic block header every 96 decoded
+bytes, the row where the build cost is nearly the whole cost - the narrowest
+root is 20% faster and the widest is 19% slower, in the order of the fill
+size: the 8-bit root fills 320 entries per build where the shipped one fills
+1152 and the 11-bit one 2304. On asset-like's compressed levels the ordering
+is exactly reversed: 11/8 is 19-21% faster and 8/6 is 14% slower, with 9/6
+between them, so on that corpus the walk beyond the root is what the kernel
+pays for and a wider root buys it back. Silesia sits between the two, with
+the shipped width already at or near the best of the four at every compressed
+level.
+
+**The level is not the lever's axis.** The issue's premise was that higher
+levels emit more, smaller blocks - more builds over fewer rounds each - so
+that the crossover would move with the level. Within each arm the compressed
+levels 1, 6 and 12 differ by at most a few percent and not monotonically, on
+both corpora, for all four widths. That is the same reading the #206 census
+gave in advance: blocks per page move by 8% across the Silesia levels and not
+at all across asset-like's, so the builds-per-page axis the premise rests on
+has almost no room to move in. What DOES move between the two corpora is
+the codes themselves: asset-like compresses to a 0.70 ratio against Silesia's
+0.33, and a flatter distribution is one whose codes sit longer, so more of its
+symbols miss a 10-bit root and walk. THAT SENTENCE IS AN EXPLANATION AND NOT A
+MEASUREMENT: no run here counted root hits against walks, and the number that
+would settle it is a hit-rate census over the recorded corpora, which the
+harness does not print today.
+
+**Occupancy is not what decides a row.** The narrow arms reach 32 resident
+warps per SM - the number 13.1 was sized for and the shipped kernel misses -
+and lose on every compressed row; the wide arm falls to 16 and wins on
+asset-like. The kernel spends its time in the round loop and the table build,
+not waiting on residency, which is consistent with #207's finding that the
+grid geometry moves nothing either.
+
+**The stored rows move the other way from the compressed ones, for a reason
+that is the residency after all.** Level 0 is 100% stored on both corpora
+(#206), builds no table and enters no round, so the root width cannot touch
+its work - yet 11/8 loses 22% there and the narrow arms gain 3.5%. That row is
+a memcpy-shaped kernel bounded by how many warps are in flight, and the table
+set is allocated per block whether or not the block ever builds one: the wide
+arm's 24544 shared bytes cut the stored path's residency in half and it shows.
+It is the one row where shared memory is the binding resource, and it is the
+row where no table is built.
+
+### The decision
+
+**Refused by the pre-registered rule, and no kernel code ships.** The rule
+wanted an improvement on at least one corpus/level with ZERO regression on the
+worst-case corpus, and the worst case on this board is two corpora rather than
+one. Every alternative width regresses at least one of them beyond the
+run-to-run spread:
+
+- 8/6 and 9/6 win worst-headers by 20% and 13% and lose worst-rounds by 3.7%
+  and 4.1%, in both repeats, against a shipped spread of 0.6% on that row -
+  and lose every compressed row on both corpora besides.
+- 11/8 wins asset-like's compressed rows by about 20% - the largest single
+  effect in this entry - and loses BOTH adversarial rows, worst-headers by
+  19%, and the stored rows by 22%.
+
+The #36 rule applies as it did to the +10% Silesia win it was written on: the
+adversarial number is the DoS-resistance margin and it outranks the average
+case. The shipped 10/7 is the only one of the four widths that is not the
+worst on any row, which is the property a fixed default has to have.
+
+**What the sweep leaves open, stated so it is not re-derived.** A width chosen
+PER TABLE BUILD - narrow when a block's code lengths say its codes are short,
+wide when they say they are long - would take both sides of the crossover at
+once, because the code-length histogram is in hand before the fill begins and
+is exactly the quantity that decides the hit rate. That is a new lever with
+its own footprint question (the table would have to be sized for the widest
+root it may choose, so the shared-memory cost is the wide arm's), and it is
+not this issue's: this issue asked whether a fixed layout should change, and
+the answer is no.
+
+The `bench_gdeflate` reports for all thirty-two invocations and the four
+residency readings are not pasted here in full: each carries the methodology
+block quoted above with the digests listed, and the tables hold every p50 they
+printed.
